@@ -13,7 +13,8 @@
 #include <WebServer.h>
 #include "web_ui.h"
 #endif
-#include "secrets.h"
+// AP credentials — SSID uses MAC last 4 hex chars for uniqueness.
+constexpr char AP_PASSWORD[] = "nolan1234";
 
 // IMPORTANT:
 // This project keeps one main.cpp and splits behavior by build flags:
@@ -810,9 +811,13 @@ void setup() {
   }
   Serial.println();
 
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  uint8_t mac[6];
+  esp_efuse_mac_get_default(mac);
+  char apSsid[20];
+  snprintf(apSsid, sizeof(apSsid), "ShoreSpotter_%02X%02X", mac[4], mac[5]);
+  WiFi.softAP(apSsid, AP_PASSWORD);
   Serial.print(F("[WiFi] AP SSID: "));
-  Serial.println(F(AP_SSID));
+  Serial.println(apSsid);
   Serial.print(F("[WiFi] AP IP:   "));
   Serial.println(WiFi.softAPIP());
   Serial.println(F("[WiFi] Open browser -> 192.168.4.1"));
