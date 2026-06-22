@@ -3,12 +3,16 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include <TinyGPSPlus.h>
+#include <Preferences.h>
+#include <Adafruit_BME280.h>
+#include <esp_system.h>
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
 
-#if defined(ROLE_SERVER)
 #include <U8g2lib.h>
+
+#if defined(ROLE_SERVER)
 #include <WiFi.h>
 #include <WebServer.h>
 #include "web_ui.h"
@@ -37,13 +41,24 @@ constexpr int RF_SF = 9;
 constexpr int RF_CR = 7;
 constexpr int RF_SYNC_WORD = 0x12;
 constexpr int TX_POWER_DBM = 17;
+constexpr int TX_POWER_MIN_DBM = 10;
+constexpr int TX_POWER_MAX_DBM = 22;
+constexpr uint32_t ATPC_EVAL_MS = 15000;
 
 constexpr uint32_t SEND_INTERVAL_MS = 1000;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 10000;  // battery + env packet rate
 constexpr uint32_t BATTERY_UPDATE_MS = 5000;
+constexpr uint32_t ENV_UPDATE_MS = 5000;
 constexpr uint32_t SERVER_IDLE_LOG_MS = 5000;
 constexpr uint32_t LINK_TIMEOUT_MS = 5000;
+constexpr uint32_t LINK_WARN_MS = 15000;
 constexpr uint32_t DISPLAY_REFRESH_MS = 500;
+constexpr uint32_t LCD_ALERT_BLINK_MS = 5000;
+
+constexpr uint16_t BATT_LOW_MV = 3500;   // conservative battery-safe threshold
+constexpr uint16_t BATT_FULL_MV = 4150;
+constexpr int16_t TEMP_WARN_C10 = 500;   // 50.0C
+constexpr uint8_t HUM_WARN_PCT = 90;
 
 #if defined(ROLE_SERVER)
 constexpr uint32_t TRACK_INTERVAL_MS = 10000;  // 1 pt / 10 s -> 720 pts = 2 hr
@@ -71,6 +86,13 @@ XPowersPMU pmu;
 
 HardwareSerial GPSSerial(1);
 TwoWire PMUWire = TwoWire(1);
+Preferences prefs;
+Adafruit_BME280 envSensor;
+bool envSensorOnline = false;
+uint32_t nextEnvMs = 0;
+int16_t cachedTempC10 = INT16_MIN;
+uint8_t cachedHumidityPct = 0xFF;
+String cachedApIp = "";
 
 // Shared OLED object — client enables it only during boot-info and shutdown screens.
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
@@ -102,6 +124,12 @@ struct __attribute__((packed)) TelemetryPayload {
   uint8_t  humidityPct;  // relative humidity 0–100 %, 0xFF = no sensor
 };
 
+struct __attribute__((packed)) AckPayload {
+  uint16_t ackSeq;
+  int16_t rssiDbm10;
+  int8_t snrDb10;
+};
+
 // ---------------------------------------------------------------------------
 // Application protocol (stage 1: binary header, ready for 1->many / many->many)
 // ---------------------------------------------------------------------------
@@ -129,6 +157,8 @@ constexpr size_t DATA_PACKET_LEN =
     sizeof(PacketHeader) + sizeof(PositionPayload) + MAC_LEN;
 constexpr size_t TELEMETRY_PACKET_LEN =
     sizeof(PacketHeader) + sizeof(TelemetryPayload) + MAC_LEN;
+constexpr size_t ACK_PACKET_LEN =
+  sizeof(PacketHeader) + sizeof(AckPayload) + MAC_LEN;
 
 #if defined(ROLE_SERVER)
 struct DecodedData {
@@ -177,6 +207,17 @@ uint16_t nodeId = 0;  // set in setup() from chip MAC last 2 bytes
 static uint16_t prevSpeedCmS   = 0;
 static uint32_t prevSpeedMs    = 0;
 static int16_t  smoothAccelCmS2 = 0;
+static uint32_t bootMs = 0;
+static uint16_t lastAckedSeq = 0;
+static uint32_t lastAckRxMs = 0;
+static uint32_t ackRxCount = 0;
+static uint32_t ackMissCount = 0;
+static uint32_t lastAckMissMarkMs = 0;
+static int8_t currentTxPowerDbm = TX_POWER_DBM;
+static bool atpcEnabled = true;
+static int16_t lastAckRssiDbm10 = -1270;
+static int8_t lastAckSnrDb10 = -127;
+static uint32_t nextAtpcEvalMs = 0;
 
 // Derive a node id from the last 2 bytes of the ESP32's factory-burned MAC.
 // 65536 possible values — collision probability negligible for any real deployment.
@@ -215,6 +256,11 @@ static float    cachedPktRate   = 0.0f;  // pkts/s averaged over ~60 s
 // User centres servo, places camera station, then calls POST /api/calibrate/servo.
 // The supplied compass heading is stored here; servo 90° corresponds to this bearing.
 static float servoOriginDeg = 0.0f;
+static uint32_t rxDataCount = 0;
+static uint32_t rxTelemetryCount = 0;
+static uint32_t rxDropCount = 0;
+static uint32_t rxErrorCount = 0;
+static uint32_t ackTxCount = 0;
 
 struct TrackPoint { float lat; float lon; };
 static TrackPoint trackBuf[TRACK_CAP];
@@ -328,6 +374,216 @@ static void serviceGps() {
   }
 }
 
+static bool initEnvSensor() {
+  // BME280 is common and simple; try both default addresses.
+  if (envSensor.begin(0x76, &Wire) || envSensor.begin(0x77, &Wire)) {
+    Serial.println(F("[ENV] BME280 init ok"));
+    return true;
+  }
+  Serial.println(F("[ENV] BME280 not found (telemetry stays N/A)"));
+  return false;
+}
+
+static void sampleEnvSensor() {
+  if (!envSensorOnline) {
+    cachedTempC10 = INT16_MIN;
+    cachedHumidityPct = 0xFF;
+    return;
+  }
+  float t = envSensor.readTemperature();
+  float h = envSensor.readHumidity();
+  if (isnan(t) || isnan(h)) {
+    cachedTempC10 = INT16_MIN;
+    cachedHumidityPct = 0xFF;
+    return;
+  }
+  cachedTempC10 = static_cast<int16_t>(lround(t * 10.0f));
+  float hc = constrain(h, 0.0f, 100.0f);
+  cachedHumidityPct = static_cast<uint8_t>(lround(hc));
+}
+
+static float estimateBatteryHours(uint16_t battMv) {
+  if (battMv <= BATT_LOW_MV) {
+    return 0.0f;
+  }
+  float ratio = (battMv - BATT_LOW_MV) / float(BATT_FULL_MV - BATT_LOW_MV);
+  ratio = constrain(ratio, 0.0f, 1.0f);
+  return ratio * 6.0f;  // conservative upper bound for 2S + radio workload
+}
+
+enum TriState : uint8_t { TRI_OK = 0, TRI_WARN = 1, TRI_BAD = 2 };
+
+// 8x8 monochrome icons (LSB-first rows for U8g2 drawXBMP)
+static const uint8_t ICON_CHECK_8[] = {0x00,0x01,0x03,0x06,0x4C,0x78,0x30,0x00};
+static const uint8_t ICON_WARN_8[]  = {0x18,0x3C,0x3C,0x3C,0x18,0x00,0x18,0x00};
+static const uint8_t ICON_CROSS_8[] = {0x42,0x66,0x3C,0x18,0x3C,0x66,0x42,0x00};
+static const uint8_t ICON_DROP_8[]  = {0x08,0x1C,0x36,0x36,0x36,0x1C,0x08,0x00};
+static const uint8_t ICON_THERM_8[] = {0x08,0x0C,0x08,0x08,0x08,0x1C,0x1C,0x08};
+
+static const uint8_t* triBitmap(TriState s) {
+  if (s == TRI_OK) return ICON_CHECK_8;
+  if (s == TRI_WARN) return ICON_WARN_8;
+  return ICON_CROSS_8;
+}
+
+static void drawTriIcon(int x, int yTop, TriState s) {
+  display.drawXBMP(x, yTop, 8, 8, triBitmap(s));
+}
+
+static TriState linkState(uint32_t ageMs) {
+  if (ageMs <= LINK_TIMEOUT_MS) return TRI_OK;
+  if (ageMs <= LINK_WARN_MS) return TRI_WARN;
+  return TRI_BAD;
+}
+
+#if defined(ROLE_SERVER)
+static TriState serverGpsState() {
+  if (!gps.location.isValid()) return TRI_BAD;
+  if (!gps.hdop.isValid()) return TRI_WARN;
+  float hd = gps.hdop.hdop();
+  if (hd <= 1.5f) return TRI_OK;
+  if (hd <= 3.0f) return TRI_WARN;
+  return TRI_BAD;
+}
+
+static TriState clientGpsState() {
+  if (!havePkt) return TRI_BAD;
+  uint32_t age = millis() - lastRxMs;
+  if (age > LINK_WARN_MS) return TRI_BAD;
+  if (age > LINK_TIMEOUT_MS || !lastData.fix) return TRI_WARN;
+  return TRI_OK;
+}
+
+static void saveWhitelistToNvs() {
+  String packed;
+  for (size_t i = 0; i < clientWhitelistCount; i++) {
+    if (i > 0) packed += ',';
+    char hex[5];
+    snprintf(hex, sizeof(hex), "%04X", clientWhitelist[i]);
+    packed += hex;
+  }
+  prefs.putString("wl", packed);
+}
+
+static void loadWhitelistFromNvs() {
+  String packed = prefs.getString("wl", "");
+  clientWhitelistCount = 0;
+  if (packed.length() == 0) {
+    for (uint16_t id : DEFAULT_WHITELIST) {
+      if (clientWhitelistCount < WHITELIST_MAX) {
+        clientWhitelist[clientWhitelistCount++] = id;
+      }
+    }
+    return;
+  }
+  int start = 0;
+  while (start < packed.length() && clientWhitelistCount < WHITELIST_MAX) {
+    int comma = packed.indexOf(',', start);
+    if (comma < 0) comma = packed.length();
+    String token = packed.substring(start, comma);
+    if (token.length() > 0) {
+      clientWhitelist[clientWhitelistCount++] =
+          static_cast<uint16_t>(strtoul(token.c_str(), nullptr, 16));
+    }
+    start = comma + 1;
+  }
+}
+
+static void saveServoOriginToNvs() {
+  prefs.putFloat("servo0", servoOriginDeg);
+}
+
+static void loadServerSettings() {
+  prefs.begin("shorespotter", false);
+  loadWhitelistFromNvs();
+  servoOriginDeg = prefs.getFloat("servo0", 0.0f);
+}
+
+static size_t buildAckPacket(uint8_t *buf, uint16_t dstId, uint16_t ackSeq,
+                             float rssi, float snr) {
+  PacketHeader hdr{};
+  hdr.magic = PROTO_MAGIC;
+  hdr.version = PROTO_VERSION;
+  hdr.networkId = NETWORK_ID;
+  hdr.srcId = SERVER_ID;
+  hdr.dstId = dstId;
+  hdr.msgType = MSG_ACK;
+  hdr.seq = txSeq++;
+  hdr.payloadLen = sizeof(AckPayload);
+
+  AckPayload ack{};
+  ack.ackSeq = ackSeq;
+  ack.rssiDbm10 = static_cast<int16_t>(lround(rssi * 10.0f));
+  ack.snrDb10 = static_cast<int8_t>(lround(snr * 10.0f));
+
+  size_t off = 0;
+  memcpy(buf + off, &hdr, sizeof(hdr)); off += sizeof(hdr);
+  memcpy(buf + off, &ack, sizeof(ack)); off += sizeof(ack);
+  memset(buf + off, 0, MAC_LEN); off += MAC_LEN;
+  return off;
+}
+#endif
+
+#if defined(ROLE_CLIENT)
+static bool parseAckPacket(const uint8_t *buf, size_t n, AckPayload &out) {
+  if (n < sizeof(PacketHeader) + sizeof(AckPayload) + MAC_LEN) return false;
+  PacketHeader hdr;
+  memcpy(&hdr, buf, sizeof(hdr));
+  if (hdr.magic != PROTO_MAGIC || hdr.version != PROTO_VERSION) return false;
+  if (hdr.networkId != NETWORK_ID) return false;
+  if (hdr.msgType != MSG_ACK) return false;
+  if (hdr.srcId != SERVER_ID || hdr.dstId != nodeId) return false;
+  if (hdr.payloadLen != sizeof(AckPayload)) return false;
+  memcpy(&out, buf + sizeof(PacketHeader), sizeof(out));
+  return true;
+}
+
+static void saveClientSettings() {
+  prefs.putChar("txpwr", currentTxPowerDbm);
+  prefs.putBool("atpc", atpcEnabled);
+}
+
+static void loadClientSettings() {
+  prefs.begin("shorespt_client", false);
+  int8_t p = prefs.getChar("txpwr", TX_POWER_DBM);
+  currentTxPowerDbm = constrain(p, TX_POWER_MIN_DBM, TX_POWER_MAX_DBM);
+  atpcEnabled = prefs.getBool("atpc", true);
+}
+
+static void applyTxPower(int8_t pwrDbm) {
+  int8_t target = constrain(pwrDbm, TX_POWER_MIN_DBM, TX_POWER_MAX_DBM);
+  if (target == currentTxPowerDbm) return;
+  int st = radio.setOutputPower(target);
+  if (st == RADIOLIB_ERR_NONE) {
+    currentTxPowerDbm = target;
+    saveClientSettings();
+    Serial.print(F("[CLIENT] TX power set to "));
+    Serial.print(currentTxPowerDbm);
+    Serial.println(F(" dBm"));
+  }
+}
+
+static void evaluateAtpc() {
+  if (!atpcEnabled) return;
+  if (millis() < nextAtpcEvalMs) return;
+  nextAtpcEvalMs = millis() + ATPC_EVAL_MS;
+
+  // No ACK for a while: push one step up.
+  if (millis() - lastAckRxMs > 20000) {
+    applyTxPower(currentTxPowerDbm + 1);
+    return;
+  }
+
+  // Strong link -> step down, weak link -> step up.
+  // lastAckRssiDbm10 is negative dBm * 10.
+  if (lastAckRssiDbm10 > -700 && lastAckSnrDb10 > 80) {
+    applyTxPower(currentTxPowerDbm - 1);
+  } else if (lastAckRssiDbm10 < -980 || lastAckSnrDb10 < 20) {
+    applyTxPower(currentTxPowerDbm + 1);
+  }
+}
+#endif
+
 #if defined(ROLE_CLIENT)
 static size_t buildDataPacket(uint8_t *buf) {
   PacketHeader hdr{};
@@ -390,8 +646,8 @@ static size_t buildTelemetryPacket(uint8_t *buf) {
 
   TelemetryPayload tel{};
   tel.batteryMv   = cachedBatteryMv;
-  tel.tempC10     = INT16_MIN;  // TODO: read from SHT3x / BME280 via I2C
-  tel.humidityPct = 0xFF;       // TODO: read from SHT3x / BME280 via I2C
+  tel.tempC10     = cachedTempC10;
+  tel.humidityPct = cachedHumidityPct;
 
   size_t off = 0;
   memcpy(buf + off, &hdr, sizeof(hdr));  off += sizeof(hdr);
@@ -428,41 +684,79 @@ static double computeBearing(double lat1, double lon1, double lat2, double lon2)
 }
 
 static void renderServerDisplay() {
-  uint32_t sinceRx = havePkt ? (millis() - lastRxMs) : 0;
-  bool linked = havePkt && (sinceRx <= LINK_TIMEOUT_MS);
+  const int leftW = 63;
+  uint32_t age = havePkt ? (millis() - lastRxMs) : UINT32_MAX;
+  TriState sGps = serverGpsState();
 
-  char buf[26];
+  // Left panel rotates client index every 5 seconds.
+  size_t clientCount = clientWhitelistCount > 0 ? clientWhitelistCount : 1;
+  size_t clientIdx = (millis() / 5000UL) % clientCount;
+  uint16_t selectedId = clientWhitelistCount > 0 ? clientWhitelist[clientIdx] : 0;
+  bool selectedOnline = havePkt && (lastData.srcId == selectedId) &&
+                        ((millis() - lastRxMs) <= LINK_WARN_MS);
+  bool selectedTelemetry = haveTelemetry && (lastTelemetry.srcId == selectedId);
+
+  TriState loraState = TRI_BAD;
+  TriState cGpsState = TRI_BAD;
+  if (selectedOnline) {
+    loraState = linkState(millis() - lastRxMs);
+    cGpsState = lastData.fix ? TRI_OK : TRI_WARN;
+  }
+
+  char line[28];
   display.clearBuffer();
-  display.setFont(u8g2_font_6x12_tr);
+  display.setFont(u8g2_font_5x7_tr);
+  display.drawVLine(leftW, 0, 64);
 
-  display.drawStr(0, 10, "SHORE SPOTTER");
-  display.drawHLine(0, 13, 128);
+  // LEFT: Client panel
+  snprintf(line, sizeof(line), "Client_%u", (unsigned)clientIdx);
+  display.drawStr(0, 8, line);
 
-  display.drawStr(0, 26, linked ? "LINK: ONLINE" : "LINK: NO SIGNAL");
+  if (selectedTelemetry && lastTelemetry.tempC10 != INT16_MIN && lastTelemetry.humidityPct != 0xFF) {
+    float etaH = estimateBatteryHours(lastTelemetry.batteryMv);
+    snprintf(line, sizeof(line), "%.1fC/%u%%/%.1fh", lastTelemetry.tempC10 / 10.0f,
+             lastTelemetry.humidityPct, etaH);
+  } else {
+    snprintf(line, sizeof(line), "--.-C/--%%/--.-h");
+  }
+  display.drawStr(0, 18, line);
+
+  display.drawStr(0, 30, "LORA:");
+  drawTriIcon(28, 22, loraState);
+
+  display.drawStr(0, 42, "CGPS:");
+  drawTriIcon(28, 34, cGpsState);
+
+  // RIGHT: Server panel
+  display.drawStr(leftW + 3, 8, "Server");
+  if (cachedTempC10 != INT16_MIN && cachedHumidityPct != 0xFF) {
+    snprintf(line, sizeof(line), "%.1fC/%u%%", cachedTempC10 / 10.0f, cachedHumidityPct);
+  } else {
+    snprintf(line, sizeof(line), "--.-C/--%%");
+  }
+  display.drawStr(leftW + 3, 18, line);
+
+  drawTriIcon(leftW + 3, 22, sGps);
+  if (gps.hdop.isValid()) {
+    snprintf(line, sizeof(line), "SGPS %.1f", gps.hdop.hdop());
+  } else {
+    snprintf(line, sizeof(line), "SGPS --");
+  }
+  display.drawStr(leftW + 14, 30, line);
 
   if (havePkt) {
-    snprintf(buf, sizeof(buf), "ID:%02X  %lus ago", lastData.srcId,
-             (unsigned long)(sinceRx / 1000));
+    snprintf(line, sizeof(line), "ID:%04X %lus", lastData.srcId, (unsigned long)(age / 1000));
   } else {
-    snprintf(buf, sizeof(buf), "ID: --");
+    snprintf(line, sizeof(line), "ID:---- --s");
   }
-  display.drawStr(0, 38, buf);
+  display.drawStr(leftW + 3, 40, line);
 
-  if (havePkt && lastData.fix && gps.location.isValid()) {
-    double brg = computeBearing(gps.location.lat(), gps.location.lng(),
-                                lastData.lat, lastData.lon);
-    snprintf(buf, sizeof(buf), "Bearing: %d deg", (int)(brg + 0.5));
-  } else {
-    snprintf(buf, sizeof(buf), "Bearing: --");
-  }
-  display.drawStr(0, 50, buf);
+  snprintf(line, sizeof(line), "R%.0f S%.1f", lastRssi, lastSnr);
+  display.drawStr(leftW + 3, 50, line);
 
-  if (haveTelemetry) {
-    snprintf(buf, sizeof(buf), "Batt: %u mV", lastTelemetry.batteryMv);
-  } else {
-    snprintf(buf, sizeof(buf), "Batt: --");
-  }
-  display.drawStr(0, 62, buf);
+  snprintf(line, sizeof(line), "A%lu D%lu", (unsigned long)ackTxCount,
+           (unsigned long)rxDataCount);
+  display.drawStr(leftW + 3, 60, line);
 
   display.sendBuffer();
 }
@@ -512,6 +806,14 @@ static String buildTrackJson() {
   js += gps.location.isValid() ? String(gps.location.lng(), 6) : F("0");
   js += F(",\"fix\":");
   js += gps.location.isValid() ? F("1") : F("0");
+  js += F(",\"temp_c\":");
+  if (cachedTempC10 != INT16_MIN) {
+    js += String(cachedTempC10 / 10.0f, 1);
+  } else {
+    js += F("null");
+  }
+  js += F(",\"humidity_pct\":");
+  js += cachedHumidityPct != 0xFF ? String(cachedHumidityPct) : F("null");
   js += F("},\"telemetry\":{\"batt_mv\":");
   js += haveTelemetry ? String(lastTelemetry.batteryMv) : F("0");
   js += F(",\"temp_c\":");
@@ -559,7 +861,7 @@ static String buildWhitelistJson() {
 
 static String buildStatusJson() {
   String js;
-  js.reserve(512);
+  js.reserve(900);
 
   // Server GPS quality
   js += F("{\"server_gps\":{\"fix\":");
@@ -585,6 +887,39 @@ static String buildStatusJson() {
   js += rssiRingCount ? String(snrAvg, 1) : F("null");
   js += F(",\"pkt_rate\":");
   js += String(cachedPktRate, 2);
+  uint32_t rxTotal = rxDataCount + rxTelemetryCount + rxDropCount;
+  js += F(",\"rx_data\":");
+  js += String(rxDataCount);
+  js += F(",\"rx_telemetry\":");
+  js += String(rxTelemetryCount);
+  js += F(",\"rx_drop\":");
+  js += String(rxDropCount);
+  js += F(",\"drop_rate\":");
+  js += rxTotal ? String((float)rxDropCount / rxTotal, 3) : F("0");
+  js += F(",\"ack_tx\":");
+  js += String(ackTxCount);
+  js += F("},");
+
+  js += F("\"env\":{\"temp_c\":");
+  if (cachedTempC10 != INT16_MIN) {
+    js += String(cachedTempC10 / 10.0f, 1);
+  } else {
+    js += F("null");
+  }
+  js += F(",\"humidity_pct\":");
+  js += cachedHumidityPct != 0xFF ? String(cachedHumidityPct) : F("null");
+  js += F("},");
+
+  js += F("\"health\":{\"uptime_s\":");
+  js += String((millis() - bootMs) / 1000);
+  js += F(",\"heap_free\":");
+  js += String(ESP.getFreeHeap());
+  js += F(",\"heap_min\":");
+  js += String(ESP.getMinFreeHeap());
+  js += F(",\"reset_reason\":\"");
+  js += String((int)esp_reset_reason());
+  js += F("\",\"rx_error\":");
+  js += String(rxErrorCount);
   js += F("},");
 
   // Servo calibration state
@@ -616,6 +951,7 @@ static void initWebServer() {
       }
       if (!found && clientWhitelistCount < WHITELIST_MAX) {
         clientWhitelist[clientWhitelistCount++] = newId;
+        saveWhitelistToNvs();
       }
     } else if (action == "remove") {
       uint16_t rmId = (uint16_t)strtoul(idStr.c_str(), nullptr, 16);
@@ -625,11 +961,13 @@ static void initWebServer() {
             clientWhitelist[j] = clientWhitelist[j + 1];
           }
           clientWhitelistCount--;
+          saveWhitelistToNvs();
           break;
         }
       }
     } else if (action == "clear") {
       clientWhitelistCount = 0;
+      saveWhitelistToNvs();
     } else {
       httpServer.send(400, "application/json",
                       "{\"ok\":false,\"error\":\"unknown action\"}");
@@ -647,6 +985,7 @@ static void initWebServer() {
   httpServer.on("/api/calibrate/servo", HTTP_POST, []() {
     if (httpServer.hasArg("heading")) {
       servoOriginDeg = httpServer.arg("heading").toFloat();
+      saveServoOriginToNvs();
       httpServer.send(200, "application/json",
                       "{\"ok\":true,\"servo_origin_deg\":" +
                           String(servoOriginDeg, 1) + "}");
@@ -707,8 +1046,16 @@ static void showClientBootScreen() {
   char line1[20], line2[20], line3[20], line4[20];
   snprintf(line1, sizeof(line1), "ID: %02X%02X", mac[4], mac[5]);
   snprintf(line2, sizeof(line2), "Batt: %u mV", cachedBatteryMv);
-  snprintf(line3, sizeof(line3), "Temp: N/A");   // TODO: SHT3x/BME280
-  snprintf(line4, sizeof(line4), "Hum:  N/A");
+  if (cachedTempC10 != INT16_MIN) {
+    snprintf(line3, sizeof(line3), "Temp: %.1fC", cachedTempC10 / 10.0f);
+  } else {
+    snprintf(line3, sizeof(line3), "Temp: N/A");
+  }
+  if (cachedHumidityPct != 0xFF) {
+    snprintf(line4, sizeof(line4), "Hum:  %u%%", cachedHumidityPct);
+  } else {
+    snprintf(line4, sizeof(line4), "Hum:  N/A");
+  }
 
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
@@ -724,13 +1071,13 @@ static void showClientBootScreen() {
 
   display.clearBuffer();
   display.sendBuffer();
-  pmu.disableALDO1();
 }
 #endif
 
 void setup() {
   Serial.begin(115200);
   delay(1200);
+  bootMs = millis();
   nodeId = derivedNodeId();
 
 #if !defined(ROLE_CLIENT) && !defined(ROLE_SERVER)
@@ -747,6 +1094,10 @@ void setup() {
   }
 
 #if defined(ROLE_CLIENT)
+  loadClientSettings();
+  radio.setOutputPower(currentTxPowerDbm);
+  nextAtpcEvalMs = millis() + ATPC_EVAL_MS;
+
   pinMode(GPS_EN_PIN, OUTPUT);
   digitalWrite(GPS_EN_PIN, HIGH);
 
@@ -754,11 +1105,17 @@ void setup() {
 
   pmuOnline = initPmu();
   if (pmuOnline) {
-    pmu.disableALDO1();  // OLED / sensor bus off on client to save power
+    pmu.setALDO1Voltage(3300);
+    pmu.enableALDO1();
     pmu.enableIRQ(XPOWERS_AXP2101_PKEY_LONG_IRQ);  // long-press = shutdown
+    delay(100);
   }
   cachedBatteryMv = readBatteryMilliVolts();
   nextBatteryMs = millis() + BATTERY_UPDATE_MS;
+  nextEnvMs = millis() + ENV_UPDATE_MS;
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  envSensorOnline = initEnvSensor();
+  sampleEnvSensor();
 
   showClientBootScreen();  // show MAC / batt / temp for 10 s then turn off OLED
 
@@ -768,6 +1125,11 @@ void setup() {
   Serial.println(F("[CLIENT] Add this id to SERVER CLIENT_WHITELIST to authorise."));
   Serial.print(F("[CLIENT] GPS UART baud="));
   Serial.println(GPS_BAUD);
+  Serial.print(F("[CLIENT] TX power="));
+  Serial.print(currentTxPowerDbm);
+  Serial.print(F(" dBm (ATPC="));
+  Serial.print(atpcEnabled ? F("on") : F("off"));
+  Serial.println(F(")"));
 #endif
 
 #if defined(ROLE_SERVER)
@@ -785,6 +1147,9 @@ void setup() {
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  envSensorOnline = initEnvSensor();
+  sampleEnvSensor();
+  nextEnvMs = millis() + ENV_UPDATE_MS;
   display.setI2CAddress(OLED_I2C_ADDR << 1);
   display.begin();
   display.clearBuffer();
@@ -796,11 +1161,7 @@ void setup() {
   nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
   nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
   Serial.println(F("[SERVER] mode active: receive position packets"));
-  // Seed runtime whitelist from compile-time defaults
-  clientWhitelistCount = 0;
-  for (uint16_t id : DEFAULT_WHITELIST) {
-    clientWhitelist[clientWhitelistCount++] = id;
-  }
+  loadServerSettings();
   Serial.print(F("[SERVER] whitelist ("));
   Serial.print(clientWhitelistCount);
   Serial.print(F(" entries): "));
@@ -820,6 +1181,7 @@ void setup() {
   Serial.println(apSsid);
   Serial.print(F("[WiFi] AP IP:   "));
   Serial.println(WiFi.softAPIP());
+  cachedApIp = WiFi.softAPIP().toString();
   Serial.println(F("[WiFi] Open browser -> 192.168.4.1"));
   initWebServer();
 #endif
@@ -834,6 +1196,11 @@ void loop() {
     cachedBatteryMv = readBatteryMilliVolts();
     Serial.print(F("[CLIENT] Battery update mV="));
     Serial.println(cachedBatteryMv);
+  }
+
+  if (millis() >= nextEnvMs) {
+    nextEnvMs = millis() + ENV_UPDATE_MS;
+    sampleEnvSensor();
   }
 
   if (millis() >= nextSendMs) {
@@ -872,6 +1239,28 @@ void loop() {
     }
   }
 
+  uint8_t ackBuf[ACK_PACKET_LEN];
+  int ackState = radio.receive(ackBuf, sizeof(ackBuf));
+  if (ackState == RADIOLIB_ERR_NONE) {
+    size_t n = radio.getPacketLength();
+    if (n > sizeof(ackBuf)) n = sizeof(ackBuf);
+    AckPayload ack{};
+    if (parseAckPacket(ackBuf, n, ack)) {
+      lastAckedSeq = ack.ackSeq;
+      lastAckRxMs = millis();
+      ackRxCount++;
+      lastAckRssiDbm10 = ack.rssiDbm10;
+      lastAckSnrDb10 = ack.snrDb10;
+    }
+  }
+  if (txSeq > 5 && (millis() - lastAckRxMs > 15000) &&
+      (millis() - lastAckMissMarkMs > 5000)) {
+    ackMissCount++;
+    lastAckMissMarkMs = millis();
+  }
+
+  evaluateAtpc();
+
   // Long-press PWR → show shutdown screen then power off
   if (pmuOnline) {
     pmu.getIrqStatus();
@@ -885,6 +1274,11 @@ void loop() {
 #if defined(ROLE_SERVER)
   httpServer.handleClient();
   serviceGps();  // keep the server's own GPS position fresh
+
+  if (millis() >= nextEnvMs) {
+    nextEnvMs = millis() + ENV_UPDATE_MS;
+    sampleEnvSensor();
+  }
 
   // Long-press PWR → show shutdown screen then power off
   if (pmuOnline) {
@@ -911,6 +1305,7 @@ void loop() {
       lastSnr = radio.getSNR();
       lastRxMs = millis();
       havePkt = true;
+      rxDataCount++;
       // Update LoRa rolling stats
       rssiRing[rssiRingIdx] = lastRssi;
       snrRing[rssiRingIdx]  = lastSnr;
@@ -926,6 +1321,12 @@ void loop() {
       if (d.fix && (millis() - lastTrackMs >= TRACK_INTERVAL_MS)) {
         lastTrackMs = millis();
         pushTrackPoint((float)d.lat, (float)d.lon);
+      }
+
+      uint8_t ackBuf[ACK_PACKET_LEN];
+      size_t ackLen = buildAckPacket(ackBuf, d.srcId, d.seq, lastRssi, lastSnr);
+      if (radio.transmit(ackBuf, ackLen) == RADIOLIB_ERR_NONE) {
+        ackTxCount++;
       }
 
       Serial.print(F("[SERVER] RX DATA | from=0x"));
@@ -950,6 +1351,7 @@ void loop() {
         lastTelemetry = t;
         haveTelemetry = true;
         lastTelemetryRxMs = millis();
+        rxTelemetryCount++;
         Serial.print(F("[SERVER] RX TELEMETRY | from=0x"));
         Serial.print(t.srcId, HEX);
         Serial.print(F(" batt_mV="));
@@ -964,6 +1366,7 @@ void loop() {
           Serial.println(F("N/A"));
         }
       } else {
+        rxDropCount++;
         Serial.println(F("[SERVER] RX dropped (foreign/invalid packet)"));
       }
     }
@@ -973,6 +1376,7 @@ void loop() {
       Serial.println(F("[SERVER] waiting for client packets..."));
     }
   } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
+    rxErrorCount++;
     Serial.print(F("[SERVER] RX failed, code="));
     Serial.println(state);
   }

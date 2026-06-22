@@ -23,7 +23,7 @@
 | `msgType` | 名稱 | 間隔 | 說明 |
 |---|---|---|---|
 | `1` | MSG_DATA | 1 s | 位置 + 速度向量 |
-| `2` | MSG_ACK | — | 保留 |
+| `2` | MSG_ACK | event-driven | 岸上端收到 DATA 後回覆短 ACK（含 ackSeq / RSSI / SNR） |
 | `3` | MSG_HELLO | — | 保留 |
 | `4` | MSG_TELEMETRY | 10 s | 電量 + 溫濕度 |
 
@@ -65,7 +65,13 @@
 | `tempC10` | `int16` | 溫度 × 10（0.1°C，`INT16_MIN` = 無感測器）|
 | `humidityPct` | `uint8` | 相對濕度 0–100%（`0xFF` = 無感測器）|
 
-> 溫濕度感測器（如 SHT30 / BME280）尚待安裝，目前固定回傳 no-sensor 標記。
+### AckPayload（5 bytes，MSG_ACK 使用）
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `ackSeq` | `uint16` | 被確認收到的 DATA 封包序號 |
+| `rssiDbm10` | `int16` | 接收 RSSI × 10（dBm） |
+| `snrDb10` | `int8` | 接收 SNR × 10（dB） |
 
 ### MAC（保留）
 
@@ -77,7 +83,7 @@
 
 Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修改），只接受其中 `srcId` 的封包，其餘靜默丟棄。
 
-開機時從 `DEFAULT_WHITELIST[]` 初始化；重啟後恢復預設值（尚未持久化）。
+開機時先讀 NVS 的白名單；若無資料才回退 `DEFAULT_WHITELIST[]`。
 
 擴充多人模式只需將新 Client 的 MAC 末 2 bytes 加入清單即可，詳見 [API 文件](api.md)。
 
