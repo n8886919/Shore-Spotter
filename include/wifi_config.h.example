@@ -1,0 +1,20 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// Phone hotspot credentials (TEMPLATE).
+//
+// 架構：手機開「個人熱點」，岸上端 SERVER 開機後以 station (STA) 模式連線到
+// 這個熱點，再用手機分配到的 IP 提供監控 Web UI。
+//
+// 使用方式：
+//   1. 複製本檔為 wifi_config.h（同目錄）。
+//   2. 把下面兩個值改成你在手機上建立的熱點 SSID / 密碼。
+//   （此檔僅 SERVER 角色使用，CLIENT 不需 WiFi。）
+//
+// wifi_config.h 已列入 .gitignore，不會被提交，避免密碼進版控。
+// ---------------------------------------------------------------------------
+constexpr char WIFI_SSID[]     = "YOUR_HOTSPOT_SSID";
+constexpr char WIFI_PASSWORD[] = "YOUR_HOTSPOT_PASSWORD";
+
+// 連線等待逾時（毫秒）。逾時後 SERVER 仍會繼續跑 LoRa 追蹤，
+// WiFi 會在背景自動重連，連上後即可開啟監控頁。
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;

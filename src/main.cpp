@@ -12,18 +12,28 @@
 
 #include <U8g2lib.h>
 
+#include "protocol.h"  // shared LoRa wire protocol (client + server)
+
 #if defined(ROLE_SERVER)
 #include <WiFi.h>
 #include <WebServer.h>
+#include <MagnetometerDrv.hpp>  // SensorLib: QMC6310 magnetometer (station heading)
 #include "web_ui.h"
+#include "wifi_config.h"  // phone hotspot SSID / password (edit there)
 #endif
-// AP credentials — SSID uses MAC last 4 hex chars for uniqueness.
-constexpr char AP_PASSWORD[] = "nolan1234";
 
 // IMPORTANT:
 // This project keeps one main.cpp and splits behavior by build flags:
 // ROLE_CLIENT (water side) / ROLE_SERVER (shore side).
 // Upload env:tbeam-client or env:tbeam-server to each board.
+//
+// Fail fast at compile time: exactly one role must be selected.
+#if !defined(ROLE_CLIENT) && !defined(ROLE_SERVER)
+#error "No role selected: define ROLE_CLIENT or ROLE_SERVER (use env:tbeam-client / env:tbeam-server)."
+#endif
+#if defined(ROLE_CLIENT) && defined(ROLE_SERVER)
+#error "Both roles defined: pick only ROLE_CLIENT or ROLE_SERVER, not both."
+#endif
 
 // T-Beam Supreme (SX1262) pins from LilyGO hardware docs.
 constexpr int LORA_SCK = 12;
@@ -46,7 +56,7 @@ constexpr int TX_POWER_MAX_DBM = 22;
 constexpr uint32_t ATPC_EVAL_MS = 15000;
 
 constexpr uint32_t SEND_INTERVAL_MS = 1000;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 10000;  // battery + env packet rate
+constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000;  // battery + env packet rate
 constexpr uint32_t BATTERY_UPDATE_MS = 5000;
 constexpr uint32_t ENV_UPDATE_MS = 5000;
 constexpr uint32_t SERVER_IDLE_LOG_MS = 5000;
@@ -54,15 +64,25 @@ constexpr uint32_t LINK_TIMEOUT_MS = 5000;
 constexpr uint32_t LINK_WARN_MS = 15000;
 constexpr uint32_t DISPLAY_REFRESH_MS = 500;
 constexpr uint32_t LCD_ALERT_BLINK_MS = 5000;
+constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;  // server: re-attempt hotspot every 5 s when offline
 
 constexpr uint16_t BATT_LOW_MV = 3500;   // conservative battery-safe threshold
 constexpr uint16_t BATT_FULL_MV = 4150;
 constexpr int16_t TEMP_WARN_C10 = 500;   // 50.0C
 constexpr uint8_t HUM_WARN_PCT = 90;
 
+// Client OLED is normally off to save power; short-press PWR wakes it briefly.
+constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
+
 #if defined(ROLE_SERVER)
-constexpr uint32_t TRACK_INTERVAL_MS = 10000;  // 1 pt / 10 s -> 720 pts = 2 hr
-constexpr size_t   TRACK_CAP = 720;
+constexpr uint32_t TRACK_INTERVAL_MS = 1000;   // 1 pt / 1 s -> 300 pts = 5 min path
+constexpr size_t   TRACK_CAP = 300;
+// Camera servo (SPT5435LV-180) driven by ESP32 LEDC PWM on IO21.
+constexpr int SERVO_PIN = 21;
+constexpr int SERVO_MIN_US = 500;    // -> 0 deg
+constexpr int SERVO_MAX_US = 2500;   // -> 180 deg
+constexpr int SERVO_LEDC_CH = 0;     // LEDC channel (arduino-esp32 2.x)
+constexpr uint32_t MAG_SAMPLE_MS = 200;
 #endif
 
 // GPS UART defaults (common on T-Beam family, override if your board differs).
@@ -96,69 +116,6 @@ String cachedApIp = "";
 
 // Shared OLED object — client enables it only during boot-info and shutdown screens.
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
-
-struct __attribute__((packed)) PacketHeader {
-  uint8_t magic;
-  uint8_t version;
-  uint8_t networkId;
-  uint16_t srcId;
-  uint16_t dstId;
-  uint8_t msgType;
-  uint16_t seq;
-  uint8_t payloadLen;
-};
-
-struct __attribute__((packed)) PositionPayload {
-  int32_t  latE7;        // latitude  * 1e7 (fixed-point, exact and compact)
-  int32_t  lonE7;        // longitude * 1e7
-  uint8_t  fix;          // GPS fix (0/1)
-  uint16_t speedCmS;     // ground speed, cm/s
-  uint16_t courseDeg10;  // track angle 0.1° units (0–3599)
-  int16_t  accelCmS2;    // smoothed acceleration, cm/s²
-};
-
-// Battery + environment sent separately every 10 s to reduce 1 Hz packet size.
-struct __attribute__((packed)) TelemetryPayload {
-  uint16_t batteryMv;    // battery voltage mV (0 = unknown)
-  int16_t  tempC10;      // temperature × 10 (0.1 °C resolution, INT16_MIN = no sensor)
-  uint8_t  humidityPct;  // relative humidity 0–100 %, 0xFF = no sensor
-};
-
-struct __attribute__((packed)) AckPayload {
-  uint16_t ackSeq;
-  int16_t rssiDbm10;
-  int8_t snrDb10;
-};
-
-// ---------------------------------------------------------------------------
-// Application protocol (stage 1: binary header, ready for 1->many / many->many)
-// ---------------------------------------------------------------------------
-// Grouping works on two layers:
-//   * RF_SYNC_WORD (above) = PHY-layer coarse filter, cheap power saving.
-//   * NETWORK_ID (below)   = logical group, authoritative and scalable.
-constexpr uint8_t PROTO_MAGIC = 0x53;
-constexpr uint8_t PROTO_VERSION = 1;
-constexpr uint16_t ID_BROADCAST = 0xFFFF;
-constexpr uint8_t MAC_LEN = 4;  // reserved for HMAC (stage 2), zero-filled now
-
-constexpr uint8_t NETWORK_ID = 0x01;  // group id; different groups => different value
-constexpr uint16_t SERVER_ID = 0x0010;   // shore station id
-// nodeId is derived at runtime from the ESP32 chip MAC (last 2 bytes).
-// No need to change source code per board — each chip is already unique.
-
-enum MsgType : uint8_t {
-  MSG_DATA      = 1,
-  MSG_ACK       = 2,
-  MSG_HELLO     = 3,
-  MSG_TELEMETRY = 4,  // battery + temp/humidity, 10 s interval
-};
-
-constexpr size_t DATA_PACKET_LEN =
-    sizeof(PacketHeader) + sizeof(PositionPayload) + MAC_LEN;
-constexpr size_t TELEMETRY_PACKET_LEN =
-    sizeof(PacketHeader) + sizeof(TelemetryPayload) + MAC_LEN;
-constexpr size_t ACK_PACKET_LEN =
-  sizeof(PacketHeader) + sizeof(AckPayload) + MAC_LEN;
 
 #if defined(ROLE_SERVER)
 struct DecodedData {
@@ -219,6 +176,11 @@ static int16_t lastAckRssiDbm10 = -1270;
 static int8_t lastAckSnrDb10 = -127;
 static uint32_t nextAtpcEvalMs = 0;
 
+// Client OLED wake state (short-press PWR turns the screen on for a few seconds)
+static bool clientOledAwake = false;
+static uint32_t clientOledOffMs = 0;
+static uint32_t nextClientOledRefreshMs = 0;
+
 // Derive a node id from the last 2 bytes of the ESP32's factory-burned MAC.
 // 65536 possible values — collision probability negligible for any real deployment.
 static uint16_t derivedNodeId() {
@@ -236,8 +198,10 @@ uint32_t lastRxMs = 0;
 float lastRssi = 0;
 float lastSnr = 0;
 uint32_t nextDisplayMs = 0;
+uint32_t nextWifiRetryMs = 0;
+uint32_t wifiReconnectingUntilMs = 0;
 
-// Telemetry (slow path, MSG_TELEMETRY every 10 s)
+// Telemetry (slow path, MSG_TELEMETRY every 30 s)
 DecodedTelemetry lastTelemetry{0, 0, INT16_MIN, 0xFF};
 bool haveTelemetry = false;
 uint32_t lastTelemetryRxMs = 0;
@@ -252,10 +216,24 @@ static uint32_t pktsThisWindow  = 0;
 static uint32_t pktWindowStartMs = 0;
 static float    cachedPktRate   = 0.0f;  // pkts/s averaged over ~60 s
 
-// Servo bearing calibration
-// User centres servo, places camera station, then calls POST /api/calibrate/servo.
-// The supplied compass heading is stored here; servo 90° corresponds to this bearing.
-static float servoOriginDeg = 0.0f;
+// Servo + tracking state.
+// Geometry: world_bearing = mag_heading + servo_angle + mountOffset
+//   * Manual: operator nudges servo_angle until the camera is on the surfer.
+//   * Start : mountOffset is locked from the current (bearing, heading, angle).
+//   * Track : servo_angle = bearing_now - heading_now - mountOffset (clamped 0..180).
+// The magnetometer term lets the station be bumped/rotated mid-session.
+enum TrackMode : uint8_t { MODE_IDLE, MODE_MANUAL, MODE_TRACKING, MODE_PAUSED };
+static TrackMode trackMode = MODE_MANUAL;
+static float servoAngleDeg = 90.0f;   // current commanded servo angle (0..180)
+static float servoTargetDeg = 90.0f;  // desired angle while tracking
+static float mountOffsetDeg = 0.0f;   // servo-to-world mounting offset (persisted)
+static bool  mountCalibrated = false;
+
+// Magnetometer (QMC6310) — station board heading in degrees (-1 = invalid)
+static SensorQMC6310 mag;
+static bool  magOnline = false;
+static float magHeadingDeg = -1.0f;
+static uint32_t nextMagMs = 0;
 static uint32_t rxDataCount = 0;
 static uint32_t rxTelemetryCount = 0;
 static uint32_t rxDropCount = 0;
@@ -430,6 +408,13 @@ static void drawTriIcon(int x, int yTop, TriState s) {
   display.drawXBMP(x, yTop, 8, 8, triBitmap(s));
 }
 
+// good/normal/bad wording used by the server run screen (replaces the tri-state icons).
+static const char* triText(TriState s) {
+  if (s == TRI_OK) return "Good";
+  if (s == TRI_WARN) return "Normal";
+  return "Bad";
+}
+
 static TriState linkState(uint32_t ageMs) {
   if (ageMs <= LINK_TIMEOUT_MS) return TRI_OK;
   if (ageMs <= LINK_WARN_MS) return TRI_WARN;
@@ -489,14 +474,16 @@ static void loadWhitelistFromNvs() {
   }
 }
 
-static void saveServoOriginToNvs() {
-  prefs.putFloat("servo0", servoOriginDeg);
+static void saveMountOffsetToNvs() {
+  prefs.putFloat("mountoff", mountOffsetDeg);
+  prefs.putBool("mountcal", mountCalibrated);
 }
 
 static void loadServerSettings() {
   prefs.begin("shorespotter", false);
   loadWhitelistFromNvs();
-  servoOriginDeg = prefs.getFloat("servo0", 0.0f);
+  mountOffsetDeg = prefs.getFloat("mountoff", 0.0f);
+  mountCalibrated = prefs.getBool("mountcal", false);
 }
 
 static size_t buildAckPacket(uint8_t *buf, uint16_t dstId, uint16_t ackSeq,
@@ -683,12 +670,121 @@ static double computeBearing(double lat1, double lon1, double lat2, double lon2)
   return brng;
 }
 
+static float normalize360(float a) {
+  while (a < 0) a += 360.0f;
+  while (a >= 360.0f) a -= 360.0f;
+  return a;
+}
+
+static const char *trackModeStr(TrackMode m) {
+  switch (m) {
+    case MODE_TRACKING: return "tracking";
+    case MODE_PAUSED:   return "paused";
+    case MODE_MANUAL:   return "manual";
+    default:            return "idle";
+  }
+}
+
+static void servoWriteMicros(int us) {
+  us = constrain(us, SERVO_MIN_US, SERVO_MAX_US);
+  uint32_t duty = (uint32_t)((float)us / 20000.0f * 65535.0f);  // 50 Hz, 16-bit
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(SERVO_PIN, duty);
+#else
+  ledcWrite(SERVO_LEDC_CH, duty);
+#endif
+}
+
+static void setServoAngle(float deg) {
+  deg = constrain(deg, 0.0f, 180.0f);
+  servoAngleDeg = deg;
+  int us = SERVO_MIN_US +
+           (int)lroundf(deg / 180.0f * (SERVO_MAX_US - SERVO_MIN_US));
+  servoWriteMicros(us);
+}
+
+static void initServo() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(SERVO_PIN, 50, 16);
+#else
+  ledcSetup(SERVO_LEDC_CH, 50, 16);
+  ledcAttachPin(SERVO_PIN, SERVO_LEDC_CH);
+#endif
+  setServoAngle(servoAngleDeg);  // centre on boot
+}
+
+static bool initMag() {
+  if (mag.begin(Wire, QMC6310U_SLAVE_ADDRESS, OLED_SDA_PIN, OLED_SCL_PIN) ||
+      mag.begin(Wire, QMC6310N_SLAVE_ADDRESS, OLED_SDA_PIN, OLED_SCL_PIN)) {
+    mag.configMagnetometer(OperationMode::CONTINUOUS_MEASUREMENT,
+                           MagFullScaleRange::FS_8G, 200.0f,
+                           MagOverSampleRatio::OSR_1, MagDownSampleRatio::DSR_1);
+    Serial.println(F("[MAG] QMC6310 init ok"));
+    return true;
+  }
+  Serial.println(F("[MAG] QMC6310 not found (heading N/A, station assumed fixed)"));
+  return false;
+}
+
+static void sampleMag() {
+  if (!magOnline) {
+    magHeadingDeg = -1.0f;
+    return;
+  }
+  MagnetometerData d;
+  if (mag.readData(d)) {
+    magHeadingDeg = normalize360(d.heading_degrees);
+  }
+}
+
+// Heading used in tracking maths; 0 when no magnetometer (station assumed fixed).
+static float trackingHeading() {
+  return (magOnline && magHeadingDeg >= 0) ? magHeadingDeg : 0.0f;
+}
+
+static bool haveBearingFix() {
+  return havePkt && lastData.fix && gps.location.isValid();
+}
+
+// Recompute and command the servo while tracking.
+static void updateTracking() {
+  if (trackMode != MODE_TRACKING || !mountCalibrated || !haveBearingFix()) return;
+  float bearing = (float)computeBearing(gps.location.lat(), gps.location.lng(),
+                                        lastData.lat, lastData.lon);
+  float target = normalize360(bearing - trackingHeading() - mountOffsetDeg);
+  if (target > 270.0f) target -= 360.0f;  // wrap small negatives toward 0
+  servoTargetDeg = constrain(target, 0.0f, 180.0f);
+  setServoAngle(servoTargetDeg);
+}
+
+// Lock the servo-to-world mounting offset from the current aim, then track.
+static bool startTracking() {
+  if (!haveBearingFix()) return false;
+  float bearingCal = (float)computeBearing(gps.location.lat(), gps.location.lng(),
+                                           lastData.lat, lastData.lon);
+  float off = normalize360(bearingCal - trackingHeading() - servoAngleDeg);
+  if (off > 180.0f) off -= 360.0f;
+  mountOffsetDeg = off;
+  mountCalibrated = true;
+  saveMountOffsetToNvs();
+  trackMode = MODE_TRACKING;
+  updateTracking();
+  return true;
+}
+
 static void renderServerDisplay() {
-  const int leftW = 63;
-  uint32_t age = havePkt ? (millis() - lastRxMs) : UINT32_MAX;
+  // Centre label column ("V" / T/H / GPS / BAT) is framed by two vertical lines;
+  // Server values sit left of it, client values right of it. The 15 px labels get
+  // a 1 px gap to each line; the odd rounding pixel is biased to the right.
+  const int leftLineX = 55;
+  const int rightLineX = 73;
+  const int leftCx = 27;   // centre of the Server (left) region
+  const int rightCx = 100; // centre of the Client (right) region
+  const int midCx = 64;    // centre of the label column
+
   TriState sGps = serverGpsState();
 
-  // Left panel rotates client index every 5 seconds.
+  // Right region rotates the selected whitelist client every 5 seconds.
   size_t clientCount = clientWhitelistCount > 0 ? clientWhitelistCount : 1;
   size_t clientIdx = (millis() / 5000UL) % clientCount;
   uint16_t selectedId = clientWhitelistCount > 0 ? clientWhitelist[clientIdx] : 0;
@@ -696,67 +792,90 @@ static void renderServerDisplay() {
                         ((millis() - lastRxMs) <= LINK_WARN_MS);
   bool selectedTelemetry = haveTelemetry && (lastTelemetry.srcId == selectedId);
 
-  TriState loraState = TRI_BAD;
-  TriState cGpsState = TRI_BAD;
-  if (selectedOnline) {
-    loraState = linkState(millis() - lastRxMs);
-    cGpsState = lastData.fix ? TRI_OK : TRI_WARN;
-  }
+  TriState loraState = selectedOnline ? linkState(millis() - lastRxMs) : TRI_BAD;
+  TriState cGps = selectedOnline ? (lastData.fix ? TRI_OK : TRI_WARN) : TRI_BAD;
 
-  char line[28];
+  char buf[24];
   display.clearBuffer();
   display.setFont(u8g2_font_5x7_tr);
-  display.drawVLine(leftW, 0, 64);
 
-  // LEFT: Client panel
-  snprintf(line, sizeof(line), "Client_%u", (unsigned)clientIdx);
-  display.drawStr(0, 8, line);
+  auto drawAt = [&](int cx, int y, const char* s) {
+    display.drawStr(cx - display.getStrWidth(s) / 2, y, s);
+  };
+  auto drawLeft = [&](int y, const char* s) { drawAt(leftCx, y, s); };
+  auto drawRight = [&](int y, const char* s) { drawAt(rightCx, y, s); };
+  auto drawMid = [&](int y, const char* s) { drawAt(midCx, y, s); };
 
-  if (selectedTelemetry && lastTelemetry.tempC10 != INT16_MIN && lastTelemetry.humidityPct != 0xFF) {
-    float etaH = estimateBatteryHours(lastTelemetry.batteryMv);
-    snprintf(line, sizeof(line), "%.1fC/%u%%/%.1fh", lastTelemetry.tempC10 / 10.0f,
-             lastTelemetry.humidityPct, etaH);
+  // Two continuous vertical lines frame the label column from the title row down
+  // through the BAT row.
+  display.drawVLine(leftLineX, 0, 45);
+  display.drawVLine(rightLineX, 0, 45);
+
+  // --- Title row ---
+  drawLeft(8, "Server");
+  drawMid(8, "V");
+  if (clientWhitelistCount > 0) {
+    snprintf(buf, sizeof(buf), "Client %u/%u", (unsigned)(clientIdx + 1),
+             (unsigned)clientWhitelistCount);
   } else {
-    snprintf(line, sizeof(line), "--.-C/--%%/--.-h");
+    snprintf(buf, sizeof(buf), "Client -/-");
   }
-  display.drawStr(0, 18, line);
+  drawRight(8, buf);
 
-  display.drawStr(0, 30, "LORA:");
-  drawTriIcon(28, 22, loraState);
-
-  display.drawStr(0, 42, "CGPS:");
-  drawTriIcon(28, 34, cGpsState);
-
-  // RIGHT: Server panel
-  display.drawStr(leftW + 3, 8, "Server");
+  // --- T/H row ---
   if (cachedTempC10 != INT16_MIN && cachedHumidityPct != 0xFF) {
-    snprintf(line, sizeof(line), "%.1fC/%u%%", cachedTempC10 / 10.0f, cachedHumidityPct);
+    snprintf(buf, sizeof(buf), "%.1fC/%u%%", cachedTempC10 / 10.0f, cachedHumidityPct);
   } else {
-    snprintf(line, sizeof(line), "--.-C/--%%");
+    snprintf(buf, sizeof(buf), "--.-C/--%%");
   }
-  display.drawStr(leftW + 3, 18, line);
-
-  drawTriIcon(leftW + 3, 22, sGps);
-  if (gps.hdop.isValid()) {
-    snprintf(line, sizeof(line), "SGPS %.1f", gps.hdop.hdop());
+  drawLeft(19, buf);
+  if (selectedTelemetry && lastTelemetry.tempC10 != INT16_MIN &&
+      lastTelemetry.humidityPct != 0xFF) {
+    snprintf(buf, sizeof(buf), "%.1fC/%u%%", lastTelemetry.tempC10 / 10.0f,
+             lastTelemetry.humidityPct);
   } else {
-    snprintf(line, sizeof(line), "SGPS --");
+    snprintf(buf, sizeof(buf), "--.-C/--%%");
   }
-  display.drawStr(leftW + 14, 30, line);
+  drawRight(19, buf);
+  drawMid(19, "T/H");
 
-  if (havePkt) {
-    snprintf(line, sizeof(line), "ID:%04X %lus", lastData.srcId, (unsigned long)(age / 1000));
+  // --- GPS row ---
+  drawLeft(30, triText(sGps));
+  drawRight(30, triText(cGps));
+  drawMid(30, "GPS");
+
+  // --- BAT row (battery endurance estimate, both sides) ---
+  if (cachedBatteryMv > 0) {
+    snprintf(buf, sizeof(buf), "%.1fhr", estimateBatteryHours(cachedBatteryMv));
   } else {
-    snprintf(line, sizeof(line), "ID:---- --s");
+    snprintf(buf, sizeof(buf), "--.-hr");
   }
-  display.drawStr(leftW + 3, 40, line);
+  drawLeft(41, buf);
+  if (selectedTelemetry && lastTelemetry.batteryMv > 0) {
+    snprintf(buf, sizeof(buf), "%.1fhr", estimateBatteryHours(lastTelemetry.batteryMv));
+  } else {
+    snprintf(buf, sizeof(buf), "--.-hr");
+  }
+  drawRight(41, buf);
+  drawMid(41, "BAT");
 
-  snprintf(line, sizeof(line), "R%.0f S%.1f", lastRssi, lastSnr);
-  display.drawStr(leftW + 3, 50, line);
+  // --- LoRa link state (right side, below the label column) ---
+  snprintf(buf, sizeof(buf), "LoRa:%s", triText(loraState));
+  drawAt(96, 52, buf);
 
-  snprintf(line, sizeof(line), "A%lu D%lu", (unsigned long)ackTxCount,
-           (unsigned long)rxDataCount);
-  display.drawStr(leftW + 3, 60, line);
+  // --- Bottom full-width WiFi status line (not split into halves) ---
+  char wifiBuf[64];
+  if (WiFi.status() == WL_CONNECTED && !cachedApIp.isEmpty()) {
+    snprintf(wifiBuf, sizeof(wifiBuf), "%s", cachedApIp.c_str());
+  } else if (millis() < wifiReconnectingUntilMs) {
+    snprintf(wifiBuf, sizeof(wifiBuf), "WiFi connecting: %s ...", WIFI_SSID);
+  } else {
+    uint32_t remain =
+        nextWifiRetryMs > millis() ? (nextWifiRetryMs - millis()) / 1000 + 1 : 0;
+    snprintf(wifiBuf, sizeof(wifiBuf), "reconnecting to %s in %lus", WIFI_SSID,
+             (unsigned long)remain);
+  }
+  display.drawStr(64 - display.getStrWidth(wifiBuf) / 2, 63, wifiBuf);
 
   display.sendBuffer();
 }
@@ -830,6 +949,20 @@ static String buildTrackJson() {
   js += haveTelemetry
             ? String((uint32_t)((millis() - lastTelemetryRxMs) / 1000))
             : F("-1");
+  js += F("},\"servo\":{\"angle\":");
+  js += String(servoAngleDeg, 1);
+  js += F(",\"target\":");
+  js += String(servoTargetDeg, 1);
+  js += F(",\"mode\":\"");
+  js += trackModeStr(trackMode);
+  js += F("\",\"calibrated\":");
+  js += mountCalibrated ? F("true") : F("false");
+  js += F(",\"mount_offset_deg\":");
+  js += String(mountOffsetDeg, 1);
+  js += F("},\"mag\":{\"online\":");
+  js += magOnline ? F("true") : F("false");
+  js += F(",\"heading\":");
+  js += (magOnline && magHeadingDeg >= 0) ? String(magHeadingDeg, 1) : F("-1");
   js += F("},\"history\":[");
   size_t start = (trackCount == TRACK_CAP) ? trackHead : 0;
   for (size_t i = 0; i < trackCount; i++) {
@@ -922,10 +1055,20 @@ static String buildStatusJson() {
   js += String(rxErrorCount);
   js += F("},");
 
-  // Servo calibration state
-  js += F("\"servo_origin_deg\":");
-  js += String(servoOriginDeg, 1);
-  js += '}';
+  // Servo / tracking + magnetometer state
+  js += F("\"servo\":{\"angle\":");
+  js += String(servoAngleDeg, 1);
+  js += F(",\"mode\":\"");
+  js += trackModeStr(trackMode);
+  js += F("\",\"calibrated\":");
+  js += mountCalibrated ? F("true") : F("false");
+  js += F(",\"mount_offset_deg\":");
+  js += String(mountOffsetDeg, 1);
+  js += F("},\"mag\":{\"online\":");
+  js += magOnline ? F("true") : F("false");
+  js += F(",\"heading\":");
+  js += (magOnline && magHeadingDeg >= 0) ? String(magHeadingDeg, 1) : F("-1");
+  js += F("}}");
   return js;
 }
 
@@ -978,21 +1121,60 @@ static void initWebServer() {
   httpServer.on("/api/status", HTTP_GET, []() {
     httpServer.send(200, "application/json", buildStatusJson());
   });
-  // POST /api/calibrate/servo?heading=<degrees>
-  // Steps: centre servo mechanically → place camera station → call this endpoint.
-  // The supplied heading (read from compass) becomes the servo "zero" reference.
-  // TODO: replace query param with auto-read from compass module (e.g. QMC5883L).
-  httpServer.on("/api/calibrate/servo", HTTP_POST, []() {
-    if (httpServer.hasArg("heading")) {
-      servoOriginDeg = httpServer.arg("heading").toFloat();
-      saveServoOriginToNvs();
-      httpServer.send(200, "application/json",
-                      "{\"ok\":true,\"servo_origin_deg\":" +
-                          String(servoOriginDeg, 1) + "}");
-    } else {
+  // POST /api/servo?angle=<0..180> — manual aim; blocked while auto-tracking.
+  httpServer.on("/api/servo", HTTP_POST, []() {
+    if (!httpServer.hasArg("angle")) {
       httpServer.send(400, "application/json",
-                      "{\"ok\":false,\"error\":\"missing heading param\"}");
+                      "{\"ok\":false,\"error\":\"missing angle param\"}");
+      return;
     }
+    if (trackMode == MODE_TRACKING) {
+      httpServer.send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"pause tracking first\"}");
+      return;
+    }
+    float a = constrain(httpServer.arg("angle").toFloat(), 0.0f, 180.0f);
+    setServoAngle(a);
+    servoTargetDeg = a;
+    if (trackMode == MODE_IDLE) trackMode = MODE_MANUAL;
+    httpServer.send(200, "application/json",
+                    "{\"ok\":true,\"angle\":" + String(servoAngleDeg, 1) + "}");
+  });
+  // POST /api/track/start — lock the current aim as calibration and auto-track.
+  httpServer.on("/api/track/start", HTTP_POST, []() {
+    if (startTracking()) {
+      httpServer.send(200, "application/json",
+                      "{\"ok\":true,\"mount_offset_deg\":" +
+                          String(mountOffsetDeg, 1) + "}");
+    } else {
+      httpServer.send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"need server+client GPS fix\"}");
+    }
+  });
+  // POST /api/track/pause — hold servo at the current angle, stop auto updates.
+  httpServer.on("/api/track/pause", HTTP_POST, []() {
+    if (trackMode == MODE_TRACKING) trackMode = MODE_PAUSED;
+    httpServer.send(200, "application/json",
+                    "{\"ok\":true,\"mode\":\"" + String(trackModeStr(trackMode)) +
+                        "\"}");
+  });
+  // POST /api/track/resume — resume auto-tracking with the existing calibration.
+  httpServer.on("/api/track/resume", HTTP_POST, []() {
+    if (!mountCalibrated) {
+      httpServer.send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"not calibrated, use start\"}");
+      return;
+    }
+    trackMode = MODE_TRACKING;
+    updateTracking();
+    httpServer.send(200, "application/json",
+                    "{\"ok\":true,\"mode\":\"tracking\"}");
+  });
+  // POST /api/track/stop — return to manual control (keeps calibration).
+  httpServer.on("/api/track/stop", HTTP_POST, []() {
+    trackMode = MODE_MANUAL;
+    httpServer.send(200, "application/json",
+                    "{\"ok\":true,\"mode\":\"manual\"}");
   });
   httpServer.onNotFound([]() {
     httpServer.sendHeader("Location", "/");
@@ -1032,15 +1214,8 @@ static void showShutdownAndPowerOff() {
 // Enables OLED rail, displays for 10 s, then disables rail to save power.
 // ---------------------------------------------------------------------------
 #if defined(ROLE_CLIENT)
-static void showClientBootScreen() {
-  if (!pmuOnline) return;
-  pmu.setALDO1Voltage(3300);
-  pmu.enableALDO1();
-  delay(100);
-  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
-  display.setI2CAddress(OLED_I2C_ADDR << 1);
-  if (!display.begin()) { pmu.disableALDO1(); return; }
-
+// Draw the status page (ID / battery / temp / humidity) to the current buffer.
+static void drawClientInfoScreen() {
   uint8_t mac[6];
   esp_efuse_mac_get_default(mac);
   char line1[20], line2[20], line3[20], line4[20];
@@ -1066,11 +1241,37 @@ static void showClientBootScreen() {
   display.drawStr(0, 52, line3);
   display.drawStr(0, 64, line4);
   display.sendBuffer();
+}
+
+// Power up the OLED rail and bring up the SH1106. Returns false if it fails.
+static bool enableClientOled() {
+  if (!pmuOnline) return false;
+  pmu.setALDO1Voltage(3300);
+  pmu.enableALDO1();
+  delay(100);
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  display.setI2CAddress(OLED_I2C_ADDR << 1);
+  if (!display.begin()) { pmu.disableALDO1(); return false; }
+  return true;
+}
+
+static void showClientBootScreen() {
+  if (!enableClientOled()) return;
+  drawClientInfoScreen();
 
   delay(10000);
 
   display.clearBuffer();
   display.sendBuffer();
+}
+
+// Short-press PWR wakes the screen for CLIENT_SCREEN_WAKE_MS (non-blocking).
+// The loop() redraws/refreshes it and turns the rail back off when it expires.
+static void wakeClientScreen() {
+  if (!enableClientOled()) return;
+  clientOledAwake = true;
+  clientOledOffMs = millis() + CLIENT_SCREEN_WAKE_MS;
+  nextClientOledRefreshMs = 0;  // force an immediate redraw
 }
 #endif
 
@@ -1079,13 +1280,6 @@ void setup() {
   delay(1200);
   bootMs = millis();
   nodeId = derivedNodeId();
-
-#if !defined(ROLE_CLIENT) && !defined(ROLE_SERVER)
-  Serial.println(F("Define ROLE_CLIENT or ROLE_SERVER in build flags."));
-  while (true) {
-    delay(1000);
-  }
-#endif
 
   if (!initRadio()) {
     while (true) {
@@ -1107,7 +1301,8 @@ void setup() {
   if (pmuOnline) {
     pmu.setALDO1Voltage(3300);
     pmu.enableALDO1();
-    pmu.enableIRQ(XPOWERS_AXP2101_PKEY_LONG_IRQ);  // long-press = shutdown
+    // short-press = wake screen 10 s, long-press = shutdown
+    pmu.enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ | XPOWERS_AXP2101_PKEY_LONG_IRQ);
     delay(100);
   }
   cachedBatteryMv = readBatteryMilliVolts();
@@ -1150,6 +1345,9 @@ void setup() {
   envSensorOnline = initEnvSensor();
   sampleEnvSensor();
   nextEnvMs = millis() + ENV_UPDATE_MS;
+  magOnline = initMag();           // QMC6310 station heading (shared I2C bus 0)
+  nextMagMs = millis() + MAG_SAMPLE_MS;
+  initServo();                     // LEDC PWM on IO21, centre the camera
   display.setI2CAddress(OLED_I2C_ADDR << 1);
   display.begin();
   display.clearBuffer();
@@ -1172,17 +1370,45 @@ void setup() {
   }
   Serial.println();
 
-  uint8_t mac[6];
-  esp_efuse_mac_get_default(mac);
-  char apSsid[20];
-  snprintf(apSsid, sizeof(apSsid), "ShoreSpotter_%02X%02X", mac[4], mac[5]);
-  WiFi.softAP(apSsid, AP_PASSWORD);
-  Serial.print(F("[WiFi] AP SSID: "));
-  Serial.println(apSsid);
-  Serial.print(F("[WiFi] AP IP:   "));
-  Serial.println(WiFi.softAPIP());
-  cachedApIp = WiFi.softAPIP().toString();
-  Serial.println(F("[WiFi] Open browser -> 192.168.4.1"));
+  // Connect to the phone-provided hotspot in station mode.
+  // Credentials come from include/wifi_config.h (WIFI_SSID / WIFI_PASSWORD).
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print(F("[WiFi] Connecting to hotspot \""));
+  Serial.print(WIFI_SSID);
+  Serial.print(F("\" "));
+  uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x12_tr);
+  display.drawStr(0, 12, "SHORE SPOTTER");
+  display.drawHLine(0, 14, 128);
+  if (WiFi.status() == WL_CONNECTED) {
+    cachedApIp = WiFi.localIP().toString();
+    Serial.print(F("[WiFi] Connected. IP: "));
+    Serial.println(cachedApIp);
+    Serial.print(F("[WiFi] Open browser -> http://"));
+    Serial.println(cachedApIp);
+    display.drawStr(0, 32, "WiFi connected");
+    display.drawStr(0, 48, cachedApIp.c_str());
+  } else {
+    cachedApIp = "";
+    Serial.println(F("[WiFi] Hotspot connect FAILED."));
+    Serial.println(F("[WiFi] Check SSID/password in include/wifi_config.h."));
+    Serial.println(F("[WiFi] LoRa tracking still runs; WiFi will auto-retry."));
+    display.drawStr(0, 32, "WiFi FAILED");
+    display.drawStr(0, 48, "see wifi_config.h");
+  }
+  display.sendBuffer();
+  delay(2000);
+
   initWebServer();
 #endif
 }
@@ -1261,12 +1487,28 @@ void loop() {
 
   evaluateAtpc();
 
-  // Long-press PWR → show shutdown screen then power off
+  // PWR key: short-press wakes the screen 10 s, long-press shuts down.
   if (pmuOnline) {
     pmu.getIrqStatus();
+    if (pmu.isPekeyShortPressIrq()) {
+      wakeClientScreen();
+    }
     if (pmu.isPekeyLongPressIrq()) {
       pmu.clearIrqStatus();
       showShutdownAndPowerOff();
+    }
+    pmu.clearIrqStatus();
+  }
+
+  // Keep the woken screen refreshed, then power the rail back off when it expires.
+  if (clientOledAwake) {
+    if (millis() >= clientOledOffMs) {
+      display.clearBuffer();
+      display.sendBuffer();
+      clientOledAwake = false;
+    } else if (millis() >= nextClientOledRefreshMs) {
+      nextClientOledRefreshMs = millis() + DISPLAY_REFRESH_MS;
+      drawClientInfoScreen();
     }
   }
 #endif
@@ -1278,6 +1520,31 @@ void loop() {
   if (millis() >= nextEnvMs) {
     nextEnvMs = millis() + ENV_UPDATE_MS;
     sampleEnvSensor();
+  }
+
+  if (millis() >= nextMagMs) {
+    nextMagMs = millis() + MAG_SAMPLE_MS;
+    sampleMag();
+  }
+
+  if (millis() >= nextBatteryMs) {
+    nextBatteryMs = millis() + BATTERY_UPDATE_MS;
+    cachedBatteryMv = readBatteryMilliVolts();  // server's own endurance estimate
+  }
+
+  // WiFi watchdog: re-attempt the hotspot every WIFI_RETRY_INTERVAL_MS while
+  // offline, and refresh the cached IP once (re)connected.
+  if (WiFi.status() == WL_CONNECTED) {
+    if (cachedApIp.isEmpty()) {
+      cachedApIp = WiFi.localIP().toString();
+    }
+  } else {
+    cachedApIp = "";
+    if (millis() >= nextWifiRetryMs) {
+      nextWifiRetryMs = millis() + WIFI_RETRY_INTERVAL_MS;
+      wifiReconnectingUntilMs = millis() + 2000;  // show "reconnecting" briefly
+      WiFi.reconnect();
+    }
   }
 
   // Long-press PWR → show shutdown screen then power off
@@ -1322,6 +1589,7 @@ void loop() {
         lastTrackMs = millis();
         pushTrackPoint((float)d.lat, (float)d.lon);
       }
+      updateTracking();  // steer the camera servo toward the surfer (if tracking)
 
       uint8_t ackBuf[ACK_PACKET_LEN];
       size_t ackLen = buildAckPacket(ackBuf, d.srcId, d.seq, lastRssi, lastSnr);
