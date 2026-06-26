@@ -17,7 +17,7 @@
 #if defined(ROLE_SERVER)
 #include <WiFi.h>
 #include <WebServer.h>
-#include <MagnetometerDrv.hpp>  // SensorLib: QMC6310 magnetometer (station heading)
+#include <SensorQMC6310.hpp>  // SensorLib: QMC6310 magnetometer (station heading)
 #include "web_ui.h"
 #include "wifi_config.h"  // phone hotspot SSID / password (edit there)
 #endif
@@ -711,6 +711,11 @@ static void initServo() {
   ledcAttachPin(SERVO_PIN, SERVO_LEDC_CH);
 #endif
   setServoAngle(servoAngleDeg);  // centre on boot
+  Serial.print(F("[SERVO] LEDC ready on IO"));
+  Serial.print(SERVO_PIN);
+  Serial.print(F(", centre "));
+  Serial.print(servoAngleDeg, 0);
+  Serial.println(F(" deg"));
 }
 
 static bool initMag() {
@@ -755,6 +760,18 @@ static void updateTracking() {
   if (target > 270.0f) target -= 360.0f;  // wrap small negatives toward 0
   servoTargetDeg = constrain(target, 0.0f, 180.0f);
   setServoAngle(servoTargetDeg);
+  static uint32_t nextTrackLogMs = 0;
+  if (millis() >= nextTrackLogMs) {
+    nextTrackLogMs = millis() + 3000;
+    Serial.print(F("[TRACK] bearing="));
+    Serial.print(bearing, 1);
+    Serial.print(F(" head="));
+    Serial.print(trackingHeading(), 1);
+    Serial.print(F(" off="));
+    Serial.print(mountOffsetDeg, 1);
+    Serial.print(F(" servo="));
+    Serial.println(servoTargetDeg, 1);
+  }
 }
 
 // Lock the servo-to-world mounting offset from the current aim, then track.
@@ -768,6 +785,14 @@ static bool startTracking() {
   mountCalibrated = true;
   saveMountOffsetToNvs();
   trackMode = MODE_TRACKING;
+  Serial.print(F("[TRACK] start: bearing="));
+  Serial.print(bearingCal, 1);
+  Serial.print(F(" head="));
+  Serial.print(trackingHeading(), 1);
+  Serial.print(F(" servo="));
+  Serial.print(servoAngleDeg, 1);
+  Serial.print(F(" -> mount_offset="));
+  Serial.println(mountOffsetDeg, 1);
   updateTracking();
   return true;
 }
@@ -1137,6 +1162,8 @@ static void initWebServer() {
     setServoAngle(a);
     servoTargetDeg = a;
     if (trackMode == MODE_IDLE) trackMode = MODE_MANUAL;
+    Serial.print(F("[SERVO] manual angle="));
+    Serial.println(servoAngleDeg, 1);
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"angle\":" + String(servoAngleDeg, 1) + "}");
   });
@@ -1154,6 +1181,7 @@ static void initWebServer() {
   // POST /api/track/pause — hold servo at the current angle, stop auto updates.
   httpServer.on("/api/track/pause", HTTP_POST, []() {
     if (trackMode == MODE_TRACKING) trackMode = MODE_PAUSED;
+    Serial.println(F("[TRACK] paused"));
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"" + String(trackModeStr(trackMode)) +
                         "\"}");
@@ -1167,12 +1195,14 @@ static void initWebServer() {
     }
     trackMode = MODE_TRACKING;
     updateTracking();
+    Serial.println(F("[TRACK] resumed"));
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"tracking\"}");
   });
   // POST /api/track/stop — return to manual control (keeps calibration).
   httpServer.on("/api/track/stop", HTTP_POST, []() {
     trackMode = MODE_MANUAL;
+    Serial.println(F("[TRACK] stopped -> manual"));
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"manual\"}");
   });
@@ -1641,7 +1671,14 @@ void loop() {
   } else if (state == RADIOLIB_ERR_RX_TIMEOUT) {
     if (millis() >= nextServerIdleLogMs) {
       nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
-      Serial.println(F("[SERVER] waiting for client packets..."));
+      Serial.print(F("[SERVER] idle | mode="));
+      Serial.print(trackModeStr(trackMode));
+      Serial.print(F(" head="));
+      if (magOnline && magHeadingDeg >= 0) Serial.print(magHeadingDeg, 1);
+      else Serial.print(F("N/A"));
+      Serial.print(F(" servo="));
+      Serial.print(servoAngleDeg, 1);
+      Serial.println(F(" (waiting for client packets)"));
     }
   } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
     rxErrorCount++;
