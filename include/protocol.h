@@ -28,12 +28,14 @@ struct __attribute__((packed)) PositionPayload {
   uint16_t speedCmS;     // ground speed, cm/s
   uint16_t courseDeg10;  // track angle 0.1° units (0–3599)
   int16_t  accelCmS2;    // smoothed acceleration, cm/s²
+  uint8_t  satellites;   // satellites in use (0xFF = unknown)
+  uint8_t  hdop10;       // horizontal DOP × 10 (0xFF = unknown)
 };
 
 // Battery + environment sent separately every 10 s to reduce 1 Hz packet size.
 struct __attribute__((packed)) TelemetryPayload {
   uint16_t batteryMv;    // battery voltage mV (0 = unknown)
-  int16_t  tempC10;      // temperature × 10 (0.1 °C resolution, INT16_MIN = no sensor)
+  int8_t   tempC;        // temperature °C, rounded (INT8_MIN = no sensor)
   uint8_t  humidityPct;  // relative humidity 0–100 %, 0xFF = no sensor
 };
 
@@ -50,7 +52,7 @@ struct __attribute__((packed)) AckPayload {
 //   * RF_SYNC_WORD (PHY, defined in main.cpp) = coarse filter, cheap power saving.
 //   * NETWORK_ID (below)                       = logical group, authoritative.
 constexpr uint8_t PROTO_MAGIC = 0x53;
-constexpr uint8_t PROTO_VERSION = 1;
+constexpr uint8_t PROTO_VERSION = 3;
 constexpr uint16_t ID_BROADCAST = 0xFFFF;
 constexpr uint8_t MAC_LEN = 4;  // reserved for HMAC (stage 2), zero-filled now
 

@@ -68,6 +68,11 @@ constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;  // server: re-attempt hotspot
 
 constexpr uint16_t BATT_LOW_MV = 3500;   // conservative battery-safe threshold
 constexpr uint16_t BATT_FULL_MV = 4150;
+// Battery percentage scale (single Li-ion cell): 0% at 3.2 V, 100% at 4.2 V.
+constexpr uint16_t BATT_EMPTY_MV = 3200;       // 0 %
+constexpr uint16_t BATT_PCT_FULL_MV = 4200;    // 100 %
+constexpr uint16_t BATT_SHUTDOWN_MV = 3200;    // below 0 % -> auto power off
+constexpr uint16_t BATT_PRESENT_MIN_MV = 2500; // ignore implausible/no-battery reads
 constexpr int16_t TEMP_WARN_C10 = 500;   // 50.0C
 constexpr uint8_t HUM_WARN_PCT = 90;
 
@@ -75,8 +80,6 @@ constexpr uint8_t HUM_WARN_PCT = 90;
 constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
 
 #if defined(ROLE_SERVER)
-constexpr uint32_t TRACK_INTERVAL_MS = 1000;   // 1 pt / 1 s -> 300 pts = 5 min path
-constexpr size_t   TRACK_CAP = 300;
 // Camera servo (SPT5435LV-180) driven by ESP32 LEDC PWM on IO21.
 constexpr int SERVO_PIN = 21;
 constexpr int SERVO_MIN_US = 500;    // -> 0 deg
@@ -127,12 +130,14 @@ struct DecodedData {
   uint16_t speedCmS;
   uint16_t courseDeg10;
   int16_t  accelCmS2;
+  uint8_t  satellites;
+  uint8_t  hdop10;
 };
 
 struct DecodedTelemetry {
   uint16_t srcId;
   uint16_t batteryMv;
-  int16_t  tempC10;     // INT16_MIN = no sensor
+  int8_t   tempC;       // INT8_MIN = no sensor
   uint8_t  humidityPct; // 0xFF = no sensor
 };
 
@@ -202,7 +207,7 @@ uint32_t nextWifiRetryMs = 0;
 uint32_t wifiReconnectingUntilMs = 0;
 
 // Telemetry (slow path, MSG_TELEMETRY every 30 s)
-DecodedTelemetry lastTelemetry{0, 0, INT16_MIN, 0xFF};
+DecodedTelemetry lastTelemetry{0, 0, INT8_MIN, 0xFF};
 bool haveTelemetry = false;
 uint32_t lastTelemetryRxMs = 0;
 
@@ -240,13 +245,12 @@ static uint32_t rxDropCount = 0;
 static uint32_t rxErrorCount = 0;
 static uint32_t ackTxCount = 0;
 
-struct TrackPoint { float lat; float lon; };
-static TrackPoint trackBuf[TRACK_CAP];
-static size_t trackHead  = 0;
-static size_t trackCount = 0;
-static uint32_t lastTrackMs = 0;
-
 WebServer httpServer(80);
+
+// Interrupt-driven LoRa RX: DIO1 fires on RxDone; the ISR only sets a flag so
+// the main loop never blocks in receive() and the web server stays responsive.
+volatile bool rxDoneFlag = false;
+void IRAM_ATTR onLoRaDio1() { rxDoneFlag = true; }
 #endif
 
 #if defined(ROLE_SERVER)
@@ -291,6 +295,8 @@ static bool parseDataPacket(const uint8_t *buf, size_t n, DecodedData &out) {
   out.speedCmS    = pos.speedCmS;
   out.courseDeg10 = pos.courseDeg10;
   out.accelCmS2   = pos.accelCmS2;
+  out.satellites  = pos.satellites;
+  out.hdop10      = pos.hdop10;
   return true;
 }
 
@@ -308,7 +314,7 @@ static bool parseTelemetryPacket(const uint8_t *buf, size_t n, DecodedTelemetry 
   memcpy(&tel, buf + sizeof(PacketHeader), sizeof(tel));
   out.srcId       = hdr.srcId;
   out.batteryMv   = tel.batteryMv;
-  out.tempC10     = tel.tempC10;
+  out.tempC       = tel.tempC;
   out.humidityPct = tel.humidityPct;
   return true;
 }
@@ -324,6 +330,19 @@ static uint16_t readBatteryMilliVolts() {
   }
 
   return pmu.getBattVoltage();
+}
+
+// Battery charge percentage: 0% at BATT_EMPTY_MV, 100% at BATT_PCT_FULL_MV.
+static uint8_t batteryPercent(uint16_t mv) {
+  if (mv <= BATT_EMPTY_MV) return 0;
+  if (mv >= BATT_PCT_FULL_MV) return 100;
+  return (uint8_t)lround((mv - BATT_EMPTY_MV) * 100.0f /
+                         (BATT_PCT_FULL_MV - BATT_EMPTY_MV));
+}
+
+// True when external (USB / Type-C) power is present — board runs "plugged in".
+static bool batteryCharging() {
+  return pmuOnline && pmu.isVbusIn();
 }
 
 static bool initPmu() {
@@ -380,15 +399,6 @@ static void sampleEnvSensor() {
   cachedHumidityPct = static_cast<uint8_t>(lround(hc));
 }
 
-static float estimateBatteryHours(uint16_t battMv) {
-  if (battMv <= BATT_LOW_MV) {
-    return 0.0f;
-  }
-  float ratio = (battMv - BATT_LOW_MV) / float(BATT_FULL_MV - BATT_LOW_MV);
-  ratio = constrain(ratio, 0.0f, 1.0f);
-  return ratio * 6.0f;  // conservative upper bound for 2S + radio workload
-}
-
 enum TriState : uint8_t { TRI_OK = 0, TRI_WARN = 1, TRI_BAD = 2 };
 
 // 8x8 monochrome icons (LSB-first rows for U8g2 drawXBMP)
@@ -397,6 +407,7 @@ static const uint8_t ICON_WARN_8[]  = {0x18,0x3C,0x3C,0x3C,0x18,0x00,0x18,0x00};
 static const uint8_t ICON_CROSS_8[] = {0x42,0x66,0x3C,0x18,0x3C,0x66,0x42,0x00};
 static const uint8_t ICON_DROP_8[]  = {0x08,0x1C,0x36,0x36,0x36,0x1C,0x08,0x00};
 static const uint8_t ICON_THERM_8[] = {0x08,0x0C,0x08,0x08,0x08,0x1C,0x1C,0x08};
+static const uint8_t ICON_BOLT_8[]  = {0x38,0x0C,0x06,0x1F,0x1C,0x0C,0x06,0x03};
 
 static const uint8_t* triBitmap(TriState s) {
   if (s == TRI_OK) return ICON_CHECK_8;
@@ -408,35 +419,44 @@ static void drawTriIcon(int x, int yTop, TriState s) {
   display.drawXBMP(x, yTop, 8, 8, triBitmap(s));
 }
 
-// good/normal/bad wording used by the server run screen (replaces the tri-state icons).
-static const char* triText(TriState s) {
-  if (s == TRI_OK) return "Good";
-  if (s == TRI_WARN) return "Normal";
-  return "Bad";
-}
-
-static TriState linkState(uint32_t ageMs) {
-  if (ageMs <= LINK_TIMEOUT_MS) return TRI_OK;
-  if (ageMs <= LINK_WARN_MS) return TRI_WARN;
-  return TRI_BAD;
-}
-
+// 4-level signal grade (Good / OK / Bad / Miss) for GPS & LoRa, shown on the
+// server run screen.
 #if defined(ROLE_SERVER)
-static TriState serverGpsState() {
-  if (!gps.location.isValid()) return TRI_BAD;
-  if (!gps.hdop.isValid()) return TRI_WARN;
-  float hd = gps.hdop.hdop();
-  if (hd <= 1.5f) return TRI_OK;
-  if (hd <= 3.0f) return TRI_WARN;
-  return TRI_BAD;
+enum SigLevel : uint8_t { SIG_GOOD = 0, SIG_OK = 1, SIG_BAD = 2, SIG_MISS = 3 };
+static const char* sig4Text(SigLevel s) {
+  switch (s) {
+    case SIG_GOOD: return "Good";
+    case SIG_OK:   return "OK";
+    case SIG_BAD:  return "Bad";
+    default:       return "Miss";
+  }
 }
 
-static TriState clientGpsState() {
-  if (!havePkt) return TRI_BAD;
-  uint32_t age = millis() - lastRxMs;
-  if (age > LINK_WARN_MS) return TRI_BAD;
-  if (age > LINK_TIMEOUT_MS || !lastData.fix) return TRI_WARN;
-  return TRI_OK;
+// LoRa grade from the last packet's RSSI/SNR; the caller maps "no link" -> Miss.
+static SigLevel loraSignal(float rssi, float snr) {
+  if (snr >= 7.0f && rssi >= -105.0f) return SIG_GOOD;
+  if (snr >= 0.0f) return SIG_OK;
+  return SIG_BAD;
+}
+
+// Unified GPS grade for the station's own GPS and the client's (decoded) GPS.
+//   Good : fix & HDOP <= 2.0 & sats >= 6
+//   OK   : fix & HDOP <= 5.0 & sats >= 4
+//   Bad  : tracking satellites but no usable fix (no fix / sats < 4 / HDOP > 5)
+//   Miss : no satellites and no fix (no signal at all)
+static SigLevel gpsSignal(bool fix, int sats, float hdop) {
+  if (sats <= 0 && !fix) return SIG_MISS;
+  if (!fix || sats < 4) return SIG_BAD;
+  if (hdop <= 2.0f && sats >= 6) return SIG_GOOD;
+  if (hdop <= 5.0f) return SIG_OK;
+  return SIG_BAD;
+}
+
+static SigLevel serverGpsState() {
+  bool  fix  = gps.location.isValid();
+  int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+  float hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
+  return gpsSignal(fix, sats, hdop);
 }
 
 static void saveWhitelistToNvs() {
@@ -609,6 +629,20 @@ static size_t buildDataPacket(uint8_t *buf) {
   if (gps.course.isValid()) {
     pos.courseDeg10 = static_cast<uint16_t>(gps.course.deg() * 10.0f);
   }
+  if (gps.satellites.isValid()) {
+    uint32_t sv = gps.satellites.value();
+    pos.satellites = (sv > 254) ? 254 : static_cast<uint8_t>(sv);
+  } else {
+    pos.satellites = 0xFF;
+  }
+  if (gps.hdop.isValid()) {
+    long hv = lround(gps.hdop.hdop() * 10.0);
+    if (hv < 0) hv = 0;
+    if (hv > 254) hv = 254;
+    pos.hdop10 = static_cast<uint8_t>(hv);
+  } else {
+    pos.hdop10 = 0xFF;
+  }
 
   size_t off = 0;
   memcpy(buf + off, &hdr, sizeof(hdr));
@@ -633,7 +667,10 @@ static size_t buildTelemetryPacket(uint8_t *buf) {
 
   TelemetryPayload tel{};
   tel.batteryMv   = cachedBatteryMv;
-  tel.tempC10     = cachedTempC10;
+  tel.tempC       = (cachedTempC10 == INT16_MIN)
+                        ? INT8_MIN
+                        : (int8_t)constrain((long)lround(cachedTempC10 / 10.0),
+                                            -127L, 127L);
   tel.humidityPct = cachedHumidityPct;
 
   size_t off = 0;
@@ -807,7 +844,7 @@ static void renderServerDisplay() {
   const int rightCx = 100; // centre of the Client (right) region
   const int midCx = 64;    // centre of the label column
 
-  TriState sGps = serverGpsState();
+  SigLevel sGps = serverGpsState();
 
   // Right region rotates the selected whitelist client every 5 seconds.
   size_t clientCount = clientWhitelistCount > 0 ? clientWhitelistCount : 1;
@@ -817,8 +854,15 @@ static void renderServerDisplay() {
                         ((millis() - lastRxMs) <= LINK_WARN_MS);
   bool selectedTelemetry = haveTelemetry && (lastTelemetry.srcId == selectedId);
 
-  TriState loraState = selectedOnline ? linkState(millis() - lastRxMs) : TRI_BAD;
-  TriState cGps = selectedOnline ? (lastData.fix ? TRI_OK : TRI_WARN) : TRI_BAD;
+  SigLevel loraState = selectedOnline ? loraSignal(lastRssi, lastSnr) : SIG_MISS;
+  SigLevel cGps;
+  if (!selectedOnline) {
+    cGps = SIG_MISS;
+  } else {
+    int   csats = (lastData.satellites != 0xFF) ? (int)lastData.satellites : 0;
+    float chdop = (lastData.hdop10 != 0xFF) ? lastData.hdop10 / 10.0f : 99.9f;
+    cGps = gpsSignal(lastData.fix, csats, chdop);
+  }
 
   char buf[24];
   display.clearBuffer();
@@ -847,16 +891,20 @@ static void renderServerDisplay() {
   }
   drawRight(8, buf);
 
+  // Header separator under the title row (table look).
+  display.drawHLine(0, 11, 128);
+
   // --- T/H row ---
   if (cachedTempC10 != INT16_MIN && cachedHumidityPct != 0xFF) {
-    snprintf(buf, sizeof(buf), "%.1fC/%u%%", cachedTempC10 / 10.0f, cachedHumidityPct);
+    snprintf(buf, sizeof(buf), "%dC/%u%%", (int)lround(cachedTempC10 / 10.0),
+             cachedHumidityPct);
   } else {
-    snprintf(buf, sizeof(buf), "--.-C/--%%");
+    snprintf(buf, sizeof(buf), "--C/--%%");
   }
   drawLeft(19, buf);
-  if (selectedTelemetry && lastTelemetry.tempC10 != INT16_MIN &&
+  if (selectedTelemetry && lastTelemetry.tempC != INT8_MIN &&
       lastTelemetry.humidityPct != 0xFF) {
-    snprintf(buf, sizeof(buf), "%.1fC/%u%%", lastTelemetry.tempC10 / 10.0f,
+    snprintf(buf, sizeof(buf), "%dC/%u%%", (int)lastTelemetry.tempC,
              lastTelemetry.humidityPct);
   } else {
     snprintf(buf, sizeof(buf), "--.-C/--%%");
@@ -865,27 +913,28 @@ static void renderServerDisplay() {
   drawMid(19, "T/H");
 
   // --- GPS row ---
-  drawLeft(30, triText(sGps));
-  drawRight(30, triText(cGps));
+  drawLeft(30, sig4Text(sGps));
+  drawRight(30, sig4Text(cGps));
   drawMid(30, "GPS");
 
-  // --- BAT row (battery endurance estimate, both sides) ---
+  // --- BAT row (battery percentage, both sides) ---
   if (cachedBatteryMv > 0) {
-    snprintf(buf, sizeof(buf), "%.1fhr", estimateBatteryHours(cachedBatteryMv));
+    snprintf(buf, sizeof(buf), "%u%%", batteryPercent(cachedBatteryMv));
   } else {
-    snprintf(buf, sizeof(buf), "--.-hr");
+    snprintf(buf, sizeof(buf), "--%%");
   }
   drawLeft(41, buf);
   if (selectedTelemetry && lastTelemetry.batteryMv > 0) {
-    snprintf(buf, sizeof(buf), "%.1fhr", estimateBatteryHours(lastTelemetry.batteryMv));
+    snprintf(buf, sizeof(buf), "%u%%", batteryPercent(lastTelemetry.batteryMv));
   } else {
-    snprintf(buf, sizeof(buf), "--.-hr");
+    snprintf(buf, sizeof(buf), "--%%");
   }
   drawRight(41, buf);
   drawMid(41, "BAT");
+  if (batteryCharging()) display.drawXBMP(2, 34, 8, 8, ICON_BOLT_8);  // ⚡ on USB
 
   // --- LoRa link state (right side, below the label column) ---
-  snprintf(buf, sizeof(buf), "LoRa:%s", triText(loraState));
+  snprintf(buf, sizeof(buf), "LoRa:%s", sig4Text(loraState));
   drawAt(96, 52, buf);
 
   // --- Bottom full-width WiFi status line (not split into halves) ---
@@ -907,20 +956,12 @@ static void renderServerDisplay() {
 #endif
 
 #if defined(ROLE_SERVER)
-static void pushTrackPoint(float lat, float lon) {
-  trackBuf[trackHead] = {lat, lon};
-  trackHead = (trackHead + 1) % TRACK_CAP;
-  if (trackCount < TRACK_CAP) {
-    trackCount++;
-  }
-}
-
 static String buildTrackJson() {
   bool linked = havePkt && ((millis() - lastRxMs) <= LINK_TIMEOUT_MS);
   uint32_t sinceRx = havePkt ? (uint32_t)((millis() - lastRxMs) / 1000) : UINT32_MAX;
 
   String js;
-  js.reserve(18000);
+  js.reserve(900);
   js += F("{\"linked\":");
   js += linked ? F("true") : F("false");
   js += F(",\"bearing\":");
@@ -942,6 +983,12 @@ static String buildTrackJson() {
   js += havePkt ? String(lastData.courseDeg10) : F("0");
   js += F(",\"accel_cms2\":");
   js += havePkt ? String(lastData.accelCmS2) : F("0");
+  js += F(",\"satellites\":");
+  js += (havePkt && lastData.satellites != 0xFF) ? String(lastData.satellites)
+                                                 : F("-1");
+  js += F(",\"hdop\":");
+  js += (havePkt && lastData.hdop10 != 0xFF) ? String(lastData.hdop10 / 10.0f, 1)
+                                             : F("-1");
   js += F(",\"last_rx_sec\":");
   js += (havePkt && sinceRx != UINT32_MAX) ? String(sinceRx) : F("-1");
   js += F("},\"server\":{\"lat\":");
@@ -950,19 +997,27 @@ static String buildTrackJson() {
   js += gps.location.isValid() ? String(gps.location.lng(), 6) : F("0");
   js += F(",\"fix\":");
   js += gps.location.isValid() ? F("1") : F("0");
+  js += F(",\"satellites\":");
+  js += gps.satellites.isValid() ? String(gps.satellites.value()) : F("-1");
+  js += F(",\"hdop\":");
+  js += gps.hdop.isValid() ? String(gps.hdop.hdop(), 1) : F("-1");
   js += F(",\"temp_c\":");
   if (cachedTempC10 != INT16_MIN) {
-    js += String(cachedTempC10 / 10.0f, 1);
+    js += String((int)lround(cachedTempC10 / 10.0));
   } else {
     js += F("null");
   }
   js += F(",\"humidity_pct\":");
   js += cachedHumidityPct != 0xFF ? String(cachedHumidityPct) : F("null");
+  js += F(",\"batt_pct\":");
+  js += cachedBatteryMv > 0 ? String(batteryPercent(cachedBatteryMv)) : F("-1");
+  js += F(",\"charging\":");
+  js += batteryCharging() ? F("true") : F("false");
   js += F("},\"telemetry\":{\"batt_mv\":");
   js += haveTelemetry ? String(lastTelemetry.batteryMv) : F("0");
   js += F(",\"temp_c\":");
-  if (haveTelemetry && lastTelemetry.tempC10 != INT16_MIN) {
-    js += String(lastTelemetry.tempC10 / 10.0f, 1);
+  if (haveTelemetry && lastTelemetry.tempC != INT8_MIN) {
+    js += String((int)lastTelemetry.tempC);
   } else {
     js += F("null");
   }
@@ -988,20 +1043,7 @@ static String buildTrackJson() {
   js += magOnline ? F("true") : F("false");
   js += F(",\"heading\":");
   js += (magOnline && magHeadingDeg >= 0) ? String(magHeadingDeg, 1) : F("-1");
-  js += F("},\"history\":[");
-  size_t start = (trackCount == TRACK_CAP) ? trackHead : 0;
-  for (size_t i = 0; i < trackCount; i++) {
-    if (i > 0) {
-      js += ',';
-    }
-    size_t idx = (start + i) % TRACK_CAP;
-    js += F("{\"lat\":");
-    js += String(trackBuf[idx].lat, 6);
-    js += F(",\"lon\":");
-    js += String(trackBuf[idx].lon, 6);
-    js += '}';
-  }
-  js += F("]}");
+  js += F("}}");
   return js;
 }
 
@@ -1060,7 +1102,7 @@ static String buildStatusJson() {
 
   js += F("\"env\":{\"temp_c\":");
   if (cachedTempC10 != INT16_MIN) {
-    js += String(cachedTempC10 / 10.0f, 1);
+    js += String((int)lround(cachedTempC10 / 10.0));
   } else {
     js += F("null");
   }
@@ -1100,6 +1142,14 @@ static String buildStatusJson() {
 static void initWebServer() {
   httpServer.on("/", HTTP_GET, []() {
     httpServer.send(200, "text/html", WEB_UI_HTML);
+  });
+  // Web app manifest -> "Add to Home screen" launches standalone (no URL bar).
+  httpServer.on("/manifest.json", HTTP_GET, []() {
+    httpServer.send(200, "application/manifest+json",
+                    F("{\"name\":\"Shore Spotter\",\"short_name\":\"Spotter\","
+                      "\"start_url\":\"/\",\"scope\":\"/\",\"display\":\"standalone\","
+                      "\"orientation\":\"portrait\",\"background_color\":\"#0d1117\","
+                      "\"theme_color\":\"#0d1117\"}"));
   });
   httpServer.on("/api/track", HTTP_GET, []() {
     httpServer.send(200, "application/json", buildTrackJson());
@@ -1239,8 +1289,56 @@ static void showShutdownAndPowerOff() {
   if (pmuOnline) pmu.shutdown();
 }
 
+// Critically-low battery handling. Skipped while on USB (charging) or when no /
+// implausible battery is detected, so it never bricks a USB-powered board.
+static bool batteryCriticallyLow() {
+  if (!pmuOnline) return false;
+  uint16_t mv = cachedBatteryMv;
+  if (mv < BATT_PRESENT_MIN_MV) return false;  // no / implausible battery reading
+  if (pmu.isVbusIn()) return false;            // on USB -> charging, don't cut
+  return mv < BATT_SHUTDOWN_MV;
+}
+
+// Show a low-battery notice, then cut power. Used at boot and at runtime so a
+// dead battery can neither keep running nor power the board back on.
+static void showLowBatteryAndPowerOff() {
+#if defined(ROLE_CLIENT)
+  if (pmuOnline) {
+    pmu.setALDO1Voltage(3300);
+    pmu.enableALDO1();
+    delay(100);
+  }
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  display.setI2CAddress(OLED_I2C_ADDR << 1);
+  display.begin();
+#endif
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x12_tr);
+  display.drawStr(16, 28, "LOW BATTERY");
+  display.drawStr(10, 46, "Shutting down");
+  display.sendBuffer();
+  Serial.print(F("[PWR] LOW BATTERY ("));
+  Serial.print(cachedBatteryMv);
+  Serial.println(F(" mV) -> power off"));
+  delay(2500);
+  display.clearBuffer();
+  display.sendBuffer();
+  if (pmuOnline) pmu.shutdown();
+  while (true) { delay(1000); }  // halt if power can't be cut (e.g. on USB)
+}
+
+// Debounced runtime check: two consecutive low readings -> shut down.
+static void checkLowBatteryAndMaybeShutdown() {
+  static uint8_t lowCount = 0;
+  if (batteryCriticallyLow()) {
+    if (++lowCount >= 2) showLowBatteryAndPowerOff();
+  } else {
+    lowCount = 0;
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Client boot-info screen: show MAC last 4 hex, battery voltage, temp/hum.
+// Client boot-info screen: show MAC last 4 hex, battery %, temp/hum.
 // Enables OLED rail, displays for 10 s, then disables rail to save power.
 // ---------------------------------------------------------------------------
 #if defined(ROLE_CLIENT)
@@ -1250,9 +1348,13 @@ static void drawClientInfoScreen() {
   esp_efuse_mac_get_default(mac);
   char line1[20], line2[20], line3[20], line4[20];
   snprintf(line1, sizeof(line1), "ID: %02X%02X", mac[4], mac[5]);
-  snprintf(line2, sizeof(line2), "Batt: %u mV", cachedBatteryMv);
+  if (cachedBatteryMv > 0) {
+    snprintf(line2, sizeof(line2), "Batt: %u%%", batteryPercent(cachedBatteryMv));
+  } else {
+    snprintf(line2, sizeof(line2), "Batt: --");
+  }
   if (cachedTempC10 != INT16_MIN) {
-    snprintf(line3, sizeof(line3), "Temp: %.1fC", cachedTempC10 / 10.0f);
+    snprintf(line3, sizeof(line3), "Temp: %dC", (int)lround(cachedTempC10 / 10.0));
   } else {
     snprintf(line3, sizeof(line3), "Temp: N/A");
   }
@@ -1268,6 +1370,7 @@ static void drawClientInfoScreen() {
   display.drawHLine(0, 14, 128);
   display.drawStr(0, 28, line1);
   display.drawStr(0, 40, line2);
+  if (batteryCharging()) display.drawXBMP(70, 31, 8, 8, ICON_BOLT_8);  // ⚡ on USB
   display.drawStr(0, 52, line3);
   display.drawStr(0, 64, line4);
   display.sendBuffer();
@@ -1336,6 +1439,7 @@ void setup() {
     delay(100);
   }
   cachedBatteryMv = readBatteryMilliVolts();
+  if (batteryCriticallyLow()) showLowBatteryAndPowerOff();  // refuse to boot empty
   nextBatteryMs = millis() + BATTERY_UPDATE_MS;
   nextEnvMs = millis() + ENV_UPDATE_MS;
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
@@ -1385,6 +1489,9 @@ void setup() {
   display.drawStr(0, 12, "SHORE SPOTTER");
   display.drawStr(0, 30, "SERVER booting...");
   display.sendBuffer();
+
+  cachedBatteryMv = readBatteryMilliVolts();
+  if (batteryCriticallyLow()) showLowBatteryAndPowerOff();  // refuse to boot empty
 
   nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
   nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
@@ -1440,6 +1547,10 @@ void setup() {
   delay(2000);
 
   initWebServer();
+
+  // Arm non-blocking, interrupt-driven reception.
+  radio.setDio1Action(onLoRaDio1);
+  radio.startReceive();
 #endif
 }
 
@@ -1452,6 +1563,7 @@ void loop() {
     cachedBatteryMv = readBatteryMilliVolts();
     Serial.print(F("[CLIENT] Battery update mV="));
     Serial.println(cachedBatteryMv);
+    checkLowBatteryAndMaybeShutdown();
   }
 
   if (millis() >= nextEnvMs) {
@@ -1469,12 +1581,29 @@ void loop() {
     if (state == RADIOLIB_ERR_NONE) {
       Serial.print(F("[CLIENT] TX ok seq="));
       Serial.print((uint16_t)(txSeq - 1));
-      Serial.print(F(" fix="));
+      Serial.print(F(" | GPS fix="));
       Serial.print(gps.location.isValid() ? 1 : 0);
-      Serial.print(F(" spd="));
-      Serial.print(gps.speed.isValid() ? gps.speed.mps() : 0.0f);
+      Serial.print(F(" sats="));
+      Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+      Serial.print(F(" hdop="));
+      if (gps.hdop.isValid()) Serial.print(gps.hdop.hdop(), 1);
+      else Serial.print(F("--"));
+      Serial.print(F(" age="));
+      Serial.print(gps.location.age());
+      Serial.print(F("ms spd="));
+      Serial.print(gps.speed.isValid() ? gps.speed.mps() : 0.0, 1);
       Serial.print(F("m/s crs="));
-      Serial.println(gps.course.isValid() ? gps.course.deg() : 0.0f);
+      Serial.print(gps.course.isValid() ? gps.course.deg() : 0.0, 0);
+      Serial.print(F(" | LoRa up(srv heard us) rssi="));
+      Serial.print(lastAckRssiDbm10 / 10.0f, 1);
+      Serial.print(F(" snr="));
+      Serial.print(lastAckSnrDb10 / 10.0f, 1);
+      Serial.print(F(" txpwr="));
+      Serial.print(currentTxPowerDbm);
+      Serial.print(F("dBm acks="));
+      Serial.print(ackRxCount);
+      Serial.print(F(" miss="));
+      Serial.println(ackMissCount);
     } else {
       Serial.print(F("[CLIENT] TX failed, code="));
       Serial.println(state);
@@ -1507,6 +1636,16 @@ void loop() {
       ackRxCount++;
       lastAckRssiDbm10 = ack.rssiDbm10;
       lastAckSnrDb10 = ack.snrDb10;
+      Serial.print(F("[CLIENT] ACK seq="));
+      Serial.print(ack.ackSeq);
+      Serial.print(F(" | up(srv heard us) rssi="));
+      Serial.print(ack.rssiDbm10 / 10.0f, 1);
+      Serial.print(F(" snr="));
+      Serial.print(ack.snrDb10 / 10.0f, 1);
+      Serial.print(F(" | down(we heard ack) rssi="));
+      Serial.print(radio.getRSSI(), 1);
+      Serial.print(F(" snr="));
+      Serial.println(radio.getSNR(), 1);
     }
   }
   if (txSeq > 5 && (millis() - lastAckRxMs > 15000) &&
@@ -1559,7 +1698,8 @@ void loop() {
 
   if (millis() >= nextBatteryMs) {
     nextBatteryMs = millis() + BATTERY_UPDATE_MS;
-    cachedBatteryMv = readBatteryMilliVolts();  // server's own endurance estimate
+    cachedBatteryMv = readBatteryMilliVolts();
+    checkLowBatteryAndMaybeShutdown();
   }
 
   // WiFi watchdog: re-attempt the hotspot every WIFI_RETRY_INTERVAL_MS while
@@ -1586,14 +1726,18 @@ void loop() {
     }
   }
 
-  uint8_t buf[DATA_PACKET_LEN];
-  int state = radio.receive(buf, sizeof(buf));
+  // Interrupt-driven RX: the DIO1 ISR sets rxDoneFlag; the loop stays
+  // non-blocking so httpServer.handleClient() above replies instantly.
+  if (rxDoneFlag) {
+    rxDoneFlag = false;
+    uint8_t buf[DATA_PACKET_LEN];
+    int state = radio.readData(buf, sizeof(buf));
 
-  if (state == RADIOLIB_ERR_NONE) {
-    size_t n = radio.getPacketLength();
-    if (n > sizeof(buf)) {
-      n = sizeof(buf);
-    }
+    if (state == RADIOLIB_ERR_NONE) {
+      size_t n = radio.getPacketLength();
+      if (n > sizeof(buf)) {
+        n = sizeof(buf);
+      }
 
     DecodedData d{};
     if (parseDataPacket(buf, n, d)) {
@@ -1615,10 +1759,6 @@ void loop() {
         pktsThisWindow = 0;
         pktWindowStartMs = millis();
       }
-      if (d.fix && (millis() - lastTrackMs >= TRACK_INTERVAL_MS)) {
-        lastTrackMs = millis();
-        pushTrackPoint((float)d.lat, (float)d.lon);
-      }
       updateTracking();  // steer the camera servo toward the surfer (if tracking)
 
       uint8_t ackBuf[ACK_PACKET_LEN];
@@ -1637,12 +1777,32 @@ void loop() {
       Serial.print(d.lon, 6);
       Serial.print(F(" fix="));
       Serial.print(d.fix);
+      Serial.print(F(" sats="));
+      Serial.print(d.satellites != 0xFF ? (int)d.satellites : -1);
+      Serial.print(F(" hdop="));
+      if (d.hdop10 != 0xFF) Serial.print(d.hdop10 / 10.0f, 1);
+      else Serial.print(F("--"));
       Serial.print(F(" spd="));
       Serial.print(d.speedCmS);
-      Serial.print(F("cm/s rssi="));
+      Serial.print(F("cm/s crs="));
+      Serial.print(d.courseDeg10 / 10.0f, 0);
+      Serial.print(F(" acc="));
+      Serial.print(d.accelCmS2 / 100.0f, 2);
+      Serial.print(F("m/s2 | LoRa rssi="));
       Serial.print(lastRssi);
       Serial.print(F(" snr="));
-      Serial.println(lastSnr);
+      Serial.print(lastSnr);
+      Serial.print(F(" | SRV-GPS fix="));
+      Serial.print(gps.location.isValid() ? 1 : 0);
+      Serial.print(F(" sats="));
+      Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+      Serial.print(F(" hdop="));
+      if (gps.hdop.isValid()) Serial.print(gps.hdop.hdop(), 1);
+      else Serial.print(F("--"));
+      Serial.print(F(" | drop="));
+      Serial.print(rxDropCount);
+      Serial.print(F(" err="));
+      Serial.println(rxErrorCount);
     } else {
       DecodedTelemetry t{};
       if (parseTelemetryPacket(buf, n, t)) {
@@ -1655,8 +1815,8 @@ void loop() {
         Serial.print(F(" batt_mV="));
         Serial.print(t.batteryMv);
         Serial.print(F(" temp="));
-        if (t.tempC10 != INT16_MIN) {
-          Serial.print(t.tempC10 / 10.0f, 1);
+        if (t.tempC != INT8_MIN) {
+          Serial.print((int)t.tempC);
           Serial.print(F("C hum="));
           Serial.print(t.humidityPct);
           Serial.println('%');
@@ -1668,22 +1828,34 @@ void loop() {
         Serial.println(F("[SERVER] RX dropped (foreign/invalid packet)"));
       }
     }
-  } else if (state == RADIOLIB_ERR_RX_TIMEOUT) {
-    if (millis() >= nextServerIdleLogMs) {
-      nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
-      Serial.print(F("[SERVER] idle | mode="));
-      Serial.print(trackModeStr(trackMode));
-      Serial.print(F(" head="));
-      if (magOnline && magHeadingDeg >= 0) Serial.print(magHeadingDeg, 1);
-      else Serial.print(F("N/A"));
-      Serial.print(F(" servo="));
-      Serial.print(servoAngleDeg, 1);
-      Serial.println(F(" (waiting for client packets)"));
+    } else {
+      rxErrorCount++;
+      Serial.print(F("[SERVER] RX failed, code="));
+      Serial.println(state);
     }
-  } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
-    rxErrorCount++;
-    Serial.print(F("[SERVER] RX failed, code="));
-    Serial.println(state);
+    rxDoneFlag = false;       // ignore the ACK's own TxDone pulse on DIO1
+    radio.startReceive();     // re-arm for the next packet
+  }
+
+  // Periodic idle log when no packet has arrived for a while.
+  if (millis() >= nextServerIdleLogMs &&
+      (!havePkt || millis() - lastRxMs > 2500)) {
+    nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
+    Serial.print(F("[SERVER] idle | mode="));
+    Serial.print(trackModeStr(trackMode));
+    Serial.print(F(" SRV-GPS fix="));
+    Serial.print(gps.location.isValid() ? 1 : 0);
+    Serial.print(F(" sats="));
+    Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+    Serial.print(F(" hdop="));
+    if (gps.hdop.isValid()) Serial.print(gps.hdop.hdop(), 1);
+    else Serial.print(F("--"));
+    Serial.print(F(" head="));
+    if (magOnline && magHeadingDeg >= 0) Serial.print(magHeadingDeg, 1);
+    else Serial.print(F("N/A"));
+    Serial.print(F(" servo="));
+    Serial.print(servoAngleDeg, 1);
+    Serial.println(F(" (waiting for client packets)"));
   }
 
   if (millis() >= nextDisplayMs) {
