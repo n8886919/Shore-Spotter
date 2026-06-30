@@ -39,24 +39,11 @@ body{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
   color:var(--mut);padding:12px 4px;font-size:15px;font-weight:700;cursor:pointer;
   font-family:inherit}
 .tabs button.on{color:var(--fg);border-bottom-color:var(--acc)}
-.statusbar{display:flex;align-items:center;gap:10px 14px;padding:6px 12px;
-  background:var(--card);border-bottom:1px solid var(--line);font-size:11px;
-  overflow-x:auto;white-space:nowrap;flex:none}
-.statusbar::-webkit-scrollbar{display:none}
-.brand{font-size:12px;font-weight:700;margin-right:2px}
-.pill{display:inline-flex;align-items:center;gap:5px;color:var(--mut);flex:none}
-.pill b{color:var(--fg);font-variant-numeric:tabular-nums}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--mut);display:inline-block}
-.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
 main{flex:1;position:relative;overflow:hidden}
 .page{position:absolute;inset:0;display:none;flex-direction:column;padding:10px;gap:10px}
 .page.on{display:flex}
 #pgInfo{overflow:auto}
-#pgCtrl{justify-content:center}
-.panel{width:100%;max-width:520px;margin:0 auto}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
-.card h2{margin:0 0 12px;font-size:13px;color:var(--mut);font-weight:600;
-  text-transform:uppercase;letter-spacing:.04em}
 .radarHead{display:flex;align-items:center;gap:10px;flex:none;
   font-size:13px;color:var(--mut);font-weight:600}
 .radarHead .segwrap{display:inline-flex}
@@ -70,40 +57,19 @@ main{flex:1;position:relative;overflow:hidden}
   background:rgba(13,17,23,.74);border:1px solid var(--line);border-radius:10px}
 .sliderOverlay input[type=range]{flex:1;accent-color:var(--acc)}
 .sliderOverlay input[type=range]:disabled{opacity:.45}
-.modeRow{display:flex;align-items:center;gap:10px;margin-bottom:12px}
-.badge{padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;
-  border:1px solid var(--line)}
-.badge.manual{color:var(--acc);border-color:var(--acc)}
-.badge.tracking{color:var(--ok);border-color:var(--ok)}
-.badge.paused{color:var(--warn);border-color:var(--warn)}
-.badge.idle{color:var(--mut)}
-.sliderRow{display:flex;align-items:center;gap:12px;margin:6px 0 14px}
 input[type=range]{flex:1;accent-color:var(--acc)}
 input[type=range]:disabled{opacity:.4}
 .ang{font-size:22px;font-weight:700;min-width:74px;text-align:right;
   font-variant-numeric:tabular-nums}
 .ang small{font-size:12px;color:var(--mut);font-weight:400}
-.btns{display:flex;flex-wrap:wrap;gap:8px}
 button{flex:1;min-width:96px;padding:11px 12px;border-radius:8px;border:1px solid var(--line);
   background:#21262d;color:var(--fg);font-size:14px;font-weight:600;cursor:pointer}
 button:hover{border-color:var(--acc)}
 button:disabled{opacity:.4;cursor:not-allowed}
-button.go{background:var(--ok);border-color:var(--ok);color:#03210e}
-button.pause{background:var(--warn);border-color:var(--warn);color:#241a00}
-.hint{font-size:11px;color:var(--mut);margin-top:10px;line-height:1.5}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
-.kv{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
-.kv .k{font-size:11px;color:var(--mut)}
-.kv .v{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}
-.kv .v small{font-size:11px;color:var(--mut);font-weight:400}
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
   background:var(--bad);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;
   opacity:0;transition:opacity .25s;pointer-events:none;z-index:9}
 #toast.show{opacity:1}
-#prog{position:fixed;top:0;left:0;height:3px;width:0;background:var(--acc);
-  z-index:10;opacity:0;transition:width .15s ease,opacity .3s;
-  box-shadow:0 0 6px var(--acc)}
-#prog.on{opacity:1}
 .lg{display:flex;gap:14px;font-size:11px;color:var(--mut);margin-top:8px;
   justify-content:center;flex-wrap:wrap}
 .lg span{display:inline-flex;align-items:center;gap:5px}
@@ -131,7 +97,6 @@ button.pause{background:var(--warn);border-color:var(--warn);color:#241a00}
 </style>
 </head>
 <body>
-<div id="prog"></div>
 <nav class="tabs">
   <button id="tabRadar" class="on" type="button">雷達</button>
   <button id="tabInfo" type="button">資訊</button>
@@ -280,8 +245,6 @@ function redraw(){
   drawRadar(last.track,geoDist(last.track.server,last.track.client));
 }
 window.addEventListener('resize',redraw);
-
-function setDot(el,state){el.className='dot '+state;}
 
 function applyMode(sv){
   var auto=(sv.mode==='tracking');

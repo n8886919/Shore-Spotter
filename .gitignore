@@ -6,3 +6,6 @@
 
 # Local secrets (copy include/wifi_config.h.example -> include/wifi_config.h)
 include/wifi_config.h
+
+# Local scan report (not version-controlled)
+docs/scan-report.md

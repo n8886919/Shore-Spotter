@@ -399,25 +399,9 @@ static void sampleEnvSensor() {
   cachedHumidityPct = static_cast<uint8_t>(lround(hc));
 }
 
-enum TriState : uint8_t { TRI_OK = 0, TRI_WARN = 1, TRI_BAD = 2 };
-
-// 8x8 monochrome icons (LSB-first rows for U8g2 drawXBMP)
-static const uint8_t ICON_CHECK_8[] = {0x00,0x01,0x03,0x06,0x4C,0x78,0x30,0x00};
-static const uint8_t ICON_WARN_8[]  = {0x18,0x3C,0x3C,0x3C,0x18,0x00,0x18,0x00};
-static const uint8_t ICON_CROSS_8[] = {0x42,0x66,0x3C,0x18,0x3C,0x66,0x42,0x00};
-static const uint8_t ICON_DROP_8[]  = {0x08,0x1C,0x36,0x36,0x36,0x1C,0x08,0x00};
-static const uint8_t ICON_THERM_8[] = {0x08,0x0C,0x08,0x08,0x08,0x1C,0x1C,0x08};
-static const uint8_t ICON_BOLT_8[]  = {0x38,0x0C,0x06,0x1F,0x1C,0x0C,0x06,0x03};
-
-static const uint8_t* triBitmap(TriState s) {
-  if (s == TRI_OK) return ICON_CHECK_8;
-  if (s == TRI_WARN) return ICON_WARN_8;
-  return ICON_CROSS_8;
-}
-
-static void drawTriIcon(int x, int yTop, TriState s) {
-  display.drawXBMP(x, yTop, 8, 8, triBitmap(s));
-}
+// 8x8 lightning icon (LSB-first rows for U8g2 drawXBMP), drawn when the board
+// is on external/USB power.
+static const uint8_t ICON_BOLT_8[] = {0x38,0x0C,0x06,0x1F,0x1C,0x0C,0x06,0x03};
 
 // 4-level signal grade (Good / OK / Bad / Miss) for GPS & LoRa, shown on the
 // server run screen.
