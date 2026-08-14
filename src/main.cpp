@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <Adafruit_BME280.h>
 #include <esp_system.h>
+#include <esp_mac.h>
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
@@ -17,6 +18,7 @@
 #if defined(ROLE_SERVER)
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 #include <SensorQMC6310.hpp>  // SensorLib: QMC6310 magnetometer (station heading)
 #include "web_ui.h"
 #include "wifi_config.h"  // phone hotspot SSID / password (edit there)
@@ -67,10 +69,9 @@ constexpr uint32_t LCD_ALERT_BLINK_MS = 5000;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;  // server: re-attempt hotspot every 5 s when offline
 
 constexpr uint16_t BATT_LOW_MV = 3500;   // conservative battery-safe threshold
-constexpr uint16_t BATT_FULL_MV = 4150;
-// Battery percentage scale (single Li-ion cell): 0% at 3.2 V, 100% at 4.2 V.
+// Battery percentage scale (single Li-ion cell): 0% at 3.2 V, 100% at 4.15 V.
 constexpr uint16_t BATT_EMPTY_MV = 3200;       // 0 %
-constexpr uint16_t BATT_PCT_FULL_MV = 4200;    // 100 %
+constexpr uint16_t BATT_PCT_FULL_MV = 4150;    // 100 %
 constexpr uint16_t BATT_SHUTDOWN_MV = 3200;    // below 0 % -> auto power off
 constexpr uint16_t BATT_PRESENT_MIN_MV = 2500; // ignore implausible/no-battery reads
 constexpr int16_t TEMP_WARN_C10 = 500;   // 50.0C
@@ -80,11 +81,17 @@ constexpr uint8_t HUM_WARN_PCT = 90;
 constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
 
 #if defined(ROLE_SERVER)
-// Camera servo (SPT5435LV-180) driven by ESP32 LEDC PWM on IO21.
+// Camera servo (GXServo QY3242BLS/GX3242 42KG) driven by ESP32 LEDC PWM on IO21.
 constexpr int SERVO_PIN = 21;
 constexpr int SERVO_MIN_US = 500;    // -> 0 deg
 constexpr int SERVO_MAX_US = 2500;   // -> 180 deg
+constexpr uint32_t SERVO_PWM_HZ = 333;
+// ESP32-S3 LEDC timers support at most 14-bit resolution.  A 16-bit attach is
+// rejected by Arduino-ESP32 3.x, leaving the pin with no PWM output.
+constexpr uint8_t SERVO_PWM_RES_BITS = 14;
+constexpr uint32_t SERVO_PWM_MAX_DUTY = (1UL << SERVO_PWM_RES_BITS) - 1;
 constexpr int SERVO_LEDC_CH = 0;     // LEDC channel (arduino-esp32 2.x)
+constexpr uint8_t SERVO_CAL_VERSION = 2;  // v2 uses CCW-positive servo geometry
 constexpr uint32_t MAG_SAMPLE_MS = 200;
 #endif
 
@@ -205,6 +212,7 @@ float lastSnr = 0;
 uint32_t nextDisplayMs = 0;
 uint32_t nextWifiRetryMs = 0;
 uint32_t wifiReconnectingUntilMs = 0;
+bool otaReady = false;
 
 // Telemetry (slow path, MSG_TELEMETRY every 30 s)
 DecodedTelemetry lastTelemetry{0, 0, INT8_MIN, 0xFF};
@@ -222,10 +230,11 @@ static uint32_t pktWindowStartMs = 0;
 static float    cachedPktRate   = 0.0f;  // pkts/s averaged over ~60 s
 
 // Servo + tracking state.
-// Geometry: world_bearing = mag_heading + servo_angle + mountOffset
+// Geometry (viewed from above, increasing servo angle turns CCW while compass
+// bearings increase CW): world_bearing = mag_heading - servo_angle + mountOffset
 //   * Manual: operator nudges servo_angle until the camera is on the surfer.
 //   * Start : mountOffset is locked from the current (bearing, heading, angle).
-//   * Track : servo_angle = bearing_now - heading_now - mountOffset (clamped 0..180).
+//   * Track : servo_angle = heading_now + mountOffset - bearing_now (clamped 0..180).
 // The magnetometer term lets the station be bumped/rotated mid-session.
 enum TrackMode : uint8_t { MODE_IDLE, MODE_MANUAL, MODE_TRACKING, MODE_PAUSED };
 static TrackMode trackMode = MODE_MANUAL;
@@ -233,6 +242,7 @@ static float servoAngleDeg = 90.0f;   // current commanded servo angle (0..180)
 static float servoTargetDeg = 90.0f;  // desired angle while tracking
 static float mountOffsetDeg = 0.0f;   // servo-to-world mounting offset (persisted)
 static bool  mountCalibrated = false;
+static bool  servoPwmReady = false;
 
 // Magnetometer (QMC6310) — station board heading in degrees (-1 = invalid)
 static SensorQMC6310 mag;
@@ -424,15 +434,15 @@ static SigLevel loraSignal(float rssi, float snr) {
 }
 
 // Unified GPS grade for the station's own GPS and the client's (decoded) GPS.
-//   Good : fix & HDOP <= 2.0 & sats >= 6
-//   OK   : fix & HDOP <= 5.0 & sats >= 4
-//   Bad  : tracking satellites but no usable fix (no fix / sats < 4 / HDOP > 5)
+//   Good : fix & HDOP <= 1.5 & sats >= 8
+//   OK   : fix & HDOP <= 3.0 & sats >= 6
+//   Bad  : tracking satellites but no usable fix (no fix / sats < 4 / doesn't meet OK)
 //   Miss : no satellites and no fix (no signal at all)
 static SigLevel gpsSignal(bool fix, int sats, float hdop) {
   if (sats <= 0 && !fix) return SIG_MISS;
   if (!fix || sats < 4) return SIG_BAD;
-  if (hdop <= 2.0f && sats >= 6) return SIG_GOOD;
-  if (hdop <= 5.0f) return SIG_OK;
+  if (hdop <= 1.5f && sats >= 8) return SIG_GOOD;
+  if (hdop <= 3.0f && sats >= 6) return SIG_OK;
   return SIG_BAD;
 }
 
@@ -481,13 +491,20 @@ static void loadWhitelistFromNvs() {
 static void saveMountOffsetToNvs() {
   prefs.putFloat("mountoff", mountOffsetDeg);
   prefs.putBool("mountcal", mountCalibrated);
+  prefs.putUChar("mountver", SERVO_CAL_VERSION);
 }
 
 static void loadServerSettings() {
   prefs.begin("shorespotter", false);
   loadWhitelistFromNvs();
-  mountOffsetDeg = prefs.getFloat("mountoff", 0.0f);
-  mountCalibrated = prefs.getBool("mountcal", false);
+  if (prefs.getUChar("mountver", 0) == SERVO_CAL_VERSION) {
+    mountOffsetDeg = prefs.getFloat("mountoff", 0.0f);
+    mountCalibrated = prefs.getBool("mountcal", false);
+  } else {
+    // Older offsets used the opposite servo direction and are not compatible.
+    mountOffsetDeg = 0.0f;
+    mountCalibrated = false;
+  }
 }
 
 static size_t buildAckPacket(uint8_t *buf, uint16_t dstId, uint16_t ackSeq,
@@ -706,37 +723,63 @@ static const char *trackModeStr(TrackMode m) {
   }
 }
 
-static void servoWriteMicros(int us) {
+static bool servoWriteMicros(int us) {
+  if (!servoPwmReady) return false;
   us = constrain(us, SERVO_MIN_US, SERVO_MAX_US);
-  uint32_t duty = (uint32_t)((float)us / 20000.0f * 65535.0f);  // 50 Hz, 16-bit
+  // Convert the requested high pulse directly to a duty value.  This remains
+  // accurate at the GXServo's 333 Hz refresh rate (period ~= 3003 us).
+  uint32_t duty = (uint32_t)(((uint64_t)us * SERVO_PWM_HZ *
+                              SERVO_PWM_MAX_DUTY + 500000ULL) /
+                             1000000ULL);
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcWrite(SERVO_PIN, duty);
+  if (!ledcWrite(SERVO_PIN, duty)) {
+    servoPwmReady = false;
+    return false;
+  }
+  return true;
 #else
   ledcWrite(SERVO_LEDC_CH, duty);
+  return true;
 #endif
 }
 
-static void setServoAngle(float deg) {
+static bool setServoAngle(float deg) {
   deg = constrain(deg, 0.0f, 180.0f);
-  servoAngleDeg = deg;
   int us = SERVO_MIN_US +
            (int)lroundf(deg / 180.0f * (SERVO_MAX_US - SERVO_MIN_US));
-  servoWriteMicros(us);
+  if (!servoWriteMicros(us)) return false;
+  servoAngleDeg = deg;
+  return true;
 }
 
-static void initServo() {
+static bool initServo() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcAttach(SERVO_PIN, 50, 16);
+  servoPwmReady = ledcAttach(SERVO_PIN, SERVO_PWM_HZ, SERVO_PWM_RES_BITS);
 #else
-  ledcSetup(SERVO_LEDC_CH, 50, 16);
-  ledcAttachPin(SERVO_PIN, SERVO_LEDC_CH);
+  servoPwmReady = ledcSetup(SERVO_LEDC_CH, SERVO_PWM_HZ,
+                            SERVO_PWM_RES_BITS) > 0;
+  if (servoPwmReady) ledcAttachPin(SERVO_PIN, SERVO_LEDC_CH);
 #endif
-  setServoAngle(servoAngleDeg);  // centre on boot
+  if (!servoPwmReady) {
+    Serial.print(F("[SERVO] ERROR: LEDC attach failed on IO"));
+    Serial.println(SERVO_PIN);
+    return false;
+  }
+  if (!setServoAngle(servoAngleDeg)) {  // centre on boot
+    Serial.println(F("[SERVO] ERROR: initial PWM write failed"));
+    servoPwmReady = false;
+    return false;
+  }
   Serial.print(F("[SERVO] LEDC ready on IO"));
   Serial.print(SERVO_PIN);
-  Serial.print(F(", centre "));
+  Serial.print(F(" at "));
+  Serial.print(SERVO_PWM_HZ);
+  Serial.print(F(" Hz/"));
+  Serial.print(SERVO_PWM_RES_BITS);
+  Serial.print(F(" bit, centre "));
   Serial.print(servoAngleDeg, 0);
   Serial.println(F(" deg"));
+  return true;
 }
 
 static bool initMag() {
@@ -777,10 +820,14 @@ static void updateTracking() {
   if (trackMode != MODE_TRACKING || !mountCalibrated || !haveBearingFix()) return;
   float bearing = (float)computeBearing(gps.location.lat(), gps.location.lng(),
                                         lastData.lat, lastData.lon);
-  float target = normalize360(bearing - trackingHeading() - mountOffsetDeg);
+  float target = normalize360(trackingHeading() + mountOffsetDeg - bearing);
   if (target > 270.0f) target -= 360.0f;  // wrap small negatives toward 0
   servoTargetDeg = constrain(target, 0.0f, 180.0f);
-  setServoAngle(servoTargetDeg);
+  if (!setServoAngle(servoTargetDeg)) {
+    trackMode = MODE_PAUSED;
+    Serial.println(F("[SERVO] ERROR: PWM write failed; tracking paused"));
+    return;
+  }
   static uint32_t nextTrackLogMs = 0;
   if (millis() >= nextTrackLogMs) {
     nextTrackLogMs = millis() + 3000;
@@ -800,7 +847,7 @@ static bool startTracking() {
   if (!haveBearingFix()) return false;
   float bearingCal = (float)computeBearing(gps.location.lat(), gps.location.lng(),
                                            lastData.lat, lastData.lon);
-  float off = normalize360(bearingCal - trackingHeading() - servoAngleDeg);
+  float off = normalize360(bearingCal - trackingHeading() + servoAngleDeg);
   if (off > 180.0f) off -= 360.0f;
   mountOffsetDeg = off;
   mountCalibrated = true;
@@ -815,7 +862,7 @@ static bool startTracking() {
   Serial.print(F(" -> mount_offset="));
   Serial.println(mountOffsetDeg, 1);
   updateTracking();
-  return true;
+  return servoPwmReady;
 }
 
 static void renderServerDisplay() {
@@ -1193,7 +1240,11 @@ static void initWebServer() {
       return;
     }
     float a = constrain(httpServer.arg("angle").toFloat(), 0.0f, 180.0f);
-    setServoAngle(a);
+    if (!setServoAngle(a)) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+      return;
+    }
     servoTargetDeg = a;
     if (trackMode == MODE_IDLE) trackMode = MODE_MANUAL;
     Serial.print(F("[SERVO] manual angle="));
@@ -1203,10 +1254,18 @@ static void initWebServer() {
   });
   // POST /api/track/start — lock the current aim as calibration and auto-track.
   httpServer.on("/api/track/start", HTTP_POST, []() {
+    if (!servoPwmReady) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+      return;
+    }
     if (startTracking()) {
       httpServer.send(200, "application/json",
                       "{\"ok\":true,\"mount_offset_deg\":" +
                           String(mountOffsetDeg, 1) + "}");
+    } else if (!servoPwmReady) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
     } else {
       httpServer.send(409, "application/json",
                       "{\"ok\":false,\"error\":\"need server+client GPS fix\"}");
@@ -1222,6 +1281,11 @@ static void initWebServer() {
   });
   // POST /api/track/resume — resume auto-tracking with the existing calibration.
   httpServer.on("/api/track/resume", HTTP_POST, []() {
+    if (!servoPwmReady) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+      return;
+    }
     if (!mountCalibrated) {
       httpServer.send(409, "application/json",
                       "{\"ok\":false,\"error\":\"not calibrated, use start\"}");
@@ -1229,6 +1293,11 @@ static void initWebServer() {
     }
     trackMode = MODE_TRACKING;
     updateTracking();
+    if (!servoPwmReady) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+      return;
+    }
     Serial.println(F("[TRACK] resumed"));
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"tracking\"}");
@@ -1245,6 +1314,26 @@ static void initWebServer() {
     httpServer.send(302);
   });
   httpServer.begin();
+}
+
+static void initArduinoOta() {
+  if (otaReady || WiFi.status() != WL_CONNECTED) return;
+
+  ArduinoOTA.setHostname("shore-spotter-server");
+  ArduinoOTA
+      .onStart([]() {
+        if (trackMode == MODE_TRACKING) trackMode = MODE_PAUSED;
+        Serial.println(F("[OTA] update started; tracking paused"));
+      })
+      .onEnd([]() { Serial.println(F("[OTA] update complete; rebooting")); })
+      .onError([](ota_error_t error) {
+        Serial.print(F("[OTA] ERROR code="));
+        Serial.println((unsigned int)error);
+      });
+  ArduinoOTA.begin();
+  otaReady = true;
+  Serial.print(F("[OTA] ready: shore-spotter-server.local / "));
+  Serial.println(WiFi.localIP());
 }
 #endif
 
@@ -1494,6 +1583,7 @@ void setup() {
   // Connect to the phone-provided hotspot in station mode.
   // Credentials come from include/wifi_config.h (WIFI_SSID / WIFI_PASSWORD).
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname("shore-spotter-server");
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print(F("[WiFi] Connecting to hotspot \""));
@@ -1531,6 +1621,7 @@ void setup() {
   delay(2000);
 
   initWebServer();
+  initArduinoOta();
 
   // Arm non-blocking, interrupt-driven reception.
   radio.setDio1Action(onLoRaDio1);
@@ -1667,6 +1758,7 @@ void loop() {
 #endif
 
 #if defined(ROLE_SERVER)
+  if (otaReady && WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
   httpServer.handleClient();
   serviceGps();  // keep the server's own GPS position fresh
 
@@ -1692,6 +1784,7 @@ void loop() {
     if (cachedApIp.isEmpty()) {
       cachedApIp = WiFi.localIP().toString();
     }
+    initArduinoOta();
   } else {
     cachedApIp = "";
     if (millis() >= nextWifiRetryMs) {

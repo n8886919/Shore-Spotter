@@ -79,8 +79,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .seg:first-child{border-radius:6px 0 0 6px}
 .seg:last-child{border-radius:0 6px 6px 0;border-left:0}
 .seg.on{background:var(--acc);border-color:var(--acc);color:#fff}
-.infoCols{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.col{overflow:auto}
+.infoCols{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.col{overflow:visible}
 .col h3{margin:0 0 4px;font-size:14px;font-weight:700}
 .sub{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;
   margin:9px 0 2px;border-bottom:1px solid var(--line);padding-bottom:2px}
@@ -173,6 +173,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
         <div class="r"><span>距上次封包</span><b id="cAge">--</b></div>
       </div>
     </div>
+    <div class="card" style="flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button id="btnClear" type="button">清除軌跡</button>
+      <button id="btnExport" type="button">匯出 GPX（可上傳 Strava）</button>
+      <span id="exportHint" class="hint2" style="margin-left:0">網頁最多保留過去 2 小時軌跡，雷達／地圖仍只顯示最近 5 分鐘；匯出後會自動清空。GPX 檔請自行到 Strava 網頁上傳</span>
+    </div>
   </section>
 </main>
 
@@ -182,10 +187,22 @@ button:disabled{opacity:.4;cursor:not-allowed}
 var $=function(id){return document.getElementById(id);};
 var last={track:null,status:null};
 var dragging=false;
+var servoPendingAngle=null;
+var servoSendTimer=0;
+var servoSending=false;
+var servoDragEnded=false;
+var SERVO_SEND_INTERVAL_MS=75;
 var viewMode='radar';
 var page='radar';
 var hist=[];               // client-accumulated path (server no longer stores it)
-var HIST_CAP=300;          // ~5 min at 1 pt/s
+var HIST_RETAIN_MS=2*60*60*1000; // keep up to 2h in memory (for CSV export)
+var RADAR_WINDOW_MS=5*60*1000;   // 雷達／地圖畫面固定只顯示最近 5 分鐘
+var radarZoom=1;           // multiplicative zoom for radar view
+var mapZoomDelta=0;        // additive zoom delta (in zoom levels) for map view
+var pinchBaseRadarZoom=1;
+var pinchBaseMapZoomDelta=0;
+var pinchStartDist=0;
+var activePointers={};
 
 function toast(m){var t=$('toast');t.textContent=m;t.classList.add('show');
   clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove('show');},2600);}
@@ -199,13 +216,43 @@ function post(url){
 }
 
 // ---- controls ----
+// Send at most one request at a time and collapse rapid slider events to the
+// newest angle. This keeps motion responsive without flooding the ESP32.
+function sendPendingServoAngle(){
+  servoSendTimer=0;
+  if(servoSending||servoPendingAngle===null)return;
+  var v=servoPendingAngle;
+  servoPendingAngle=null;
+  servoSending=true;
+  post('/api/servo?angle='+encodeURIComponent(v)).catch(function(){}).then(function(){
+    servoSending=false;
+    if(servoPendingAngle!==null){
+      if(servoDragEnded)sendPendingServoAngle();
+      else servoSendTimer=setTimeout(sendPendingServoAngle,SERVO_SEND_INTERVAL_MS);
+    }else if(servoDragEnded){
+      servoDragEnded=false;
+      dragging=false;
+    }
+  });
+}
+function queueServoAngle(v,isFinal){
+  servoPendingAngle=v;
+  if(isFinal)servoDragEnded=true;
+  if(servoSending)return;
+  if(servoSendTimer)clearTimeout(servoSendTimer);
+  servoSendTimer=isFinal?0:setTimeout(sendPendingServoAngle,SERVO_SEND_INTERVAL_MS);
+  if(isFinal)sendPendingServoAngle();
+}
 $('sld').addEventListener('input',function(){
-  dragging=true;$('angTxt').textContent=this.value;});
-$('sld').addEventListener('change',function(){
-  var v=this.value;
-  post('/api/servo?angle='+v).catch(function(){}).then(function(){dragging=false;});
+  dragging=true;
+  servoDragEnded=false;
+  $('angTxt').textContent=this.value;
+  queueServoAngle(this.value,false);
 });
-// 手動 = release servo to the slider; 自動 = lock the current aim as "facing the
+$('sld').addEventListener('change',function(){
+  queueServoAngle(this.value,true);
+});
+// 手動 = move servo live with the slider; 自動 = lock the current aim as "facing the
 // surfer" and auto-track (re-locks every time, so no separate calibrate step).
 $('mManual').onclick=function(){
   if(last.track&&last.track.servo.mode==='tracking')post('/api/track/pause').then(refresh);
@@ -246,6 +293,71 @@ function redraw(){
 }
 window.addEventListener('resize',redraw);
 
+function clamp(v,min,max){return Math.max(min,Math.min(max,v));}
+function setRadarZoomAbs(v){radarZoom=clamp(v,0.35,20);redraw();}
+function setMapZoomDeltaAbs(v){mapZoomDelta=clamp(v,-6,6);redraw();}
+function zoomByFactor(f){
+  if(!(f>0))return;
+  if(viewMode==='radar')setRadarZoomAbs(radarZoom*f);
+  else setMapZoomDeltaAbs(mapZoomDelta+Math.log(f)/Math.LN2);
+}
+function pointerDist(a,b){
+  var dx=a.x-b.x,dy=a.y-b.y;
+  return Math.sqrt(dx*dx+dy*dy);
+}
+function firstTwoPointers(){
+  var ks=Object.keys(activePointers);
+  if(ks.length<2)return null;
+  return[activePointers[ks[0]],activePointers[ks[1]]];
+}
+function beginPinch(){
+  var pair=firstTwoPointers();
+  if(!pair)return;
+  pinchStartDist=pointerDist(pair[0],pair[1]);
+  pinchBaseRadarZoom=radarZoom;
+  pinchBaseMapZoomDelta=mapZoomDelta;
+}
+
+var radarCanvas=$('radar');
+radarCanvas.addEventListener('wheel',function(ev){
+  if(page!=='radar')return;
+  ev.preventDefault();
+  zoomByFactor(Math.exp(-ev.deltaY*0.0015));
+},{passive:false});
+
+radarCanvas.addEventListener('pointerdown',function(ev){
+  activePointers[ev.pointerId]={x:ev.clientX,y:ev.clientY};
+  if(Object.keys(activePointers).length===2){
+    beginPinch();
+    try{radarCanvas.setPointerCapture(ev.pointerId);}catch(_e){}
+  }
+});
+
+radarCanvas.addEventListener('pointermove',function(ev){
+  if(!activePointers[ev.pointerId])return;
+  activePointers[ev.pointerId]={x:ev.clientX,y:ev.clientY};
+  if(Object.keys(activePointers).length!==2||pinchStartDist<=0)return;
+  var pair=firstTwoPointers();
+  if(!pair)return;
+  var d=pointerDist(pair[0],pair[1]);
+  if(!(d>0))return;
+  var factor=d/pinchStartDist;
+  if(viewMode==='radar')setRadarZoomAbs(pinchBaseRadarZoom*factor);
+  else setMapZoomDeltaAbs(pinchBaseMapZoomDelta+Math.log(factor)/Math.LN2);
+});
+
+function endPointer(ev){
+  delete activePointers[ev.pointerId];
+  if(Object.keys(activePointers).length<2){
+    pinchStartDist=0;
+  }else{
+    beginPinch();
+  }
+}
+radarCanvas.addEventListener('pointerup',endPointer);
+radarCanvas.addEventListener('pointercancel',endPointer);
+radarCanvas.addEventListener('pointerleave',endPointer);
+
 function applyMode(sv){
   var auto=(sv.mode==='tracking');
   $('mManual').classList.toggle('on',!auto);
@@ -260,8 +372,8 @@ function applyMode(sv){
 function gpsGrade(sats,hdop){
   if(sats<0||hdop<0||sats<=0)return 'miss';
   if(sats<4)return 'bad';
-  if(hdop<=2&&sats>=6)return 'good';
-  if(hdop<=5)return 'ok';
+  if(hdop<=1.5&&sats>=8)return 'good';
+  if(hdop<=3&&sats>=6)return 'ok';
   return 'bad';
 }
 // Leader line + small info card placed next to a marker (px,py) on the canvas.
@@ -294,15 +406,62 @@ function drawGpsTag(x,px,py,W,H,title,sats,hdop){
 function fetchTrack(){return fetch('/api/track').then(function(r){return r.json();});}
 
 // Append the current sample to the local path (skip stale/duplicate points).
+// Full buffer keeps up to HIST_RETAIN_MS (2h) for CSV export; drawing only
+// ever looks at the most recent RADAR_WINDOW_MS (5 min) slice via recentHist().
 function pushHist(d){
   if(!d.linked||!d.client.fix)return;
-  var e={lat:d.client.lat,lon:d.client.lon,sfix:d.server.fix?1:0,
+  var e={t:Date.now(),lat:d.client.lat,lon:d.client.lon,sfix:d.server.fix?1:0,
          slat:d.server.fix?d.server.lat:0,slon:d.server.fix?d.server.lon:0};
   var l=hist[hist.length-1];
   if(l&&l.lat===e.lat&&l.lon===e.lon&&l.slat===e.slat&&l.slon===e.slon)return;
   hist.push(e);
-  if(hist.length>HIST_CAP)hist.shift();
+  var cutoff=Date.now()-HIST_RETAIN_MS;
+  while(hist.length&&hist[0].t<cutoff)hist.shift();
 }
+// Slice of hist within the last windowMs, walked backwards so it stays O(window
+// size) instead of scanning the whole 2h buffer every redraw.
+function recentHist(windowMs){
+  var cutoff=Date.now()-windowMs,out=[];
+  for(var i=hist.length-1;i>=0;i--){
+    if(hist[i].t<cutoff)break;
+    out.unshift(hist[i]);
+  }
+  return out;
+}
+// 清除目前保留的全部軌跡（雷達／地圖立即選回空白）。
+function clearHist(){
+  hist=[];
+  toast('已清除軌跡');
+  redraw();
+}
+$('btnClear').onclick=clearHist;
+
+// GPX 匯出（Strava 可直接上傳的格式）：只包 Surfer（client）的軌跡點，
+// 匯出完成後自動清空線上網頁保留的線上軌跡（避免重複上傳）。
+function escXml(s){return String(s).replace(/[<>&'"]/g,function(c){
+  return{'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c];});}
+function exportTrackGpx(){
+  if(!hist.length){toast('尚無軌跡資料可匯出');return;}
+  var name='Shore Spotter '+new Date(hist[0].t).toISOString();
+  var lines=['<?xml version="1.0" encoding="UTF-8"?>',
+    '<gpx version="1.1" creator="Shore Spotter" xmlns="http://www.topografix.com/GPX/1/1">',
+    '  <metadata><time>'+new Date().toISOString()+'</time></metadata>',
+    '  <trk><name>'+escXml(name)+'</name><trkseg>'];
+  hist.forEach(function(e){
+    lines.push('    <trkpt lat="'+e.lat+'" lon="'+e.lon+'"><time>'+
+      new Date(e.t).toISOString()+'</time></trkpt>');
+  });
+  lines.push('  </trkseg></trk>','</gpx>');
+  var blob=new Blob([lines.join('\n')],{type:'application/gpx+xml'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');
+  var ts=new Date().toISOString().replace(/[:.]/g,'-');
+  a.href=url;a.download='shorespotter_track_'+ts+'.gpx';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  clearHist();
+}
+$('btnExport').onclick=exportTrackGpx;
 
 var refreshing=false;
 function refresh(){
@@ -349,8 +508,8 @@ function refreshStatus(){
 
 function fmtUptime(s){var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
   return h>0?(h+'h'+m+'m'):(m+'m'+(s%60)+'s');}
-// Battery %: 0% at 3.2 V, 100% at 4.2 V (matches the firmware scale).
-function battPct(mv){return Math.max(0,Math.min(100,Math.round((mv-3200)/10)));}
+// Battery %: 0% at 3.2 V, 100% at 4.15 V (matches the firmware scale).
+function battPct(mv){return Math.max(0,Math.min(100,Math.round((mv-3200)*100/950)));}
 
 // equirectangular metres between two {lat,lon,fix} points
 function geoDist(a,b){
@@ -374,27 +533,32 @@ function drawRadar(d,dist){
   var cx=W/2,cy=H/2,R=Math.min(W,H)/2-26;
   x.clearRect(0,0,W,H);
   var st=d.server,maxR=50;
+  var recent=recentHist(RADAR_WINDOW_MS);
   if(st.fix){
-    hist.forEach(function(p){var en=toEN(st,p);
+    recent.forEach(function(p){var en=toEN(st,p);
       maxR=Math.max(maxR,Math.hypot(en.e,en.n));});
     if(d.client.fix){var cur0=toEN(st,d.client);maxR=Math.max(maxR,Math.hypot(cur0.e,cur0.n));}
   }
   maxR*=1.1;
+  var visR=maxR/radarZoom;
+  // 圈圈（同心圓格線）與旁邊文字的亮度：調這兩個 alpha（0~1，越大越亮）即可。
+  var RING_ALPHA=0.5, LABEL_ALPHA=1;
   // grid rings + scale labels
-  x.strokeStyle='#21262d';x.fillStyle='#6e7681';x.font='10px system-ui';x.textAlign='left';
+  x.strokeStyle='rgba(255,255,255,'+RING_ALPHA+')';
+  x.fillStyle='rgba(255,255,255,'+LABEL_ALPHA+')';x.font='10px system-ui';x.textAlign='left';
   for(var k=1;k<=3;k++){var rr=R*k/3;x.beginPath();x.arc(cx,cy,rr,0,7);x.stroke();
-    x.fillText((maxR*k/3).toFixed(0)+'m',cx+4,cy-rr+12);}
+    x.fillText((visR*k/3).toFixed(0)+'m',cx+4,cy-rr+12);}
   // cross + compass
-  x.strokeStyle='#21262d';x.beginPath();
+  x.strokeStyle='rgba(255,255,255,'+RING_ALPHA+')';x.beginPath();
   x.moveTo(cx-R,cy);x.lineTo(cx+R,cy);x.moveTo(cx,cy-R);x.lineTo(cx,cy+R);x.stroke();
-  x.fillStyle='#8b949e';x.font='11px system-ui';x.textAlign='center';
+  x.fillStyle='#fff';x.font='11px system-ui';x.textAlign='center';
   x.fillText('N',cx,cy-R-8);x.fillText('S',cx,cy+R+14);
   x.fillText('E',cx+R+10,cy+4);x.fillText('W',cx-R-10,cy+4);
   x.textAlign='left';
-  var sc=R/maxR;
+  var sc=R/visR;
   function plot(e,n){return[cx+e*sc,cy-n*sc];}
   // surfer path (faded by age: oldest dim, newest bright)
-  var h=hist;
+  var h=recent;
   if(st.fix&&h.length>1){
     for(var i=1;i<h.length;i++){
       var a=toEN(st,h[i-1]),b=toEN(st,h[i]);
@@ -403,17 +567,34 @@ function drawRadar(d,dist){
       x.lineWidth=2;x.beginPath();x.moveTo(pa[0],pa[1]);x.lineTo(pb[0],pb[1]);x.stroke();
     }
   }
-  // servo aim lines (world bearing = heading + angle + mountOffset)
+  // servo aim lines (angle increases CCW; compass bearing increases CW)
   var hdg=(d.mag.online&&d.mag.heading>=0)?d.mag.heading:0;
   var off=d.servo.mount_offset_deg||0;
   function aim(angle,col,w){
-    var brg=((hdg+angle+off)%360+360)%360,r=brg*Math.PI/180;
+    var brg=((hdg-angle+off)%360+360)%360,r=brg*Math.PI/180;
     x.strokeStyle=col;x.lineWidth=w;x.beginPath();x.moveTo(cx,cy);
     x.lineTo(cx+Math.sin(r)*R,cy-Math.cos(r)*R);x.stroke();
   }
+  // Servo 目前：畫成一個 5 度扇形雷達波束（半徑方向漸層 + 發光邊緣），
+  // 比單一細線更有「雷達掃描」的感覺；halfWidthDeg 可調整扇形寬度。
+  function aimSector(angle,rgb,halfWidthDeg){
+    var brg=((hdg-angle+off)%360+360)%360;
+    var a0=(brg-halfWidthDeg-90)*Math.PI/180,a1=(brg+halfWidthDeg-90)*Math.PI/180;
+    var grad=x.createRadialGradient(cx,cy,0,cx,cy,R);
+    grad.addColorStop(0,'rgba('+rgb+',0.04)');
+    grad.addColorStop(0.6,'rgba('+rgb+',0.30)');
+    grad.addColorStop(1,'rgba('+rgb+',0.88)');
+    x.save();
+    x.shadowColor='rgba('+rgb+',0.9)';x.shadowBlur=10;
+    x.fillStyle=grad;
+    x.beginPath();x.moveTo(cx,cy);x.arc(cx,cy,R,a0,a1);x.closePath();x.fill();
+    x.restore();
+    x.strokeStyle='rgba('+rgb+',0.95)';x.lineWidth=1.5;
+    x.beginPath();x.arc(cx,cy,R,a0,a1);x.stroke();
+  }
   if(d.servo.calibrated){
     aim(d.servo.target,'rgba(34,211,238,.55)',2);
-    aim(d.servo.angle,'#f97316',3);
+    aimSector(d.servo.angle,'249,115,22',2.5);   // 5° 扇形 (±2.5°)
   }
   // current surfer marker + GPS status tag
   if(st.fix&&d.client.fix){
@@ -472,7 +653,7 @@ function drawMap(d,dist){
   fitCanvas();
   var c=$('radar'),x=c.getContext('2d'),W=c.width,H=c.height;
   x.clearRect(0,0,W,H);
-  var h=hist,cli=[],srv=[];
+  var h=recentHist(RADAR_WINDOW_MS),cli=[],srv=[];
   for(var i=0;i<h.length;i++){
     if(h[i].lat||h[i].lon)cli.push({lat:h[i].lat,lon:h[i].lon});
     if(h[i].sfix)srv.push({lat:h[i].slat,lon:h[i].slon});
@@ -497,20 +678,23 @@ function drawMap(d,dist){
     var ht=Math.abs(latToY(minLat,zz)-latToY(maxLat,zz));
     if(w<=W-2*m&&ht<=H-2*m){z=zz;break;}
   }
-  var cwx=lonToX(midLon,z),cwy=latToY(midLat,z);
-  function plot(p){return[W/2+(lonToX(p.lon,z)-cwx),H/2+(latToY(p.lat,z)-cwy)];}
+  var zf=clamp(z+mapZoomDelta,2,19);
+  var zi=Math.floor(zf),frac=zf-zi,zoomScale=Math.pow(2,frac);
+  var cwx=lonToX(midLon,zi),cwy=latToY(midLat,zi);
+  function plot(p){return[W/2+(lonToX(p.lon,zi)-cwx)*zoomScale,
+                           H/2+(latToY(p.lat,zi)-cwy)*zoomScale];}
   // draw OSM tiles (loads only when the phone has internet; fails silently offline)
-  var n=Math.pow(2,z),originX=cwx-W/2,originY=cwy-H/2;
+  var n=Math.pow(2,zi),originX=cwx-W/(2*zoomScale),originY=cwy-H/(2*zoomScale);
   var tx0=Math.floor(originX/256),ty0=Math.floor(originY/256);
-  var tx1=Math.floor((cwx+W/2)/256),ty1=Math.floor((cwy+H/2)/256);
+  var tx1=Math.floor((cwx+W/(2*zoomScale))/256),ty1=Math.floor((cwy+H/(2*zoomScale))/256);
   var anyTile=false;
   for(var ty=ty0;ty<=ty1;ty++){
     if(ty<0||ty>=n)continue;
     for(var tx=tx0;tx<=tx1;tx++){
       var wtx=((tx%n)+n)%n;
-      var img=getTile(z,wtx,ty);
-      var dx=Math.round(tx*256-originX),dy=Math.round(ty*256-originY);
-      if(img._ok){x.drawImage(img,dx,dy,256,256);anyTile=true;}
+      var img=getTile(zi,wtx,ty);
+      var dx=Math.round((tx*256-originX)*zoomScale),dy=Math.round((ty*256-originY)*zoomScale);
+      if(img._ok){x.drawImage(img,dx,dy,Math.ceil(256*zoomScale),Math.ceil(256*zoomScale));anyTile=true;}
     }
   }
   if(anyTile){x.fillStyle='rgba(13,17,23,0.12)';x.fillRect(0,0,W,H);}
@@ -526,7 +710,7 @@ function drawMap(d,dist){
       'Surfer'+(d.server.fix&&dist!=null?(' '+dist.toFixed(0)+'m'):''),
       d.client.satellites,d.client.hdop);}
   // scale bar (metres-per-pixel at this latitude & zoom)
-  var mpp=156543.03392*Math.cos(midLat*Math.PI/180)/Math.pow(2,z);
+  var mpp=156543.03392*Math.cos(midLat*Math.PI/180)/Math.pow(2,zf);
   var step=niceStep(mpp*90),px2=step/mpp,bx=W-14-px2,by=H-18;
   x.strokeStyle='#fff';x.lineWidth=3;x.beginPath();
   x.moveTo(bx,by);x.lineTo(bx+px2,by);x.moveTo(bx,by-4);x.lineTo(bx,by+4);

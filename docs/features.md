@@ -52,14 +52,15 @@
 - **白名單**：最多 16 筆，開機從 NVS 載入（無資料用 `DEFAULT_WHITELIST`），可經 API 動態 add/remove/clear 並寫回 NVS。
 - **磁力計航向**：板上 QMC6310（I2C bus0）每 200 ms 讀一次 heading，被用來補償攝影站身體旋轉；離線時 heading 視為 0（假設站體固定）。
 - **雲台追蹤狀態機**：`manual`（手動拖 slider 對準 surfer）→ `tracking`（按 start）→ `paused`（可 pause/resume）。
-  - Servo（IO21，內建 LEDC 50 Hz PWM，500–2500 µs = 0–180°）。
-  - start 時鎖定 `mount_offset = bearing − heading − servo_angle`（寫 NVS），之後 `servo_angle = bearing − heading − mount_offset`（clamp 0–180°）。
+  - Servo（IO21，內建 LEDC 333 Hz / 14-bit PWM，500–2500 µs = 0–180°）。
+  - 從上方看，Servo 角度增加為逆時針、羅盤 bearing 增加為順時針；start 時鎖定 `mount_offset = bearing − heading + servo_angle`（寫 NVS），之後 `servo_angle = heading + mount_offset − bearing`（clamp 0–180°）。
 - 長按 PWR 鍵 → 關機畫面後斷電。
 
 # 5. WiFi / Web 監控（Server）
 
 - STA 模式連手機熱點（帳密在 `wifi_config.h`），逾時 20 秒；連不上仍跑 LoRa，背景自動重連。
 - 內嵌單頁 Web UI（Servo 控制 + Canvas 極座標雷達圖，無外部 CDN），前端每 1 秒輪詢 `/api/track`、每 3 秒輪詢 `/api/status`。
+- Server 支援 PlatformIO `espota` Wi-Fi 韌體更新；OTA 開始時暫停追蹤，完成後自動重開。OTA 本身未設密碼，以手機熱點的存取控制作為網路邊界。
 - API endpoint 與 JSON 欄位詳見 [interface.md](interface.md)。
 - Web UI 頂部狀態列：Link / RX 秒數 / GPS 衛星 / 羅盤 heading / RSSI / Batt / Uptime。
 - 雷達圖：以攝影站為中心的 east/north 座標，自動縮放、畫出 surfer 過去 5 分鐘軌跡與 servo 當前/目標指向。
@@ -113,9 +114,14 @@ SH1106 128×64。以下為模擬畫面（`<...>` 為動態數值）。
 ```
 
 + `Client-n/N` 中 n 代表白名單編號（1 起算）、N 代表白名單總數；無白名單時顯示 `Client -/-`。
-+ `LoRa` & `GPS` 狀態為四級：`Good` / `OK` / `Bad` / `Miss`（`Miss` = 沒訊號/沒連線/無衛星）。
-  + GPS：Good = fix 且 HDOP≤2 且 sats≥6；OK = fix 且 HDOP≤5 且 sats≥4；Bad = 有收到衛星但無可用定位；Miss = 沒衛星且無定位。
-  + LoRa：依最近一筆 RSSI/SNR 分 Good/OK/Bad；連線中斷（未收到封包）= Miss。
++ `LoRa` & `GPS` 狀態為四級：`Good` / `OK` / `Bad` / `Miss`（`Miss` = 沒訊號/沒連線/無衛星）\
+  GPS
+  + Good = fix 且 HDOP≤1.5 且 sats≥8
+  + OK = fix 且 HDOP≤3 且 sats≥6
+  + Bad = 有收到衛星但無可用定位
+  + Miss = 沒衛星且無定位。
+
+  LoRa：依最近一筆 RSSI/SNR 分 Good/OK/Bad/Miss。
 + 溫濕度無資料顯示 `--.-C/--%`
 + `BAT` 顯示電量百分比（左=Server 自身 18650、右=選定 Client 遙測），無資料顯示 `--%`；Server 接著 USB/充電時左側顯示 ⚡。
 + wifi_status
@@ -141,7 +147,7 @@ SH1106 128×64。以下為模擬畫面（`<...>` 為動態數值）。
 
 # 8. 健康 / 告警門檻
 
-- 電量百分比：單顆鋰電 **3.2V = 0%、4.2V = 100%**（線性），OLED 與網頁皆以 % 顯示。
+- 電量百分比：單顆鋰電 **3.2V = 0%、4.15V = 100%**（線性），OLED 與網頁皆以 % 顯示。
 - 低電量自動關機（Server / Client 皆有）：偵測到 **< 3.2V** 時顯示「LOW BATTERY」後由 PMU 斷電；**開機**時若已過低則直接顯示後關機（無法開機）。為避免誤動作，**接著 USB（VBUS 在）時不關機**、且讀值 < 2.5V（視為無/異常電池）時忽略；執行中需連續兩次低讀值才關機。
 - 充電指示：偵測到外部電源（USB/Type-C）時顯示 ⚡（OLED 與網頁「站」電量）。
 - 溫度警告 50.0°C、濕度警告 90%。

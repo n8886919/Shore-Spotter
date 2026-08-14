@@ -6,7 +6,7 @@
 2. **I2C 裝置位址** — OLED / 感測器 / PMU
 3. **電氣參數與電源通道** — AXP2101 各路供電
 4. **按鈕說明** — PWR / BOOT / RST
-5. **Servo 規格** — SPT5435LV-180
+5. **Servo 規格** — GXServo Brushless 42KG (QY3242BLS / GX3242)
 6. **接線圖** — 電池 / UBEC / Servo / 攝影機
 
 韌體行為見 [features.md](features.md)；封包/HTTP 介面見 [interface.md](interface.md)。
@@ -136,24 +136,36 @@
 
 > 韌體用法（本專案）：Client 端**短按 PWR** 喚醒 OLED 顯示狀態 10 秒；**長按 PWR** 顯示關機畫面後由 PMU 斷電。Server 端長按 PWR 同樣為關機。
 
-# SPT5435LV -180
-| Parameter             |               Value | Parameter             |                Value |
-| --------------------- | ------------------: | --------------------- | -------------------: |
-| Brand                 |           SPT Servo | Potentiometer         |            Mechanics |
-| Motor                 |                Core | Voltage Range         |          4.8V / 6.0V |
-| Neutral Point         |              1500μs | Signal Frequency      |                330Hz |
-| PWM Voltage           |           3.3V–5.0V | PWM Voltage           |            3.3V–5.0V |
-| Feedback Angle        |                  No | Operating Temperature |           -10°C–50°C |
-| Cycle                 |                20ms | Dead band             |                  4μs |
-| Default Direction     |                 CCW | Yes / no Lock         |                 Lock |
-| Remote control Angle  |                 90° | 500–2500μs Angle      |           180° / PWM |
-| Quiescent Current     |              100mAh | Rated Current         |                 1.4A |
-| Blocking Current      |                3.5A | Weight / Dimensions   | 60g / 40.5×20×40.5mm |
-| Output Gear           |          Futaba 25T | Gear Material         |       All Metal Gear |
-| Shell Material        | Half Aluminum Shell | Bearing               |                  2BB |
-| Connector Wire Length |               260MM | Line Definition       | Brown-/Red+/Orange S |
-| Operating Speed       |  4.8V / 0.16″ / 60° | Operating Speed       |   6.0V / 0.14″ / 60° |
-| Stall Torque          |     4.8V / 29 kg.cm | Stall Torque          |      6.0V / 35 kg.cm |
+# GXServo Brushless 42KG (QY3242BLS / GX3242)
+
+> 本專案目前使用：**500–2500us, 180°**（與韌體 `SERVO_MIN_US=500`, `SERVO_MAX_US=2500` 對應）。
+
+| Parameter | Value |
+| --- | --- |
+| 型號 | GXServo QY3242BLS / GX3242（42KG 級） |
+| 馬達型式 | Brushless |
+| 操作電壓 | 5.0V–8.4V |
+| 控制訊號 | PWM, 1520us / 333Hz（常見標示） |
+| PWM 輸入電平 | 3.3V–5.0V |
+| 脈寬/角度 | 500–2500us 對應 180° |
+| 堵轉扭力 | 30 kg.cm @ 6.0V / 38 kg.cm @ 7.4V / 42 kg.cm @ 8.4V |
+| 空載速度 | 0.118s/60° @ 6.0V / 0.092s/60° @ 7.4V / 0.085s/60° @ 8.4V |
+| Dead band | 2us |
+| 防護 | IP65（依賣場標示） |
+| 齒輪/軸承 | 金屬齒輪（常見為銅鋁組合）/ 雙滾珠 |
+| 尺寸/重量 | 約 40 x 20 x 37mm / 約 69g |
+| 線材 | Brown(-) / Red(+) / Orange(Signal) |
+
+> [!IMPORTANT]
+> 1. GXServo 42KG 在不同通路會有標示差異（例如殼材、齒輪材質、是否可程式化、角度選項）。
+> 2. 本專案以 **180° 版本 + 500–2500us** 為準，若你買到 270/360° 版本，需重新校正行程。
+> 3. 若使用 2S 電池，請先經 UBEC/穩壓供電給 Servo，不要直接把 2S 接到 servo 電源腳。
+> 4. Servo Brown(-)、UBEC GND 與 T-Beam GND 必須共地；只接 IO21 訊號線無法形成有效的 PWM 電位基準。
+
+資料來源（2026-07-23 查詢）：
+- https://www.ariesrc.gr/en/servo-4/22326-gxservo-qy3242bls-42kg-brushless-motor-180-degree-metal-gear-digital-servo-for-rc.html
+- https://hobbyant.com/p/sale-268576
+- https://offthegridsun.com/Servo-Robot-Motor/GXservo-GX3242-42KG-Brushless-Steering-Gear-High-Speed-Servo
 
 # 接線圖
 ```mermaid
@@ -162,9 +174,10 @@ flowchart TD
 
     B -->|XT60| U[HobbyWing 5A UBEC]
     B -->|XT60| C[Type-C Converter]
-    U -->|6V| S[SPT5435LV-180 Servo]
+    U -->|6V~8.4V| S[GXServo 42KG Servo]
     C --> T[LILYGO T-Beam Supreme]
     T -->|IO21 PWM| S
+    T ---|GND 共地| S
     S -->|3D列印連接器| A[攝影機]
 
 ```
@@ -174,6 +187,6 @@ flowchart TD
 - **Server**：2S 經 Type-C 變壓供 USB-C（PMU 視為 VBUS），同時板載 **18650** 作備援 → 像手機插著電使用。
 - **Client**：板載 **18650** 單獨供電。
 - 板上 **AXP2101 只量得到 18650（單 cell）**；2S 無法直接讀（對 Server 只是 VBUS）。
-- 電量 %：**3.2V=0%、4.2V=100%**（線性）。低於 3.2V 自動關機；**接 USB（VBUS 在）時不關機**，Type-C 失效改吃 18650 過低才關（保險）。
+- 電量 %：**3.2V=0%、4.15V=100%**（線性）。低於 3.2V 自動關機；**接 USB（VBUS 在）時不關機**，Type-C 失效改吃 18650 過低才關（保險）。
 - 接 USB/Type-C 時 OLED 與網頁顯示 **⚡**；「插著 Type-C 仍回報 18650 電壓」為正常。
 - 18650 為 LilyGO 板載電池，亦是 GPS 熱啟動備援電源。

@@ -193,7 +193,7 @@ Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修�
 | `mag.heading` | 攝影站板子的羅盤航向（度），無效時為 `-1` |
 | `client.satellites` / `server.satellites` | 雙方使用中衛星數，`-1` = 無效 |
 | `client.hdop` / `server.hdop` | 雙方 HDOP，`-1` = 無效（兩端套用相同 Good/Normal/Bad 標準）|
-| `server.batt_pct` | 攝影站 18650 電量 %（3.2V=0%、4.2V=100%），`-1` = 無電池/未知 |
+| `server.batt_pct` | 攝影站 18650 電量 %（3.2V=0%、4.15V=100%），`-1` = 無電池/未知 |
 | `server.charging` | 攝影站是否接外部電源（USB/Type-C，VBUS 在），用於 ⚡ 指示 |
 
 > 過去 5 分鐘軌跡不再由 API 回傳；前端每秒把 `client`/`server` 當下位置附加到本地陣列（最多 300 點），重整頁會重新累積。
@@ -336,7 +336,7 @@ POST /api/whitelist?action=clear
 { "ok": true, "angle": 87.0 }
 ```
 
-錯誤時回 `409`（`pause tracking first`）或 `400`（`missing angle param`）。
+錯誤時回 `409`（`pause tracking first`）、`400`（`missing angle param`），或在 LEDC/PWM 初始化失敗時回 `503`（`servo PWM unavailable`）。
 
 ## `POST /api/track/start`
 
@@ -348,7 +348,7 @@ POST /api/whitelist?action=clear
 { "ok": true, "mount_offset_deg": 12.5 }
 ```
 
-無法校正時回 `409`（`need server+client GPS fix`）。
+無法校正時回 `409`（`need server+client GPS fix`）；PWM 不可用時回 `503`（`servo PWM unavailable`）。
 
 ## `POST /api/track/pause`
 
@@ -360,7 +360,7 @@ POST /api/whitelist?action=clear
 
 ## `POST /api/track/resume`
 
-以現有校正恢復自動追蹤（無需重新對準）。未校正時回 `409`。
+以現有校正恢復自動追蹤（無需重新對準）。未校正時回 `409`；PWM 不可用時回 `503`。
 
 ```json
 { "ok": true, "mode": "tracking" }

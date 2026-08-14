@@ -17,6 +17,32 @@ LCD顯示: 連線狀態 / 電量 / 濕度 / GPS狀態 / 監控頁面IP
 
 手機開啟個人熱點，攝影站開機自動連線（熱點 SSID/密碼設定於 `include/wifi_config.h`），再用手機瀏覽器輸入攝影站 IP（開機時 OLED 顯示）即可進入監控頁面
 
+## 怎麼分 client / server
+這個專案不是用序列埠來分角色，而是用 `platformio.ini` 裡的 PlatformIO environment 來分：
+
++ `tbeam-client` = Surfer 端追蹤器，對應 `ROLE_CLIENT`
++ `tbeam-server` = 岸邊攝影站，對應 `ROLE_SERVER`
+
+燒錄哪塊板、走哪個 `upload_port`，看的是你執行 `pio run -e tbeam-client` 還是 `-e tbeam-server`（或 VS Code 下方切換 environment），跟埠號本身無關。
+
+`upload_port` / `monitor_port` 依作業系統手動指定即可，`platformio.ini` 裡每個 environment 下面都留了 Windows（`COMx`）與 Linux（`/dev/ttyACM*` 或 `/dev/ttyUSB*`）的範例，要用哪個就拿掉那兩行前面的 `;`、其餘保持註解。同時插兩塊板時，先用 `ls /dev/tty*`（Linux）確認各板實際對應的裝置名稱，再分別填進 `tbeam-client` / `tbeam-server` 對應的 environment。
+
+## Server 透過 Wi-Fi 更新（PlatformIO espota）
+
+第一次必須用 `tbeam-server` 經 USB 燒錄，讓板子取得 OTA 功能。之後電腦與 Server 連在同一個手機熱點時，可使用 `tbeam-server-ota`：
+
+```bash
+pio run -e tbeam-server-ota -t upload
+```
+
+預設以 `shore-spotter-server.local` 尋找裝置。若手機熱點不轉送 mDNS，改用 OLED 顯示的 IP：
+
+```bash
+pio run -e tbeam-server-ota -t upload --upload-port <SERVER_IP>
+```
+
+更新期間請維持供電與 Wi-Fi 穩定。OTA 開始時會暫停自動追蹤，成功後 Server 自動重開；USB 燒錄仍保留作為救援方式。OTA 本身未設密碼，任何連上同一熱點且能連到 Server 的裝置都能送出韌體，因此不要讓不受信任的裝置加入熱點。
+
 ## 為什麼選 LoRa？
 衝浪環境對無線通訊有幾個特殊條件：距離遠、無遮蔽物、不適合攜帶手機。LoRa 在這個場景下的優勢在於低功耗與長距離，更重要的是它讓「下水端」的職責單純：只負責定位與傳輸，不需要維護網路連線。
 
