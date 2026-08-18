@@ -9,3 +9,7 @@ include/wifi_config.h
 
 # Local scan report (not version-controlled)
 docs/scan-report.md
+
+# Python bytecode (tools/)
+__pycache__/
+*.pyc

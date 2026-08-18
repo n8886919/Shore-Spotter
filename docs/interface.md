@@ -179,14 +179,34 @@ Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修�
 回傳完整 Web UI（單頁 HTML，內嵌 Servo 控制 + Canvas 極座標雷達圖，無外部 CDN 依賴）。
 兩個分頁：**雷達**（雷達／地圖 + 手動／自動）與**資訊**（遙測、校正、軌跡匯出）。
 
-## `GET /favicon.ico`
+## 分頁圖示 `GET /icon-16.png` · `/icon-32.png` · `/icon-192.png` · `/favicon.ico`
 
-回 `204 No Content`。
+回 `image/png`，帶 `Cache-Control: public, max-age=604800`。
 
-沒有這個 handler 的話，瀏覽器自動發出的 favicon 請求會落到 `onNotFound` 的
-`302 -> /`，於是**每開一次頁面就多抓一次完整的 44 KB HTML**。監控頁的 `<head>`
-另外放了 `<link rel="icon" href="data:,">` 從源頭抑制這個請求，這裡是備援
-（PWA、直接開 `/log` 等情況）。
+| 端點 | 尺寸 | 位元組 | 用途 |
+|---|---|---|---|
+| `/icon-16.png` | 16×16 | 389 | 分頁列（1× DPI）|
+| `/icon-32.png` | 32×32 | 538 | 分頁列（2× DPI）、書籤 |
+| `/icon-192.png` | 192×192 | 2120 | PWA 加到主畫面、`apple-touch-icon` |
+| `/favicon.ico` | 32×32 | — | 同 `/icon-32.png`；瀏覽器認的是 Content-Type 不是副檔名 |
+
+合計約 3 KB flash。全部是**調色盤 PNG**（整張圖只有 6 種顏色，比 RGBA 小 3–5 倍），
+嵌在韌體裡由攝影站自己供應，離線一樣看得到。
+
+`/favicon.ico` 一定要有 handler：沒有的話瀏覽器自動發出的那個請求會落到 `onNotFound`
+的 `302 -> /`，於是**每開一次頁面就多抓一次完整的 44 KB HTML**。監控頁的 `<head>` 也
+明確列出了尺寸，讓瀏覽器直接挑對，不必先去試 `/favicon.ico`。
+
+> 圖示的來源是 [`tools/make_icon.py`](../tools/make_icon.py)，它產生
+> `include/web_icon.h`。圖示是用幾何繪製的，所以 repo 裡**不另外放一份 SVG** ——
+> 兩份副本遲早會走岔。要改設計就改那個腳本裡的常數再重跑。
+>
+> 設計上畫的是這台機器本身而不是一朵浪：半圓 = servo 的 0–180° 行程、橘扇形 = 目前
+> 瞄準、紅點 = 衝浪者、白點 = 攝影站，顏色與監控頁雷達畫面一致。理由是 16px 下浪會
+> 糊成一團，而且那是任何衝浪 app 都長的樣子。
+>
+> manifest 的 `icons` 刻意**不宣告** `purpose:"maskable"`：紅點靠近圖磚邊緣，
+> Android 的圓形遮罩會把它切掉。
 
 ## `GET /log`
 

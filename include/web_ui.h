@@ -39,9 +39,12 @@ static const char WEB_UI_HTML[] = R"rawlit(
 <meta name="theme-color" content="#0d1117">
 <meta name="apple-mobile-web-app-title" content="Shore Spotter">
 <link rel="manifest" href="/manifest.json">
-<!-- 空的 icon：沒有這行瀏覽器會自動去要 /favicon.ico，多一趟往返打在只能同時
-     服務一個連線的 ESP32 上。 -->
-<link rel="icon" href="data:,">
+<!-- 分頁圖示（見 tools/make_icon.py）。明確指定尺寸讓瀏覽器直接挑對，
+     不必先去要 /favicon.ico 試試看 —— 那一趟往返打在只能同時服務一個連線的
+     ESP32 上。 -->
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <title>Shore Spotter</title>
 <style>
 :root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;
@@ -1021,6 +1024,8 @@ static const char WEB_LOG_HTML[] = R"loglit(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0d1117">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png">
 <title>Shore Spotter · 紀錄</title>
 <style>
 :root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#3b82f6}

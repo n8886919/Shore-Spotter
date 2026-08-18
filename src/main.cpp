@@ -22,6 +22,7 @@
 #include <ArduinoOTA.h>
 #include <SensorQMC6310.hpp>  // SensorLib: QMC6310 magnetometer (station heading)
 #include "alerts.h"    // 現場提醒的門檻與分級
+#include "web_icon.h"  // 分頁圖示（由 tools/make_icon.py 產生）
 #include "web_ui.h"
 #include "wifi_config.h"  // phone hotspot SSID / password (edit there)
 #endif
@@ -2363,7 +2364,11 @@ static void initWebServer() {
                     F("{\"name\":\"Shore Spotter\",\"short_name\":\"Spotter\","
                       "\"start_url\":\"/\",\"scope\":\"/\",\"display\":\"standalone\","
                       "\"orientation\":\"portrait\",\"background_color\":\"#0d1117\","
-                      "\"theme_color\":\"#0d1117\"}"));
+                      "\"theme_color\":\"#0d1117\",\"icons\":["
+                      "{\"src\":\"/icon-192.png\",\"sizes\":\"192x192\",\"type\":\"image/png\"},"
+                      "{\"src\":\"/icon-32.png\",\"sizes\":\"32x32\",\"type\":\"image/png\"}]}"));
+    // 註：刻意不宣告 purpose:"maskable" —— 紅點靠近圖磚邊緣，Android 的圓形遮罩
+    // 會把它切掉。
   });
   httpServer.on("/api/track", HTTP_GET, []() {
     httpServer.send(200, "application/json", buildTrackJson());
@@ -2625,10 +2630,27 @@ static void initWebServer() {
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"manual\"}");
   });
-  // 沒有這個 handler 的話，瀏覽器自動要的 /favicon.ico 會落到 onNotFound ->
-  // 302 -> "/"，於是每開一次頁面就多抓一次完整的 44 KB HTML。
-  httpServer.on("/favicon.ico", HTTP_GET, []() {
-    httpServer.send(204);
+  // 分頁圖示。三個尺寸讓瀏覽器自己挑：16/32 給分頁列（1x / 2x DPI），
+  // 192 給 PWA「加到主畫面」與高解析度情境。合計約 3 KB flash。
+  //
+  // /favicon.ico 一定要有 handler：沒有的話瀏覽器自動發出的那個請求會落到
+  // onNotFound -> 302 -> "/"，於是每開一次頁面就多抓一次完整的 44 KB HTML。
+  // 內容給 PNG 就好，瀏覽器認的是 Content-Type 不是副檔名。
+  auto sendIcon = [](const uint8_t *png, size_t len) {
+    httpServer.sendHeader("Cache-Control", "public, max-age=604800");
+    httpServer.send_P(200, PSTR("image/png"), (PGM_P)png, len);
+  };
+  httpServer.on("/favicon.ico", HTTP_GET, [sendIcon]() {
+    sendIcon(ICON_32_PNG, sizeof(ICON_32_PNG));
+  });
+  httpServer.on("/icon-16.png", HTTP_GET, [sendIcon]() {
+    sendIcon(ICON_16_PNG, sizeof(ICON_16_PNG));
+  });
+  httpServer.on("/icon-32.png", HTTP_GET, [sendIcon]() {
+    sendIcon(ICON_32_PNG, sizeof(ICON_32_PNG));
+  });
+  httpServer.on("/icon-192.png", HTTP_GET, [sendIcon]() {
+    sendIcon(ICON_192_PNG, sizeof(ICON_192_PNG));
   });
   httpServer.onNotFound([]() {
     httpServer.sendHeader("Location", "/");
