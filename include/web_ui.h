@@ -6,8 +6,13 @@
 // OpenStreetMap raster tiles directly in the browser — those appear only when
 // the phone also has mobile data; offline it falls back to tracks + scale bar.
 //
-// Operator flow (no separate calibrate step):
-//   手動 (Manual): drag the overlaid slider to aim the camera at the surfer.
+// Operator flow:
+//   One-time, on the 資訊 page: magnetometer hard-iron calibration (spin the rig
+//   through one turn), then landmark calibration (centre a distant landmark in
+//   the viewfinder and paste its coordinates). Both are solo, and together they
+//   make mount_offset a constant that survives being packed up and set down at
+//   another spot — so later sessions need no aiming at all.
+//   手動 (Manual): drag the overlaid slider to aim the camera manually.
 //   自動 (Auto):   locks the current manual aim as "facing the surfer" and
 //                  auto-follows; pressing it again re-locks from the latest aim.
 // Layout: full-height, no-scroll, two top tabs — 雷達 (radar/map canvas with the
@@ -87,6 +92,19 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .r{display:flex;justify-content:space-between;align-items:baseline;gap:6px;
   font-size:12px;padding:2px 0}
 .r span{color:var(--mut)}
+.calCard h3{margin:0 0 4px;font-size:14px;font-weight:700}
+.calRow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.calRow input[type=text]{flex:1;min-width:170px;padding:10px;border-radius:8px;
+  border:1px solid var(--line);background:#0d1117;color:var(--fg);font-size:13px}
+.hint3{display:block;margin-top:6px;font-size:11px;color:var(--mut);line-height:1.45}
+.bar{height:6px;border-radius:3px;background:#21262d;overflow:hidden;margin-top:8px}
+.bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
+#pgLog{overflow:hidden}
+#logBox{flex:1;min-height:0;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-all;
+  font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--fg)}
+.logBar{flex:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.logBar label{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:5px}
+.logBar button{flex:0 0 auto;min-width:72px}
 .r b{font-variant-numeric:tabular-nums}
 .cmp{width:100%;border-collapse:collapse;font-size:13px}
 .cmp th,.cmp td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:right;
@@ -100,6 +118,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 <nav class="tabs">
   <button id="tabRadar" class="on" type="button">雷達</button>
   <button id="tabInfo" type="button">資訊</button>
+  <button id="tabLog" type="button">紀錄</button>
 </nav>
 
 <main>
@@ -173,11 +192,42 @@ button:disabled{opacity:.4;cursor:not-allowed}
         <div class="r"><span>距上次封包</span><b id="cAge">--</b></div>
       </div>
     </div>
+    <div class="card calCard" style="flex:none">
+      <h3>校正（各做一次即可）</h3>
+
+      <div class="sub">1 · 磁力計 hard-iron</div>
+      <div class="r"><span>狀態</span><b id="mcState">--</b></div>
+      <div class="r"><span>擬合殘差</span><b id="mcRes">--</b></div>
+      <div class="r"><span>磁場強度</span><b id="mcFld">--</b></div>
+      <div class="bar"><i id="mcBar"></i></div>
+      <div class="calRow"><button id="btnMagCal" type="button">開始磁力計校正</button></div>
+      <span class="hint3">按下後把整台機器放腳架上，<b>慢慢水平轉一整圈</b>（15~30 秒）。
+        校正值跟著板子走，換浪點不用重做。殘差 &lt;1° 代表安裝位置乾淨；
+        好幾度表示 servo 的鋼齒輪在干擾，應該把板子移遠而不是將就。</span>
+
+      <div class="sub" style="margin-top:16px">2 · 地標校正（鎖定 mount_offset）</div>
+      <div class="r"><span>目前 mount_offset</span><b id="mcOff">--</b></div>
+      <div class="calRow">
+        <input id="lmCoord" type="text" placeholder="25.033611, 121.565000">
+        <button id="btnLmCal" type="button">用目前鏡頭指向校正</button>
+      </div>
+      <span class="hint3">servo 設 90°，從<b>觀景窗</b>把 1 km 以外的地標對到畫面正中央，
+        貼上該地標座標（Google Maps 右鍵可複製）再按鈕。不需要追蹤器在場、不需要第二個人。
+        先做完步驟 1，否則這個值換場地就失效。</span>
+    </div>
     <div class="card" style="flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <button id="btnClear" type="button">清除軌跡</button>
       <button id="btnExport" type="button">匯出 GPX（可上傳 Strava）</button>
       <span id="exportHint" class="hint2" style="margin-left:0">網頁最多保留過去 2 小時軌跡，雷達／地圖仍只顯示最近 5 分鐘；匯出後會自動清空。GPX 檔請自行到 Strava 網頁上傳</span>
     </div>
+  </section>
+  <section id="pgLog" class="page">
+    <div class="card logBar">
+      <button id="btnLogClear" type="button">清除</button>
+      <label><input id="logFollow" type="checkbox" checked> 自動捲到最新</label>
+      <span id="logStat" class="hint2">--</span>
+    </div>
+    <pre id="logBox" class="card"></pre>
   </section>
 </main>
 
@@ -276,12 +326,19 @@ function showPage(p){
   page=p;
   $('tabRadar').classList.toggle('on',p==='radar');
   $('tabInfo').classList.toggle('on',p==='info');
+  $('tabLog').classList.toggle('on',p==='log');
   $('pgRadar').classList.toggle('on',p==='radar');
   $('pgInfo').classList.toggle('on',p==='info');
+  $('pgLog').classList.toggle('on',p==='log');
   if(p==='radar')redraw();
+  // Only poll the log while its tab is visible — no point spending the ESP's
+  // single-client web server on it otherwise.
+  if(p==='log'){pumpLog();if(!logTimer)logTimer=setInterval(pumpLog,2000);}
+  else if(logTimer){clearInterval(logTimer);logTimer=0;}
 }
 $('tabRadar').onclick=function(){showPage('radar');};
 $('tabInfo').onclick=function(){showPage('info');};
+$('tabLog').onclick=function(){showPage('log');};
 function fitCanvas(){
   var c=$('radar'),w=Math.round(c.clientWidth),h=Math.round(c.clientHeight);
   if(w>0&&h>0&&(c.width!==w||c.height!==h)){c.width=w;c.height=h;}
@@ -481,6 +538,7 @@ function refresh(){
     $('sTemp').textContent=d.server.temp_c==null?'--':d.server.temp_c+'°C';
     $('sHum').textContent=d.server.humidity_pct==null?'--':d.server.humidity_pct+'%';
     $('sHdg').textContent=d.mag.online&&d.mag.heading>=0?d.mag.heading.toFixed(0)+'°':'--';
+    $('mcOff').textContent=d.servo.calibrated?d.servo.mount_offset_deg.toFixed(1)+'°':'未校正';
     // --- Client block ---
     $('cFix').textContent=d.client.fix?'有':'無';
     $('cSat').textContent=d.client.satellites>=0?d.client.satellites:'--';
@@ -665,13 +723,31 @@ function drawMap(d,dist){
   if(all.length===0){
     x.fillStyle='#f85149';x.font='13px system-ui';x.textAlign='center';
     x.fillText('尚無 GPS 軌跡資料',W/2,H/2);x.textAlign='left';return;}
-  // bounding box (deg) with a minimum span so a stationary cluster keeps context
-  var minLat=1e9,maxLat=-1e9,minLon=1e9,maxLon=-1e9;
-  all.forEach(function(p){minLat=Math.min(minLat,p.lat);maxLat=Math.max(maxLat,p.lat);
-    minLon=Math.min(minLon,p.lon);maxLon=Math.max(maxLon,p.lon);});
-  var midLat=(minLat+maxLat)/2,midLon=(minLon+maxLon)/2,minSpan=0.0009;
-  if(maxLat-minLat<minSpan){minLat=midLat-minSpan/2;maxLat=midLat+minSpan/2;}
-  if(maxLon-minLon<minSpan){minLon=midLon-minSpan/2;maxLon=midLon+minSpan/2;}
+  // Centre on the LIVE station/surfer midpoint, not on the track's bounding box.
+  // Using the box made the view drift away as the trail grew, so the two things
+  // you actually care about slid off-centre while old track pulled the camera.
+  var minSpan=0.0009,midLat,midLon;
+  if(d.server.fix&&d.client.fix){
+    midLat=(d.server.lat+d.client.lat)/2;midLon=(d.server.lon+d.client.lon)/2;
+  }else if(d.server.fix){midLat=d.server.lat;midLon=d.server.lon;}
+  else if(d.client.fix){midLat=d.client.lat;midLon=d.client.lon;}
+  else{ // no live fix at all — fall back to the old track-box centre
+    var bl=1e9,bh=-1e9,gl=1e9,gh=-1e9;
+    all.forEach(function(p){bl=Math.min(bl,p.lat);bh=Math.max(bh,p.lat);
+      gl=Math.min(gl,p.lon);gh=Math.max(gh,p.lon);});
+    midLat=(bl+bh)/2;midLon=(gl+gh)/2;
+  }
+  // Span symmetric about that centre and just wide enough to hold both live
+  // points, so auto-zoom still frames them but the centre never moves with the
+  // trail. Pinch (mapZoomDelta) still overrides to see more track.
+  var halfLat=minSpan/2,halfLon=minSpan/2;
+  [d.server.fix?d.server:null,d.client.fix?d.client:null].forEach(function(p){
+    if(!p)return;
+    halfLat=Math.max(halfLat,Math.abs(p.lat-midLat));
+    halfLon=Math.max(halfLon,Math.abs(p.lon-midLon));
+  });
+  var minLat=midLat-halfLat,maxLat=midLat+halfLat;
+  var minLon=midLon-halfLon,maxLon=midLon+halfLon;
   var m=12,z=2;
   for(var zz=19;zz>=2;zz--){
     var w=Math.abs(lonToX(maxLon,zz)-lonToX(minLon,zz));
@@ -729,8 +805,86 @@ function drawMap(d,dist){
 
 showPage('radar');
 refresh();refreshStatus();
+// ---- log ----
+// The firmware keeps a 4 KB ring buffer and hands back only what we have not
+// seen, keyed on an absolute byte offset, so polling stays cheap.
+var logNext=0, logTimer=0, logBusy=false;
+function pumpLog(){
+  if(logBusy)return;
+  logBusy=true;
+  fetch('/api/log?from='+logNext).then(function(r){
+    var n=parseInt(r.headers.get('X-Log-Next')||'0',10);
+    var dropped=r.headers.get('X-Log-Dropped')==='1';
+    return r.text().then(function(t){return{t:t,n:n,d:dropped};});
+  }).then(function(o){
+    var box=$('logBox');
+    // Follow only if already pinned to the bottom, so reading scrollback is not
+    // yanked away every 2 s.
+    var atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
+    if(o.d&&logNext!==0)box.textContent+='\n--- 略過部分紀錄（緩衝已滿或裝置重開）---\n';
+    if(o.t)box.textContent+=o.t;
+    if(box.textContent.length>60000)box.textContent=box.textContent.slice(-40000);
+    logNext=o.n;
+    $('logStat').textContent=o.n+' bytes';
+    if($('logFollow').checked&&atEnd)box.scrollTop=box.scrollHeight;
+  }).catch(function(){}).then(function(){logBusy=false;});
+}
+$('btnLogClear').onclick=function(){
+  post('/api/log').then(function(){
+    $('logBox').textContent='';logNext=0;pumpLog();
+  }).catch(function(){});
+};
+
+// ---- calibration ----
+var magPollTimer=0;
+function renderMagCal(m){
+  var st={idle:'未校正',collecting:'量測中…',done:'已校正',failed:'失敗'}[m.state]||m.state;
+  if(!m.online)st='無磁力計';
+  else if(m.state==='failed'&&m.error)st='失敗：'+m.error;
+  $('mcState').textContent=st;
+  $('mcRes').textContent=m.residual_deg==null?'--':m.residual_deg.toFixed(2)+'°';
+  $('mcFld').textContent=m.field_gauss==null?'--':m.field_gauss.toFixed(3)+' G';
+  var pct=m.state==='collecting'?m.coverage_pct:(m.calibrated?100:0);
+  $('mcBar').style.width=pct+'%';
+  $('btnMagCal').textContent=m.state==='collecting'
+    ?('轉圈中… '+m.coverage_pct+'%（點此取消）'):'開始磁力計校正';
+}
+function pollMagCal(){
+  fetch('/api/mag/calibrate').then(function(r){return r.json();}).then(function(m){
+    renderMagCal(m);
+    if(m.state==='collecting'){magPollTimer=setTimeout(pollMagCal,300);}
+    else{
+      magPollTimer=0;
+      if(m.state==='done')toast('磁力計校正完成，殘差 '+m.residual_deg.toFixed(2)+'°');
+      else if(m.state==='failed')toast('校正失敗：'+(m.error||'未知'));
+    }
+  }).catch(function(){magPollTimer=0;});
+}
+$('btnMagCal').onclick=function(){
+  var busy=magPollTimer!==0;
+  post('/api/mag/calibrate'+(busy?'?action=cancel':'')).then(function(m){
+    renderMagCal(m);
+    if(magPollTimer){clearTimeout(magPollTimer);magPollTimer=0;}
+    if(m.state==='collecting'){toast('開始轉圈：慢慢水平轉一整圈');pollMagCal();}
+  }).catch(function(){});
+};
+// Accepts "25.033611, 121.565000" — the exact format Google Maps copies.
+$('btnLmCal').onclick=function(){
+  var m=/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/.exec($('lmCoord').value||'');
+  if(!m){toast('座標格式看不懂，例如 25.033611, 121.565000');return;}
+  post('/api/track/calibrate?lat='+m[1]+'&lon='+m[2]).then(function(j){
+    $('mcOff').textContent=j.mount_offset_deg.toFixed(1)+'°';
+    toast('已鎖定 mount_offset '+j.mount_offset_deg.toFixed(1)+'°（地標方位 '+
+      j.bearing.toFixed(1)+'°、距離 '+j.distance_m+' m）');
+    if(j.warning)setTimeout(function(){toast(j.warning);},2800);
+    refresh();
+  }).catch(function(){});
+};
+
 setInterval(refresh,1000);
 setInterval(refreshStatus,3000);
+fetch('/api/mag/calibrate').then(function(r){return r.json();})
+  .then(renderMagCal).catch(function(){});
 </script>
 </body>
 </html>

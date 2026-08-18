@@ -19,19 +19,48 @@
 | 頻率 | 923.2 MHz（台灣合法 AS923）|
 | 頻寬 | 125 kHz |
 | Spreading Factor | SF9 |
-| Coding Rate | 4/7 |
+| Coding Rate | 4/5 |
 | Sync Word | `0x12` |
 | 發射功率 | 17 dBm（ATPC 動態調整 10–22 dBm）|
 | 發送間隔 | 1 秒 / 封包（位置），30 秒 / 封包（遙測）|
 
+> **必須兩端一致的是 頻率 / 頻寬 / SF / Sync Word**，不一致就完全解不出封包。
+> **Coding Rate 不必一致**：explicit header 模式（RadioLib 預設）會把 payload 的 CR
+> 寫在 header 裡，而 header 固定以 4/8 編碼，接收端因此能自動解出任何 CR。
+> 所以兩塊板即使 CR 不同也能正常通訊，CR 只決定「這塊板自己發送時」用什麼編碼率。
+
 ## 封包類型
 
-| `msgType` | 名稱 | 間隔 | 說明 |
-|---|---|---|---|
-| `1` | MSG_DATA | 1 s | 位置 + 速度向量 |
-| `2` | MSG_ACK | event-driven | 岸上端收到 DATA 後回覆短 ACK（含 ackSeq / RSSI / SNR） |
-| `3` | MSG_HELLO | — | 保留 |
-| `4` | MSG_TELEMETRY | 30 s | 電量 + 溫濕度 |
+| `msgType` | 名稱 | 間隔 | 大小 | 空中時間 | 說明 |
+|---|---|---|---|---|---|
+| `1` | MSG_DATA | 1 s | 32 B | 246 ms | 位置 + 速度向量 |
+| `2` | MSG_ACK | 每 4 包 | 20 B | 185 ms | 岸上端回覆短 ACK（含 ackSeq / RSSI / SNR） |
+| `3` | MSG_HELLO | — | — | — | 保留 |
+| `4` | MSG_TELEMETRY | 30 s（限定時槽）| 19 B | 185 ms | 電量 + 溫濕度 |
+
+平均通道佔用 = 246 + 185/4 ≈ **292 ms/s（29%）**。
+
+### ACK 為何不是每包都回
+
+ACK 只有 Client 會用到（ATPC 的上行品質來源 + 連線存活判斷），兩者都不需要 1 Hz
+解析度。改成每 4 包回一次省下 75% 的 ACK 空中時間，主要是為了未來多 Surfer 時的
+通道餘裕。挑選依據是 **client 的 `seq`（`seq % 4 == 0`）而不是 server 端計數器**，
+這樣掉包不會讓排程滑掉，兩端也不必同步額外狀態。Client 端的斷線門檻由
+`ACK_EVERY_N` 推導，改 N 不需要手動改門檻。
+
+### 遙測時槽
+
+30 s 是 1 s 的整數倍，遙測若「到期就送」會固定壓在位置封包與其 ACK 上，兩包同歸於盡。
+因此遙測只在位置封包送出後的**靜默時槽**起送。時槽上下界不是寫死的常數，而是開機時
+用 `radio.getTimeOnAir()` 由實際 RF 參數推導（`computeAirtimeBudget()`）：
+
+```
+下界 = ToA(DATA) + ToA(ACK) + 80 ms   ≈ 511 ms
+上界 = 發送間隔 − ToA(TELEMETRY) − 80 ms ≈ 735 ms
+```
+
+所以調整 SF / CR / 封包大小 / 發送間隔都不必手動重算。開機時序列埠會印出實際數值；
+若空中時間大到塞不進一個發送週期，會印 `WARNING` 並退回「ACK 結束後隨時可送」。
 
 ## 封包結構
 
@@ -184,8 +213,8 @@ Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修�
 | `server.fix` | 攝影站本身的 GPS fix 狀態 |
 | `server.temp_c` | 攝影站本機溫度，`null` = 無感測器 |
 | `server.humidity_pct` | 攝影站本機濕度，`null` = 無感測器 |
-| `servo.angle` | Servo 目前角度（0–180°）|
-| `servo.target` | 追蹤模式下計算出的目標角度（0–180°）|
+| `servo.angle` | Servo 目前角度（0–180°）；追蹤時受 120°/s 轉速限制，會略微落後 `target` |
+| `servo.target` | 追蹤模式下計算出的目標角度（0–180°），以**外推後**的 Surfer 位置計算 |
 | `servo.mode` | `idle` / `manual` / `tracking` / `paused` |
 | `servo.calibrated` | 是否已鎖定 `mount_offset`（按過 start）|
 | `servo.mount_offset_deg` | Servo→世界座標的安裝偏移角，校正後鎖定 |
@@ -244,13 +273,17 @@ GPS 訊號品質、LoRa 訊號統計、Servo 校正狀態。
   },
   "mag": {
     "online": true,
-    "heading": 153.0
+    "heading": 153.0,
+    "calibrated": true,
+    "residual_deg": 0.82
   }
 }
 ```
 
 | 欄位 | 說明 |
 |---|---|
+| `mag.calibrated` | 是否已做過 hard-iron 校正 |
+| `mag.residual_deg` | 校正擬合殘差（度），`null` = 未校正 |
 | `server_gps.satellites` | 可見衛星數，`-1` = 無效 |
 | `server_gps.hdop` | 水平精度因子，數值越小越好，`-1` = 無效 |
 | `lora.rssi` | 最近一筆封包 RSSI（dBm）|
@@ -319,6 +352,91 @@ POST /api/whitelist?action=clear
   "count": 2
 }
 ```
+
+## `POST /api/track/calibrate`
+
+用**已知座標的地標**鎖定 `mount_offset`，取代「對著水裡的人拖滑桿」。
+
+```
+POST /api/track/calibrate?lat=<地標緯度>&lon=<地標經度>
+```
+
+攝影站用自身 GPS 與地標座標算出真方位角，再套用與 `startTracking()` 相同的公式：
+
+```
+mount_offset = 地標方位 − heading + 目前 servo 角度
+```
+
+**不需要追蹤器在場、不需要 client 封包、不需要第二個人**，只要攝影站自己有 GPS fix。
+操作是把地標對到**觀景窗正中央**——400mm 下這是 ±0.05° 的照準，比對著海上的人準一個數量級。
+
+回應：
+
+```json
+{"ok":true,"bearing":312.45,"distance_m":1840,"mount_offset_deg":88.3,
+ "servo_angle":90.0,"mag_calibrated":true,"warning":""}
+```
+
+`warning` 會在兩種情況有值：磁力計還沒做 hard-iron 校正（那這個 offset 換場地就失效），
+或地標距離 < 300 m（近地標會把攝影站自身的定位誤差放大成方位誤差：1 m 誤差在 100 m
+是 0.6°，在 1 km 只有 0.06°）。
+
+錯誤：`400`（缺參數 / 座標超出範圍）、`409`（`need server GPS fix`）。
+
+## `/api/log`
+
+攝影站的滾動執行紀錄。韌體把所有 log 同時寫到 USB 序列埠和一個 **4 KB 環形緩衝**，
+網頁「紀錄」分頁可直接看——機器架在沙灘腳架上時不可能接筆電讀序列埠，而
+**espota 只上傳韌體、不提供任何 log**。
+
+```
+GET  /api/log?from=<絕對位移>   取得該位移之後的新內容
+POST /api/log                   清除緩衝
+```
+
+回應是 **plain text**（不是 JSON，這樣 log 內容不必跳脫），簿記放在兩個自訂 header：
+
+| Header | 說明 |
+|---|---|
+| `X-Log-Next` | 本次回傳結束時的絕對位移，下次帶進 `from` 即可只取增量 |
+| `X-Log-Dropped` | `1` = 你要的位移已滾出 4 KB 視窗（或裝置重開、位移倒退），已自動跳到目前最舊的位置 |
+
+位移是單調遞增的總位元組數，所以前端輪詢只會拿到新內容。裝置重開後 `logTotal` 歸零、
+位移倒退，此時一樣回 `X-Log-Dropped: 1` 並從頭給起。
+
+> 前端只在「紀錄」分頁可見時才輪詢（每 2 秒），因為 ESP32 的 WebServer 一次只服務一個連線。
+
+## `/api/mag/calibrate`
+
+磁力計 hard-iron 校正。
+
+```
+POST /api/mag/calibrate              開始收樣本
+POST /api/mag/calibrate?action=cancel 中止
+GET  /api/mag/calibrate              查詢進度
+```
+
+開始後把**整台機器水平慢慢轉一整圈**。韌體以 20 Hz 取樣，每當向量轉過 2° 收一筆
+（最多 180 筆），並以 36 個 10° 的分格統計涵蓋率；收滿 34/36 格就自動做最小平方圓擬合，
+圓心即為 hard-iron 偏移，寫入 NVS。逾時 120 秒。
+
+```json
+{"state":"done","online":true,"coverage_pct":100,"samples":178,"calibrated":true,
+ "residual_deg":0.82,"field_gauss":0.3714,"offset_x":0.0213,"offset_y":-0.0147,
+ "heading":47.2,"error":""}
+```
+
+| 欄位 | 說明 |
+|---|---|
+| `state` | `idle` / `collecting` / `done` / `failed` |
+| `coverage_pct` | 轉圈涵蓋率（僅 `collecting` 時有意義）|
+| `residual_deg` | 擬合殘差換算成 heading 誤差。**< 1° = 安裝乾淨**；好幾度代表 soft-iron（servo 鋼齒輪），該把板子移遠 |
+| `field_gauss` | 擬合出的水平磁場強度。台灣應該接近 **0.37 G**，差太多代表有強烈局部干擾 |
+| `error` | `field over range — board is too close to the servo` / `no rotation detected` / `incomplete turn` / `circle fit failed` |
+
+> 沒有 hard-iron 校正時，heading 是真實方位角被正弦扭曲後的結果（板上 18650 的鍍鎳鋼殼
+> 就足以造成 20~30° 且**隨面向而變**的誤差）。這正是為什麼未校正時 `mount_offset` 換個
+> 方位架設就失效、每次都得重新對準。校正過後它才是真正的常數。
 
 ## `POST /api/servo`
 
@@ -394,3 +512,7 @@ POST /api/whitelist?action=clear
 | `rssiDbm10` / `snrDb10` | AckPayload（下行）| `lora.rssi` / `lora.snr` | ÷ 10（攝影站本地量測）|
 
 > `bearing` 不是封包欄位，而是攝影站用「自身 GPS」與「`client.lat/lon`」即時計算；`server.*` 來自攝影站本機 GPS 與感測器；過去 5 分鐘軌跡不在此 API，而是前端用每秒的 `client/server` 位置自行累積（5 分鐘 / 300 點）。`servo.*` 為 Servo 追蹤狀態，`mag.heading` 由板上 QMC6310 磁力計提供，三者皆攝影站本地產生。
+
+> **`bearing` 與 `servo.target` 為何可能不一致**：`client.lat/lon` 與 `bearing` 用的是
+> **原始收到的**位置；servo 用的是沿速度向量**外推後**的位置（見 features.md §4）。
+> 高速時兩者可差數公尺 / 數度，這是預期行為，不是校正跑掉。

@@ -50,7 +50,20 @@ constexpr int LORA_BUSY = 4;
 constexpr float RF_FREQUENCY = 923.2;
 constexpr float RF_BW = 125.0;
 constexpr int RF_SF = 9;
-constexpr int RF_CR = 7;
+// Coding rate 4/5 (RadioLib takes the denominator, 5..8).
+// 4/7 -> 4/5 removes ~21 % of the airtime of every packet at effectively no
+// sensitivity cost — Semtech quotes its sensitivity figures at 4/5; the extra
+// parity of 4/7 buys robustness against burst interference, not link budget.
+// SF is deliberately left at 9: SF8 would halve the airtime again but costs
+// 2.5 dB (~25 % range), which is the wrong trade for a tracker worn in the water.
+//
+// RF_SF / RF_BW / RF_FREQUENCY / RF_SYNC_WORD must match on both boards or the
+// link dies. RF_CR does NOT: in explicit-header mode (RadioLib's default, and
+// implicitHeader() is never called here) the payload coding rate is carried in
+// the header itself, which is always sent at 4/8, so a receiver decodes any CR
+// regardless of how it is configured. Mixed-CR boards interoperate fine — CR
+// only sets what this board uses for its own transmissions.
+constexpr int RF_CR = 5;
 constexpr int RF_SYNC_WORD = 0x12;
 constexpr int TX_POWER_DBM = 17;
 constexpr int TX_POWER_MIN_DBM = 10;
@@ -59,23 +72,55 @@ constexpr uint32_t ATPC_EVAL_MS = 15000;
 
 constexpr uint32_t SEND_INTERVAL_MS = 1000;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000;  // battery + env packet rate
+// TELEMETRY_INTERVAL_MS is an exact multiple of SEND_INTERVAL_MS, so a telemetry
+// packet that is simply "due" always lands on top of a position packet and the
+// ACK that follows it — both sides end up transmitting at once and both packets
+// are lost. Telemetry is therefore only started inside the quiet slot of the
+// position cycle. The slot bounds are derived at boot from the radio's own
+// time-on-air (see computeAirtimeBudget) rather than hand-tuned, so they follow
+// any change to RF_SF / RF_CR / packet size / SEND_INTERVAL_MS automatically.
+constexpr uint32_t TELEMETRY_SLOT_GUARD_MS = 80;
 constexpr uint32_t BATTERY_UPDATE_MS = 5000;
+
+// The server acknowledges every ACK_EVERY_N-th position packet instead of all
+// of them. An ACK is ~185 ms of airtime at SF9/CR4-5 and only the client
+// consumes it — for ATPC and link liveness, neither of which needs 1 Hz
+// resolution. Selection is by sequence number rather than a server-side counter
+// so a dropped packet cannot slide the schedule, and both ends agree on which
+// seq carries an ACK without extra state.
+//
+// Keep this a power of two: seq is uint16_t, and 65536 % N == 0 only then, so
+// the cadence stays continuous across sequence wrap. Also note txSeq is shared
+// with telemetry packets, so the 30 s telemetry burns one sequence number and
+// the ACK spacing shows a single 3- or 5-packet gap around it. Both are
+// cosmetic — nothing keys off the ACK arriving on an exact schedule.
+constexpr uint16_t ACK_EVERY_N = 4;
+constexpr uint32_t ACK_PERIOD_MS = ACK_EVERY_N * SEND_INTERVAL_MS;
+// Client link thresholds derived from the ACK cadence so they cannot drift out
+// of sync when ACK_EVERY_N changes. At N=4 these evaluate to the 16 s / 20 s
+// the firmware used when every packet was acknowledged.
+constexpr uint32_t ACK_STALE_MS = 4 * ACK_PERIOD_MS;
+constexpr uint32_t ATPC_NO_ACK_MS = 5 * ACK_PERIOD_MS;
 constexpr uint32_t ENV_UPDATE_MS = 5000;
 constexpr uint32_t SERVER_IDLE_LOG_MS = 5000;
 constexpr uint32_t LINK_TIMEOUT_MS = 5000;
 constexpr uint32_t LINK_WARN_MS = 15000;
 constexpr uint32_t DISPLAY_REFRESH_MS = 500;
-constexpr uint32_t LCD_ALERT_BLINK_MS = 5000;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;  // server: re-attempt hotspot every 5 s when offline
+// PWR-key IRQ polling rate. loop() no longer blocks, so it spins at several kHz
+// and polling the PMU every pass would mean thousands of I2C transactions per
+// second for a button that only needs to feel instant to a human.
+constexpr uint32_t PMU_KEY_POLL_MS = 100;
+// GPS UART is 9600 baud (960 B/s); the default 256 B driver buffer overflows in
+// 267 ms, which is shorter than a single blocking LoRa transmit. 1 KB covers a
+// full second of NMEA so no sentence is lost while the radio is busy.
+constexpr size_t GPS_RX_BUFFER_BYTES = 1024;
 
-constexpr uint16_t BATT_LOW_MV = 3500;   // conservative battery-safe threshold
 // Battery percentage scale (single Li-ion cell): 0% at 3.2 V, 100% at 4.15 V.
 constexpr uint16_t BATT_EMPTY_MV = 3200;       // 0 %
 constexpr uint16_t BATT_PCT_FULL_MV = 4150;    // 100 %
 constexpr uint16_t BATT_SHUTDOWN_MV = 3200;    // below 0 % -> auto power off
 constexpr uint16_t BATT_PRESENT_MIN_MV = 2500; // ignore implausible/no-battery reads
-constexpr int16_t TEMP_WARN_C10 = 500;   // 50.0C
-constexpr uint8_t HUM_WARN_PCT = 90;
 
 // Client OLED is normally off to save power; short-press PWR wakes it briefly.
 constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
@@ -93,6 +138,47 @@ constexpr uint32_t SERVO_PWM_MAX_DUTY = (1UL << SERVO_PWM_RES_BITS) - 1;
 constexpr int SERVO_LEDC_CH = 0;     // LEDC channel (arduino-esp32 2.x)
 constexpr uint8_t SERVO_CAL_VERSION = 2;  // v2 uses CCW-positive servo geometry
 constexpr uint32_t MAG_SAMPLE_MS = 200;
+// Heading low-pass, applied to the field vector (see sampleMag).
+// alpha = 1 - exp(-MAG_SAMPLE_MS / tau) with tau = 0.5 s.
+constexpr float MAG_FILTER_ALPHA = 0.33f;
+
+// Camera tracking loop. The servo is refreshed far faster than position packets
+// arrive (1 Hz): between packets the surfer's position is dead-reckoned from the
+// velocity vector already carried in PositionPayload, so the camera pans
+// continuously instead of stepping once per received packet — and keeps panning
+// through a dropped packet instead of freezing for a whole second.
+constexpr uint32_t TRACK_UPDATE_MS = 50;      // 20 Hz servo refresh
+constexpr float DR_MIN_SPEED_CMS = 30.0f;     // below this the GPS course is noise
+constexpr float DR_MAX_AGE_S = 2.0f;          // stop projecting after ~2 lost packets
+constexpr float SERVO_MAX_SLEW_DEG_S = 120.0f;  // pan rate limit (smooth footage)
+
+// --- Magnetometer hard-iron calibration -----------------------------------
+// Spin the whole station through one slow horizontal turn; the firmware fits a
+// circle to the Bx/By locus and stores its centre as the hard-iron offset.
+//
+// Why it matters: uncalibrated, heading is a sine-distorted function of true
+// yaw. The on-board 18650's nickel-plated steel can sits centimetres from the
+// sensor and can offset the field by tens of uT against a ~37 uT horizontal
+// field, so the distortion reaches 20-30 deg AND varies with which way the rig
+// faces. That is precisely what makes a stored mount_offset stop being valid
+// after the station is packed up and set down facing a different way at another
+// spot — i.e. it is the reason the aim calibration currently has to be redone
+// every session. Fix the hard iron and mount_offset becomes a true constant.
+constexpr uint32_t MAG_CAL_SAMPLE_MS = 50;        // 20 Hz while collecting
+constexpr size_t   MAG_CAL_MAX_SAMPLES = 180;
+constexpr float    MAG_CAL_MIN_STEP_DEG = 2.0f;   // spread samples round the circle
+constexpr uint8_t  MAG_CAL_BINS = 36;             // 10 deg coverage bins
+constexpr uint8_t  MAG_CAL_BINS_REQUIRED = 34;    // allow a small gap
+constexpr uint32_t MAG_CAL_TIMEOUT_MS = 120000;
+constexpr uint8_t  MAG_CAL_VERSION = 1;
+
+// --- Heading freeze --------------------------------------------------------
+// The live heading is not used while tracking: it is snapshotted when tracking
+// starts so magnetometer noise (servo current, vibration, filter ripple) never
+// reaches the servo. Only a change bigger than the deadband is taken to mean
+// the tripod was genuinely moved, which re-snapshots. With GPS at ~1 m the
+// magnetometer is otherwise the dominant error term in the pointing budget.
+constexpr float MAG_FREEZE_DEADBAND_DEG = 2.0f;
 #endif
 
 // GPS UART defaults (common on T-Beam family, override if your board differs).
@@ -123,9 +209,70 @@ uint32_t nextEnvMs = 0;
 int16_t cachedTempC10 = INT16_MIN;
 uint8_t cachedHumidityPct = 0xFF;
 String cachedApIp = "";
+#if defined(ROLE_SERVER)
+IPAddress cachedApIpAddr;  // last address seen, to detect DHCP changes
+#endif
 
 // Shared OLED object — client enables it only during boot-info and shutdown screens.
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+#if defined(ROLE_SERVER)
+// Rolling log the web UI can render. The station lives on a tripod at the beach,
+// where nobody is going to tether a laptop to read the serial port — and OTA
+// (espota) only uploads firmware, it never carries logs.
+constexpr size_t LOG_BUF_BYTES = 4096;
+static char     logBuf[LOG_BUF_BYTES];
+static size_t   logHead = 0;     // next write position
+static bool     logWrapped = false;
+static uint32_t logTotal = 0;    // monotonic byte count, lets the UI fetch deltas
+
+static void logPush(uint8_t c) {
+  logBuf[logHead] = (char)c;
+  logHead = (logHead + 1) % LOG_BUF_BYTES;
+  if (logHead == 0) logWrapped = true;
+  logTotal++;
+}
+#endif
+
+// Tee for all firmware logging. Output still goes to the USB serial port; on the
+// server it is additionally captured into logBuf. Deriving from Print inherits
+// every print()/println() overload, so call sites change in name only.
+// Safe without locking: nothing logs from an ISR (the DIO1 handler only sets a
+// flag) and the web server is serviced from loop(), so this is single-threaded.
+// Buffered to whole lines before touching the USB serial port. This matters far
+// more than it looks: Print::print(F("...")) emits one character at a time, and
+// HWCDC::write() waits up to tx_timeout_ms (100 ms by default) per call when the
+// port is enumerated but nothing is draining it — exactly the state of a board
+// plugged into a PC with no terminal open. That turned a ~110-character log line
+// into ~11 s of blocking. Buffering makes it one bulk write per line instead of
+// one per character; setTxTimeoutMs(0) in setup() then removes the wait entirely.
+// Dropped serial output is acceptable because the server's ring buffer (and the
+// web 紀錄 tab) is the authoritative log.
+class LogTee : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    lineBuf_[lineLen_++] = c;
+    if (c == '\n' || lineLen_ >= sizeof(lineBuf_)) flushLine();
+    return 1;
+  }
+  size_t write(const uint8_t *b, size_t n) override {
+    for (size_t i = 0; i < n; i++) write(b[i]);
+    return n;
+  }
+
+ private:
+  void flushLine() {
+    if (lineLen_ == 0) return;
+    Serial.write(lineBuf_, lineLen_);
+#if defined(ROLE_SERVER)
+    for (size_t i = 0; i < lineLen_; i++) logPush(lineBuf_[i]);
+#endif
+    lineLen_ = 0;
+  }
+  uint8_t lineBuf_[256];  // longest log line here is ~300 B, so at most 2 writes
+  size_t  lineLen_ = 0;
+};
+static LogTee Log;
 
 #if defined(ROLE_SERVER)
 struct DecodedData {
@@ -165,8 +312,13 @@ static bool isClientAllowed(uint16_t id) {
 
 uint16_t txSeq = 0;
 uint32_t nextSendMs = 0;
+uint32_t lastSendMs = 0;  // start of the last position TX (telemetry slot anchor)
 uint32_t nextTelemetryMs = 0;
+uint32_t nextPmuKeyMs = 0;
 uint32_t nextBatteryMs = 0;
+// Telemetry quiet slot, filled in by computeAirtimeBudget() at boot.
+uint32_t telemetrySlotMinMs = 0;
+uint32_t telemetrySlotMaxMs = 0;
 uint32_t nextServerIdleLogMs = 0;
 uint16_t cachedBatteryMv = 0;
 bool pmuOnline = false;
@@ -177,7 +329,6 @@ static uint16_t prevSpeedCmS   = 0;
 static uint32_t prevSpeedMs    = 0;
 static int16_t  smoothAccelCmS2 = 0;
 static uint32_t bootMs = 0;
-static uint16_t lastAckedSeq = 0;
 static uint32_t lastAckRxMs = 0;
 static uint32_t ackRxCount = 0;
 static uint32_t ackMissCount = 0;
@@ -192,6 +343,20 @@ static uint32_t nextAtpcEvalMs = 0;
 static bool clientOledAwake = false;
 static uint32_t clientOledOffMs = 0;
 static uint32_t nextClientOledRefreshMs = 0;
+
+#if defined(ROLE_CLIENT)
+// Interrupt-driven ACK reception, mirroring the server's RX path.
+//
+// This used to be a blocking radio.receive() called on every loop() pass.
+// RadioLib defaults that call's timeout to 500 % of the expected time-on-air
+// (~1.1 s for a 20-byte ACK at SF9/CR4-7), and the call was reached again right
+// after the ACK had already been consumed — so every cycle spent an extra ~1.1 s
+// parked in a dead wait. That stretched the nominal 1 Hz position cadence to
+// ~1.7 s and overflowed the GPS UART buffer on the way. The ISR now only raises
+// a flag and loop() drains the packet when one genuinely arrives.
+volatile bool clientRxFlag = false;
+void IRAM_ATTR onClientDio1() { clientRxFlag = true; }
+#endif
 
 // Derive a node id from the last 2 bytes of the ESP32's factory-burned MAC.
 // 65536 possible values — collision probability negligible for any real deployment.
@@ -243,12 +408,44 @@ static float servoTargetDeg = 90.0f;  // desired angle while tracking
 static float mountOffsetDeg = 0.0f;   // servo-to-world mounting offset (persisted)
 static bool  mountCalibrated = false;
 static bool  servoPwmReady = false;
+static uint32_t nextTrackMs = 0;      // TRACK_UPDATE_MS tick
+static uint32_t lastServoStepMs = 0;  // 0 = no previous step (slew dt unknown)
+static float frozenHeadingDeg = 0.0f; // heading snapshot in use while tracking
+static bool  headingFrozen = false;
 
 // Magnetometer (QMC6310) — station board heading in degrees (-1 = invalid)
 static SensorQMC6310 mag;
 static bool  magOnline = false;
 static float magHeadingDeg = -1.0f;
 static uint32_t nextMagMs = 0;
+
+// Hard-iron offsets in Gauss, subtracted before the heading is computed.
+// Zero until calibrated, which reproduces the previous (uncorrected) behaviour.
+static float magOffsetX = 0.0f;
+static float magOffsetY = 0.0f;
+static bool  magCalibrated = false;
+static float magCalResidualDeg = -1.0f;  // fit quality; -1 = unknown
+static float magCalFieldGauss = -1.0f;   // fitted radius, sanity check vs ~0.37 G
+
+// Heading low-pass state (file scope so a fresh calibration can re-seed it).
+static float magFiltX = 0.0f;
+static float magFiltY = 0.0f;
+static bool  magFiltInit = false;
+
+enum MagCalState : uint8_t {
+  MAGCAL_IDLE, MAGCAL_COLLECTING, MAGCAL_DONE, MAGCAL_FAILED
+};
+static MagCalState magCalState = MAGCAL_IDLE;
+static float    magCalX[MAG_CAL_MAX_SAMPLES];
+static float    magCalY[MAG_CAL_MAX_SAMPLES];
+static size_t   magCalCount = 0;
+static uint64_t magCalBinMask = 0;
+static uint32_t magCalStartMs = 0;
+static float    magCalMinX = 0, magCalMaxX = 0, magCalMinY = 0, magCalMaxY = 0;
+static float    magCalLastAngle = 0.0f;
+static bool     magCalHaveLast = false;
+static bool     magCalOverflowSeen = false;
+static const char *magCalError = "";
 static uint32_t rxDataCount = 0;
 static uint32_t rxTelemetryCount = 0;
 static uint32_t rxDropCount = 0;
@@ -358,7 +555,7 @@ static bool batteryCharging() {
 static bool initPmu() {
   PMUWire.begin(PMU_SDA_PIN, PMU_SCL_PIN);
   if (!pmu.begin(PMUWire, AXP2101_SLAVE_ADDRESS, PMU_SDA_PIN, PMU_SCL_PIN)) {
-    Serial.println(F("[PMU] AXP2101 init failed"));
+    Log.println(F("[PMU] AXP2101 init failed"));
     return false;
   }
 
@@ -371,7 +568,7 @@ static bool initPmu() {
   pmu.setALDO4Voltage(3300);
   pmu.enableALDO4();
 
-  Serial.println(F("[PMU] AXP2101 init ok"));
+  Log.println(F("[PMU] AXP2101 init ok"));
   return true;
 }
 
@@ -384,10 +581,10 @@ static void serviceGps() {
 static bool initEnvSensor() {
   // BME280 is common and simple; try both default addresses.
   if (envSensor.begin(0x76, &Wire) || envSensor.begin(0x77, &Wire)) {
-    Serial.println(F("[ENV] BME280 init ok"));
+    Log.println(F("[ENV] BME280 init ok"));
     return true;
   }
-  Serial.println(F("[ENV] BME280 not found (telemetry stays N/A)"));
+  Log.println(F("[ENV] BME280 not found (telemetry stays N/A)"));
   return false;
 }
 
@@ -505,6 +702,15 @@ static void loadServerSettings() {
     mountOffsetDeg = 0.0f;
     mountCalibrated = false;
   }
+
+  if (prefs.getUChar("magver", 0) == MAG_CAL_VERSION) {
+    magOffsetX = prefs.getFloat("magx", 0.0f);
+    magOffsetY = prefs.getFloat("magy", 0.0f);
+    magCalibrated = prefs.getBool("magcal", false);
+    magCalResidualDeg = prefs.getFloat("magres", -1.0f);
+    magCalFieldGauss = prefs.getFloat("magfld", -1.0f);
+    if (magCalibrated) magCalState = MAGCAL_DONE;
+  }
 }
 
 static size_t buildAckPacket(uint8_t *buf, uint16_t dstId, uint16_t ackSeq,
@@ -561,13 +767,18 @@ static void loadClientSettings() {
 static void applyTxPower(int8_t pwrDbm) {
   int8_t target = constrain(pwrDbm, TX_POWER_MIN_DBM, TX_POWER_MAX_DBM);
   if (target == currentTxPowerDbm) return;
+  // SetPaConfig / SetTxParams are configuration commands: drop out of the
+  // continuous RX armed by loop() before issuing them, then re-arm.
+  radio.standby();
   int st = radio.setOutputPower(target);
+  clientRxFlag = false;
+  radio.startReceive();
   if (st == RADIOLIB_ERR_NONE) {
     currentTxPowerDbm = target;
     saveClientSettings();
-    Serial.print(F("[CLIENT] TX power set to "));
-    Serial.print(currentTxPowerDbm);
-    Serial.println(F(" dBm"));
+    Log.print(F("[CLIENT] TX power set to "));
+    Log.print(currentTxPowerDbm);
+    Log.println(F(" dBm"));
   }
 }
 
@@ -577,7 +788,7 @@ static void evaluateAtpc() {
   nextAtpcEvalMs = millis() + ATPC_EVAL_MS;
 
   // No ACK for a while: push one step up.
-  if (millis() - lastAckRxMs > 20000) {
+  if (millis() - lastAckRxMs > ATPC_NO_ACK_MS) {
     applyTxPower(currentTxPowerDbm + 1);
     return;
   }
@@ -686,12 +897,61 @@ static bool initRadio() {
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   int state = radio.begin(RF_FREQUENCY, RF_BW, RF_SF, RF_CR, RF_SYNC_WORD, TX_POWER_DBM);
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.print(F("[LoRa] init failed, code="));
-    Serial.println(state);
+    Log.print(F("[LoRa] init failed, code="));
+    Log.println(state);
     return false;
   }
-  Serial.println(F("[LoRa] init ok"));
+  Log.println(F("[LoRa] init ok"));
   return true;
+}
+
+// Derive the telemetry quiet slot from the radio's actual time-on-air, and log
+// the airtime budget. Asking the radio beats keeping hand-computed millisecond
+// constants in sync with RF_SF / RF_CR / packet sizes — get that wrong and
+// telemetry either collides forever or never finds a slot at all, both silently.
+// Call after initRadio(), which is what configures SF/CR/BW.
+static void computeAirtimeBudget() {
+  uint32_t dataMs = radio.getTimeOnAir(DATA_PACKET_LEN) / 1000;
+  uint32_t ackMs = radio.getTimeOnAir(ACK_PACKET_LEN) / 1000;
+  uint32_t telMs = radio.getTimeOnAir(TELEMETRY_PACKET_LEN) / 1000;
+
+  // Worst case: assume this cycle is one of the ACKed ones.
+  telemetrySlotMinMs = dataMs + ackMs + TELEMETRY_SLOT_GUARD_MS;
+  telemetrySlotMaxMs = (SEND_INTERVAL_MS > telMs + TELEMETRY_SLOT_GUARD_MS)
+                           ? SEND_INTERVAL_MS - telMs - TELEMETRY_SLOT_GUARD_MS
+                           : 0;
+
+  Log.print(F("[LoRa] SF"));
+  Log.print(RF_SF);
+  Log.print(F(" CR4/"));
+  Log.print(RF_CR);
+  Log.print(F(" BW"));
+  Log.print(RF_BW, 0);
+  Log.print(F("k | airtime data="));
+  Log.print(dataMs);
+  Log.print(F("ms ack="));
+  Log.print(ackMs);
+  Log.print(F("ms(1/"));
+  Log.print(ACK_EVERY_N);
+  Log.print(F(") tel="));
+  Log.print(telMs);
+  Log.print(F("ms | duty="));
+  Log.print((dataMs + ackMs / ACK_EVERY_N) * 100 / SEND_INTERVAL_MS);
+  Log.println('%');
+
+  if (telemetrySlotMaxMs <= telemetrySlotMinMs) {
+    // Airtime no longer fits inside one send interval. Degrade to "any time
+    // after the ACK should be done" rather than stalling telemetry silently.
+    telemetrySlotMinMs = dataMs + ackMs;
+    telemetrySlotMaxMs = SEND_INTERVAL_MS;
+    Log.println(F("[LoRa] WARNING: airtime exceeds SEND_INTERVAL_MS; "
+                     "telemetry may collide with position packets"));
+  }
+  Log.print(F("[LoRa] telemetry slot = "));
+  Log.print(telemetrySlotMinMs);
+  Log.print(F(".."));
+  Log.print(telemetrySlotMaxMs);
+  Log.println(F(" ms after position TX"));
 }
 
 #if defined(ROLE_SERVER)
@@ -712,6 +972,12 @@ static float normalize360(float a) {
   while (a < 0) a += 360.0f;
   while (a >= 360.0f) a -= 360.0f;
   return a;
+}
+
+// Shortest signed difference a-b, in [-180, 180].
+static float angleDiff(float a, float b) {
+  float d = normalize360(a - b);
+  return (d > 180.0f) ? d - 360.0f : d;
 }
 
 static const char *trackModeStr(TrackMode m) {
@@ -761,37 +1027,209 @@ static bool initServo() {
   if (servoPwmReady) ledcAttachPin(SERVO_PIN, SERVO_LEDC_CH);
 #endif
   if (!servoPwmReady) {
-    Serial.print(F("[SERVO] ERROR: LEDC attach failed on IO"));
-    Serial.println(SERVO_PIN);
+    Log.print(F("[SERVO] ERROR: LEDC attach failed on IO"));
+    Log.println(SERVO_PIN);
     return false;
   }
   if (!setServoAngle(servoAngleDeg)) {  // centre on boot
-    Serial.println(F("[SERVO] ERROR: initial PWM write failed"));
+    Log.println(F("[SERVO] ERROR: initial PWM write failed"));
     servoPwmReady = false;
     return false;
   }
-  Serial.print(F("[SERVO] LEDC ready on IO"));
-  Serial.print(SERVO_PIN);
-  Serial.print(F(" at "));
-  Serial.print(SERVO_PWM_HZ);
-  Serial.print(F(" Hz/"));
-  Serial.print(SERVO_PWM_RES_BITS);
-  Serial.print(F(" bit, centre "));
-  Serial.print(servoAngleDeg, 0);
-  Serial.println(F(" deg"));
+  Log.print(F("[SERVO] LEDC ready on IO"));
+  Log.print(SERVO_PIN);
+  Log.print(F(" at "));
+  Log.print(SERVO_PWM_HZ);
+  Log.print(F(" Hz/"));
+  Log.print(SERVO_PWM_RES_BITS);
+  Log.print(F(" bit, centre "));
+  Log.print(servoAngleDeg, 0);
+  Log.println(F(" deg"));
   return true;
+}
+
+// Least-squares circle fit. Rewriting (x-cx)^2 + (y-cy)^2 = r^2 as
+//   x^2 + y^2 = a*x + b*y + c,  a = 2cx, b = 2cy, c = r^2 - cx^2 - cy^2
+// makes it linear in (a, b, c), so it is one 3x3 solve rather than an iterative
+// fit — cheap enough to run on the ESP32 the moment the turn completes.
+static bool fitCircle(const float *xs, const float *ys, size_t n,
+                      float &cx, float &cy, float &r) {
+  if (n < 8) return false;
+  double Sx = 0, Sy = 0, Sxx = 0, Syy = 0, Sxy = 0, Sz = 0, Sxz = 0, Syz = 0;
+  for (size_t i = 0; i < n; i++) {
+    double x = xs[i], y = ys[i], z = x * x + y * y;
+    Sx += x; Sy += y; Sxx += x * x; Syy += y * y; Sxy += x * y;
+    Sz += z; Sxz += x * z; Syz += y * z;
+  }
+  double m[3][4] = {{Sxx, Sxy, Sx, Sxz},
+                    {Sxy, Syy, Sy, Syz},
+                    {Sx,  Sy,  (double)n, Sz}};
+  for (int col = 0; col < 3; col++) {  // Gauss-Jordan with partial pivoting
+    int piv = col;
+    for (int i = col + 1; i < 3; i++) {
+      if (fabs(m[i][col]) > fabs(m[piv][col])) piv = i;
+    }
+    if (fabs(m[piv][col]) < 1e-12) return false;  // degenerate: not a real turn
+    if (piv != col) {
+      for (int k = 0; k < 4; k++) {
+        double t = m[col][k]; m[col][k] = m[piv][k]; m[piv][k] = t;
+      }
+    }
+    for (int i = 0; i < 3; i++) {
+      if (i == col) continue;
+      double f = m[i][col] / m[col][col];
+      for (int k = col; k < 4; k++) m[i][k] -= f * m[col][k];
+    }
+  }
+  double a = m[0][3] / m[0][0];
+  double b = m[1][3] / m[1][1];
+  double c = m[2][3] / m[2][2];
+  cx = (float)(a / 2.0);
+  cy = (float)(b / 2.0);
+  double rr = c + (double)cx * cx + (double)cy * cy;
+  if (rr <= 0) return false;
+  r = (float)sqrt(rr);
+  return true;
+}
+
+static void saveMagCalToNvs() {
+  prefs.putFloat("magx", magOffsetX);
+  prefs.putFloat("magy", magOffsetY);
+  prefs.putBool("magcal", magCalibrated);
+  prefs.putFloat("magres", magCalResidualDeg);
+  prefs.putFloat("magfld", magCalFieldGauss);
+  prefs.putUChar("magver", MAG_CAL_VERSION);
+}
+
+static void startMagCalibration() {
+  magCalState = MAGCAL_COLLECTING;
+  magCalCount = 0;
+  magCalBinMask = 0;
+  magCalHaveLast = false;
+  magCalOverflowSeen = false;
+  magCalStartMs = millis();
+  magCalError = "";
+  Log.println(F("[MAGCAL] started — turn the whole station through one slow "
+                   "full horizontal circle"));
+}
+
+static uint8_t magCalCoveragePct() {
+  uint8_t bits = 0;
+  for (uint8_t i = 0; i < MAG_CAL_BINS; i++) {
+    if (magCalBinMask & (1ULL << i)) bits++;
+  }
+  return (uint8_t)((uint16_t)bits * 100 / MAG_CAL_BINS);
+}
+
+static void finishMagCalibration() {
+  float cx, cy, r;
+  if (!fitCircle(magCalX, magCalY, magCalCount, cx, cy, r) || r <= 0.0f) {
+    magCalState = MAGCAL_FAILED;
+    magCalError = "circle fit failed";
+    Log.println(F("[MAGCAL] FAILED: circle fit did not converge"));
+    return;
+  }
+
+  // RMS distance from the fitted circle, expressed as the heading error it
+  // implies. A clean mount lands under ~1 deg; a few degrees means soft iron
+  // (the servo's steel gears) and the answer is to move the board, not to fit
+  // a fancier model.
+  double sum = 0;
+  for (size_t i = 0; i < magCalCount; i++) {
+    double dx = magCalX[i] - cx, dy = magCalY[i] - cy;
+    double e = sqrt(dx * dx + dy * dy) - r;
+    sum += e * e;
+  }
+  float rms = (float)sqrt(sum / magCalCount);
+
+  magOffsetX = cx;
+  magOffsetY = cy;
+  magCalFieldGauss = r;
+  magCalResidualDeg = degrees(atanf(rms / r));
+  magCalibrated = true;
+  magFiltInit = false;  // re-seed the heading filter with corrected values
+  magCalState = MAGCAL_DONE;
+  saveMagCalToNvs();
+
+  Log.print(F("[MAGCAL] done: offset=("));
+  Log.print(magOffsetX, 4);
+  Log.print(F(", "));
+  Log.print(magOffsetY, 4);
+  Log.print(F(") G field="));
+  Log.print(magCalFieldGauss, 4);
+  Log.print(F(" G residual="));
+  Log.print(magCalResidualDeg, 2);
+  Log.print(F(" deg from "));
+  Log.print(magCalCount);
+  Log.println(F(" samples"));
+  if (magCalFieldGauss < 0.15f || magCalFieldGauss > 0.75f) {
+    Log.println(F("[MAGCAL] WARNING: fitted field is far from Earth's ~0.37 G "
+                     "— strong local interference?"));
+  }
+}
+
+// Feed one RAW (uncalibrated) sample to the collector. Samples are accepted only
+// after the vector has swung MAG_CAL_MIN_STEP_DEG, which spreads them evenly
+// round the circle and stops a stationary rig from filling the buffer.
+static void collectMagCalSample(float x, float y) {
+  if (magCalCount == 0) {
+    magCalMinX = magCalMaxX = x;
+    magCalMinY = magCalMaxY = y;
+  } else {
+    if (x < magCalMinX) magCalMinX = x;
+    if (x > magCalMaxX) magCalMaxX = x;
+    if (y < magCalMinY) magCalMinY = y;
+    if (y > magCalMaxY) magCalMaxY = y;
+  }
+
+  // Bin against the running min/max midpoint rather than the origin: with a
+  // large hard-iron offset the origin can fall outside the locus entirely, and
+  // then the angle seen from it never sweeps a full 360 deg.
+  float refX = (magCalMinX + magCalMaxX) * 0.5f;
+  float refY = (magCalMinY + magCalMaxY) * 0.5f;
+  float ang = normalize360(degrees(atan2f(y - refY, x - refX)));
+
+  if (magCalHaveLast && fabsf(angleDiff(ang, magCalLastAngle)) < MAG_CAL_MIN_STEP_DEG) {
+    return;
+  }
+  magCalLastAngle = ang;
+  magCalHaveLast = true;
+
+  magCalBinMask |= (1ULL << (uint8_t)(ang / (360.0f / MAG_CAL_BINS)));
+  if (magCalCount < MAG_CAL_MAX_SAMPLES) {
+    magCalX[magCalCount] = x;
+    magCalY[magCalCount] = y;
+    magCalCount++;
+  }
+
+  uint8_t bins = 0;
+  for (uint8_t i = 0; i < MAG_CAL_BINS; i++) {
+    if (magCalBinMask & (1ULL << i)) bins++;
+  }
+  if (bins >= MAG_CAL_BINS_REQUIRED) finishMagCalibration();
 }
 
 static bool initMag() {
   if (mag.begin(Wire, QMC6310U_SLAVE_ADDRESS, OLED_SDA_PIN, OLED_SCL_PIN) ||
       mag.begin(Wire, QMC6310N_SLAVE_ADDRESS, OLED_SDA_PIN, OLED_SCL_PIN)) {
+    // OSR_8 (was OSR_1) averages 8 samples inside the sensor, cutting the noise
+    // floor ~3x for free. That noise lands straight on the servo: heading feeds
+    // updateTracking() at 20 Hz and the 120 deg/s slew limit passes anything
+    // under 6 deg per tick, so an unfiltered ~0.5 deg jitter is visible shimmer
+    // on a telephoto shot.
+    // ODR drops 200 -> 50 Hz: we only sample every MAG_SAMPLE_MS (5 Hz), and a
+    // lower rate both keeps OSR_8 achievable and is quieter.
+    // Range stays at FS_8G (+/-800 uT) rather than the 4x finer FS_2G — the
+    // station sits next to a 42 kg servo motor, and saturating is worse than
+    // quantising (Earth's field is ~45 uT, so FS_8G is already ~30x finer than
+    // the noise floor).
     mag.configMagnetometer(OperationMode::CONTINUOUS_MEASUREMENT,
-                           MagFullScaleRange::FS_8G, 200.0f,
-                           MagOverSampleRatio::OSR_1, MagDownSampleRatio::DSR_1);
-    Serial.println(F("[MAG] QMC6310 init ok"));
+                           MagFullScaleRange::FS_8G, 50.0f,
+                           MagOverSampleRatio::OSR_8, MagDownSampleRatio::DSR_1);
+    Log.println(F("[MAG] QMC6310 init ok"));
     return true;
   }
-  Serial.println(F("[MAG] QMC6310 not found (heading N/A, station assumed fixed)"));
+  Log.println(F("[MAG] QMC6310 not found (heading N/A, station assumed fixed)"));
   return false;
 }
 
@@ -801,9 +1239,58 @@ static void sampleMag() {
     return;
   }
   MagnetometerData d;
-  if (mag.readData(d)) {
-    magHeadingDeg = normalize360(d.heading_degrees);
+  if (!mag.readData(d)) return;
+
+  if (d.overflow) {
+    if (magCalState == MAGCAL_COLLECTING) magCalOverflowSeen = true;
+    // Field exceeded full scale — the sample is meaningless. In practice this
+    // means the board is mounted too close to the servo motor or to a lead
+    // carrying servo current. Hold the last good heading and say so.
+    static uint32_t nextMagWarnMs = 0;
+    if (millis() >= nextMagWarnMs) {
+      nextMagWarnMs = millis() + 10000;
+      Log.println(F("[MAG] overflow: field over range — move the board away "
+                       "from the servo / power leads"));
+    }
+    return;
   }
+
+  // Calibration runs on RAW samples: the whole point is to find the offset that
+  // is about to be subtracted below.
+  if (magCalState == MAGCAL_COLLECTING) {
+    collectMagCalSample(d.magnetic_field.x, d.magnetic_field.y);
+    if (magCalState == MAGCAL_COLLECTING &&
+        millis() - magCalStartMs > MAG_CAL_TIMEOUT_MS) {
+      magCalState = MAGCAL_FAILED;
+      magCalError = magCalOverflowSeen
+                        ? "field over range — board is too close to the servo"
+                        : (magCalCount < 8 ? "no rotation detected"
+                                           : "incomplete turn");
+      Log.print(F("[MAGCAL] FAILED: timeout at "));
+      Log.print(magCalCoveragePct());
+      Log.println(F("% coverage"));
+    }
+  }
+
+  // Hard-iron correction. Both are zero until a calibration has been run, which
+  // reproduces the original uncorrected behaviour exactly.
+  float x = d.magnetic_field.x - magOffsetX;
+  float y = d.magnetic_field.y - magOffsetY;
+
+  // Low-pass in vector space, not on the angle: averaging degrees is wrong
+  // across the 360/0 wrap. The station is meant to be stationary, so a ~0.5 s
+  // time constant costs nothing — it halves the noise reaching the servo and
+  // still settles a genuine tripod bump inside ~1.5 s.
+  if (!magFiltInit) {
+    magFiltX = x;
+    magFiltY = y;
+    magFiltInit = true;
+  } else {
+    magFiltX += MAG_FILTER_ALPHA * (x - magFiltX);
+    magFiltY += MAG_FILTER_ALPHA * (y - magFiltY);
+  }
+  if (magFiltX == 0.0f && magFiltY == 0.0f) return;  // degenerate, keep last
+  magHeadingDeg = normalize360(degrees(atan2f(magFiltY, magFiltX)));
 }
 
 // Heading used in tracking maths; 0 when no magnetometer (station assumed fixed).
@@ -815,52 +1302,120 @@ static bool haveBearingFix() {
   return havePkt && lastData.fix && gps.location.isValid();
 }
 
+// Project the last received client position forward along its velocity vector.
+//
+// Position packets arrive at 1 Hz, so lastData is already up to a second stale
+// by the time it is used; without this the camera can only step once per packet
+// and freezes completely whenever one is dropped. speedCmS / courseDeg10 are
+// already in the payload, so the projection costs nothing on the air.
+//
+// Constant velocity only: accelCmS2 is a heavily smoothed derivative of GPS
+// speed, and squaring it into the projection overshoots badly exactly when it
+// matters (a surfer dropping into a wave).
+static void predictClientPos(double &lat, double &lon) {
+  lat = lastData.lat;
+  lon = lastData.lon;
+  if (lastData.speedCmS < DR_MIN_SPEED_CMS) return;  // course is noise when idle
+  float ageS = (millis() - lastRxMs) / 1000.0f;
+  if (ageS <= 0.0f) return;
+  // Cap the projection instead of letting it run away when the link drops: the
+  // camera coasts for ~2 packets, then holds.
+  if (ageS > DR_MAX_AGE_S) ageS = DR_MAX_AGE_S;
+  float distM = (lastData.speedCmS / 100.0f) * ageS;
+  float courseRad = radians(lastData.courseDeg10 / 10.0f);
+  double cosLat = cos(radians(lat));
+  lat += (distM * cos(courseRad)) / 111320.0;
+  if (fabs(cosLat) > 1e-6) {
+    lon += (distM * sin(courseRad)) / (111320.0 * cosLat);
+  }
+}
+
 // Recompute and command the servo while tracking.
+// Driven from loop() every TRACK_UPDATE_MS, not by packet arrival.
 static void updateTracking() {
-  if (trackMode != MODE_TRACKING || !mountCalibrated || !haveBearingFix()) return;
+  if (trackMode != MODE_TRACKING || !mountCalibrated || !haveBearingFix()) {
+    lastServoStepMs = 0;  // a later resume must not see a huge slew dt
+    headingFrozen = false;
+    return;
+  }
+
+  // Heading freeze (see MAG_FREEZE_DEADBAND_DEG): snapshot on entry and hold,
+  // so magnetometer noise never reaches the servo. Only a swing bigger than the
+  // deadband counts as the tripod actually having been moved, and re-snapshots
+  // to the live value — which resets the error well inside the band, giving
+  // hysteresis for free instead of chattering at the threshold.
+  float liveHeading = trackingHeading();
+  if (!headingFrozen) {
+    frozenHeadingDeg = liveHeading;
+    headingFrozen = true;
+  } else if (fabsf(angleDiff(liveHeading, frozenHeadingDeg)) >
+             MAG_FREEZE_DEADBAND_DEG) {
+    frozenHeadingDeg = liveHeading;
+  }
+
+  double clientLat, clientLon;
+  predictClientPos(clientLat, clientLon);
   float bearing = (float)computeBearing(gps.location.lat(), gps.location.lng(),
-                                        lastData.lat, lastData.lon);
-  float target = normalize360(trackingHeading() + mountOffsetDeg - bearing);
+                                        clientLat, clientLon);
+  float target = normalize360(frozenHeadingDeg + mountOffsetDeg - bearing);
   if (target > 270.0f) target -= 360.0f;  // wrap small negatives toward 0
   servoTargetDeg = constrain(target, 0.0f, 180.0f);
-  if (!setServoAngle(servoTargetDeg)) {
+
+  // Rate-limit the pan. A single bad GPS sample, or a resume from a far-off
+  // angle, would otherwise whip the camera across at the servo's full ~400°/s.
+  uint32_t now = millis();
+  float dt = (lastServoStepMs == 0) ? 0.0f : (now - lastServoStepMs) / 1000.0f;
+  lastServoStepMs = now;
+  if (dt <= 0.0f || dt > 0.5f) dt = TRACK_UPDATE_MS / 1000.0f;
+  float maxStep = SERVO_MAX_SLEW_DEG_S * dt;
+  float step = constrain(servoTargetDeg - servoAngleDeg, -maxStep, maxStep);
+
+  if (!setServoAngle(servoAngleDeg + step)) {
     trackMode = MODE_PAUSED;
-    Serial.println(F("[SERVO] ERROR: PWM write failed; tracking paused"));
+    Log.println(F("[SERVO] ERROR: PWM write failed; tracking paused"));
     return;
   }
   static uint32_t nextTrackLogMs = 0;
   if (millis() >= nextTrackLogMs) {
     nextTrackLogMs = millis() + 3000;
-    Serial.print(F("[TRACK] bearing="));
-    Serial.print(bearing, 1);
-    Serial.print(F(" head="));
-    Serial.print(trackingHeading(), 1);
-    Serial.print(F(" off="));
-    Serial.print(mountOffsetDeg, 1);
-    Serial.print(F(" servo="));
-    Serial.println(servoTargetDeg, 1);
+    Log.print(F("[TRACK] bearing="));
+    Log.print(bearing, 1);
+    Log.print(F(" head="));
+    Log.print(frozenHeadingDeg, 1);
+    Log.print(F(" off="));
+    Log.print(mountOffsetDeg, 1);
+    Log.print(F(" servo="));
+    Log.print(servoAngleDeg, 1);
+    Log.print(F("->"));
+    Log.println(servoTargetDeg, 1);
   }
 }
 
 // Lock the servo-to-world mounting offset from the current aim, then track.
+// Calibration uses the same dead-reckoned position as updateTracking(), so the
+// offset does not silently absorb whatever projection drift happened to exist
+// at the moment the operator pressed start.
 static bool startTracking() {
   if (!haveBearingFix()) return false;
+  double clientLat, clientLon;
+  predictClientPos(clientLat, clientLon);
   float bearingCal = (float)computeBearing(gps.location.lat(), gps.location.lng(),
-                                           lastData.lat, lastData.lon);
+                                           clientLat, clientLon);
   float off = normalize360(bearingCal - trackingHeading() + servoAngleDeg);
   if (off > 180.0f) off -= 360.0f;
   mountOffsetDeg = off;
   mountCalibrated = true;
   saveMountOffsetToNvs();
   trackMode = MODE_TRACKING;
-  Serial.print(F("[TRACK] start: bearing="));
-  Serial.print(bearingCal, 1);
-  Serial.print(F(" head="));
-  Serial.print(trackingHeading(), 1);
-  Serial.print(F(" servo="));
-  Serial.print(servoAngleDeg, 1);
-  Serial.print(F(" -> mount_offset="));
-  Serial.println(mountOffsetDeg, 1);
+  headingFrozen = false;  // re-snapshot: the offset above used the live heading
+  Log.print(F("[TRACK] start: bearing="));
+  Log.print(bearingCal, 1);
+  Log.print(F(" head="));
+  Log.print(trackingHeading(), 1);
+  Log.print(F(" servo="));
+  Log.print(servoAngleDeg, 1);
+  Log.print(F(" -> mount_offset="));
+  Log.println(mountOffsetDeg, 1);
   updateTracking();
   return servoPwmReady;
 }
@@ -1166,8 +1721,72 @@ static String buildStatusJson() {
   js += magOnline ? F("true") : F("false");
   js += F(",\"heading\":");
   js += (magOnline && magHeadingDeg >= 0) ? String(magHeadingDeg, 1) : F("-1");
+  js += F(",\"calibrated\":");
+  js += magCalibrated ? F("true") : F("false");
+  js += F(",\"residual_deg\":");
+  js += magCalResidualDeg >= 0 ? String(magCalResidualDeg, 2) : F("null");
   js += F("}}");
   return js;
+}
+
+static String buildMagCalJson() {
+  const char *st = "idle";
+  switch (magCalState) {
+    case MAGCAL_COLLECTING: st = "collecting"; break;
+    case MAGCAL_DONE:       st = "done"; break;
+    case MAGCAL_FAILED:     st = "failed"; break;
+    default:                st = "idle"; break;
+  }
+  String js = F("{\"state\":\"");
+  js += st;
+  js += F("\",\"online\":");
+  js += magOnline ? F("true") : F("false");
+  js += F(",\"coverage_pct\":");
+  js += String(magCalState == MAGCAL_COLLECTING ? magCalCoveragePct() : 0);
+  js += F(",\"samples\":");
+  js += String((uint32_t)magCalCount);
+  js += F(",\"calibrated\":");
+  js += magCalibrated ? F("true") : F("false");
+  js += F(",\"residual_deg\":");
+  js += magCalResidualDeg >= 0 ? String(magCalResidualDeg, 2) : F("null");
+  js += F(",\"field_gauss\":");
+  js += magCalFieldGauss >= 0 ? String(magCalFieldGauss, 4) : F("null");
+  js += F(",\"offset_x\":");
+  js += String(magOffsetX, 4);
+  js += F(",\"offset_y\":");
+  js += String(magOffsetY, 4);
+  js += F(",\"heading\":");
+  js += (magOnline && magHeadingDeg >= 0) ? String(magHeadingDeg, 1) : F("-1");
+  js += F(",\"error\":\"");
+  js += magCalError;
+  js += F("\"}");
+  return js;
+}
+
+// Extract the log bytes the caller has not seen yet.
+// Offsets are absolute (logTotal), so a caller can poll for deltas; if it has
+// fallen behind the 4 KB window — or we rebooted and logTotal went backwards —
+// it is snapped to the oldest byte we still hold and told data was dropped.
+static String buildLogText(uint32_t from, bool &dropped, uint32_t &next) {
+  uint32_t oldest = logWrapped ? (logTotal - LOG_BUF_BYTES) : 0;
+  uint32_t start;
+  dropped = false;
+  if (from > logTotal || from < oldest) {  // behind the window, or we rebooted
+    start = oldest;
+    dropped = (logTotal > 0);
+  } else {
+    start = from;
+  }
+  next = logTotal;
+
+  String out;
+  out.reserve(logTotal - start + 8);
+  for (uint32_t k = start; k < logTotal; k++) {
+    size_t idx = logWrapped ? (logHead + (size_t)(k - oldest)) % LOG_BUF_BYTES
+                            : (size_t)k;
+    out += logBuf[idx];
+  }
+  return out;
 }
 
 static void initWebServer() {
@@ -1224,6 +1843,123 @@ static void initWebServer() {
     }
     httpServer.send(200, "application/json", buildWhitelistJson());
   });
+  // GET/POST /api/mag/calibrate — hard-iron calibration.
+  // POST starts (or ?action=cancel aborts); GET polls progress.
+  httpServer.on("/api/mag/calibrate", HTTP_GET, []() {
+    httpServer.send(200, "application/json", buildMagCalJson());
+  });
+  httpServer.on("/api/mag/calibrate", HTTP_POST, []() {
+    if (httpServer.arg("action") == "cancel") {
+      magCalState = magCalibrated ? MAGCAL_DONE : MAGCAL_IDLE;
+      httpServer.send(200, "application/json", buildMagCalJson());
+      return;
+    }
+    if (!magOnline) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"no magnetometer\"}");
+      return;
+    }
+    startMagCalibration();
+    httpServer.send(200, "application/json", buildMagCalJson());
+  });
+
+  // POST /api/track/calibrate?lat=<deg>&lon=<deg>
+  // Lock mount_offset against a landmark of known position instead of against
+  // the surfer. Centre the landmark in the viewfinder first — at 400 mm that is
+  // a ~0.05 deg sight, an order of magnitude better than aiming at a person in
+  // the water, and it needs neither a second person nor the tracker to be
+  // present. Only the station's own GPS fix is required.
+  httpServer.on("/api/track/calibrate", HTTP_POST, []() {
+    if (!httpServer.hasArg("lat") || !httpServer.hasArg("lon")) {
+      httpServer.send(400, "application/json",
+                      "{\"ok\":false,\"error\":\"missing lat/lon\"}");
+      return;
+    }
+    if (!gps.location.isValid()) {
+      httpServer.send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"need server GPS fix\"}");
+      return;
+    }
+    double lat = httpServer.arg("lat").toDouble();
+    double lon = httpServer.arg("lon").toDouble();
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 ||
+        (lat == 0.0 && lon == 0.0)) {
+      httpServer.send(400, "application/json",
+                      "{\"ok\":false,\"error\":\"lat/lon out of range\"}");
+      return;
+    }
+
+    double sLat = gps.location.lat(), sLon = gps.location.lng();
+    float bearing = (float)computeBearing(sLat, sLon, lat, lon);
+    // Equirectangular distance is plenty here; it only drives a sanity warning.
+    double eastM = radians(lon - sLon) * cos(radians(sLat)) * 6371000.0;
+    double northM = radians(lat - sLat) * 6371000.0;
+    double distM = sqrt(eastM * eastM + northM * northM);
+
+    float off = normalize360(bearing - trackingHeading() + servoAngleDeg);
+    if (off > 180.0f) off -= 360.0f;
+    mountOffsetDeg = off;
+    mountCalibrated = true;
+    headingFrozen = false;  // re-snapshot against the new offset
+    saveMountOffsetToNvs();
+
+    Log.print(F("[TRACK] landmark calibration: bearing="));
+    Log.print(bearing, 2);
+    Log.print(F(" dist="));
+    Log.print(distM, 0);
+    Log.print(F("m head="));
+    Log.print(trackingHeading(), 2);
+    Log.print(F(" servo="));
+    Log.print(servoAngleDeg, 1);
+    Log.print(F(" -> mount_offset="));
+    Log.println(mountOffsetDeg, 2);
+
+    String js = F("{\"ok\":true,\"bearing\":");
+    js += String(bearing, 2);
+    js += F(",\"distance_m\":");
+    js += String((uint32_t)distM);
+    js += F(",\"mount_offset_deg\":");
+    js += String(mountOffsetDeg, 2);
+    js += F(",\"servo_angle\":");
+    js += String(servoAngleDeg, 1);
+    js += F(",\"mag_calibrated\":");
+    js += magCalibrated ? F("true") : F("false");
+    js += F(",\"warning\":\"");
+    if (!magCalibrated && magOnline) {
+      // Without hard-iron correction this offset is only valid near the
+      // orientation it was taken at — the very thing it is meant to outlive.
+      js += F("run the magnetometer calibration first, or this offset will not "
+              "survive being set up facing a different way");
+    } else if (distM < 300.0) {
+      // A near landmark amplifies the station's own position error into the
+      // bearing: 1 m at 100 m is 0.6 deg, at 1 km it is 0.06 deg.
+      js += F("landmark is close; 1 km or more gives a much tighter reference");
+    }
+    js += F("\"}");
+    httpServer.send(200, "application/json", js);
+  });
+
+  // GET /api/log?from=<absolute offset> — plain text, delta since that offset.
+  // Plain text rather than JSON so the log needs no escaping; the two custom
+  // headers carry the bookkeeping (same-origin JS can read them freely).
+  httpServer.on("/api/log", HTTP_GET, []() {
+    uint32_t from = httpServer.hasArg("from")
+                        ? (uint32_t)strtoul(httpServer.arg("from").c_str(), nullptr, 10)
+                        : 0;
+    bool dropped = false;
+    uint32_t next = 0;
+    String txt = buildLogText(from, dropped, next);
+    httpServer.sendHeader("X-Log-Next", String(next));
+    httpServer.sendHeader("X-Log-Dropped", dropped ? "1" : "0");
+    httpServer.send(200, "text/plain; charset=utf-8", txt);
+  });
+  httpServer.on("/api/log", HTTP_POST, []() {  // clear
+    logHead = 0;
+    logWrapped = false;
+    logTotal = 0;
+    httpServer.send(200, "application/json", "{\"ok\":true}");
+  });
+
   httpServer.on("/api/status", HTTP_GET, []() {
     httpServer.send(200, "application/json", buildStatusJson());
   });
@@ -1247,8 +1983,8 @@ static void initWebServer() {
     }
     servoTargetDeg = a;
     if (trackMode == MODE_IDLE) trackMode = MODE_MANUAL;
-    Serial.print(F("[SERVO] manual angle="));
-    Serial.println(servoAngleDeg, 1);
+    Log.print(F("[SERVO] manual angle="));
+    Log.println(servoAngleDeg, 1);
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"angle\":" + String(servoAngleDeg, 1) + "}");
   });
@@ -1274,7 +2010,7 @@ static void initWebServer() {
   // POST /api/track/pause — hold servo at the current angle, stop auto updates.
   httpServer.on("/api/track/pause", HTTP_POST, []() {
     if (trackMode == MODE_TRACKING) trackMode = MODE_PAUSED;
-    Serial.println(F("[TRACK] paused"));
+    Log.println(F("[TRACK] paused"));
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"" + String(trackModeStr(trackMode)) +
                         "\"}");
@@ -1298,14 +2034,14 @@ static void initWebServer() {
                       "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
       return;
     }
-    Serial.println(F("[TRACK] resumed"));
+    Log.println(F("[TRACK] resumed"));
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"tracking\"}");
   });
   // POST /api/track/stop — return to manual control (keeps calibration).
   httpServer.on("/api/track/stop", HTTP_POST, []() {
     trackMode = MODE_MANUAL;
-    Serial.println(F("[TRACK] stopped -> manual"));
+    Log.println(F("[TRACK] stopped -> manual"));
     httpServer.send(200, "application/json",
                     "{\"ok\":true,\"mode\":\"manual\"}");
   });
@@ -1323,17 +2059,17 @@ static void initArduinoOta() {
   ArduinoOTA
       .onStart([]() {
         if (trackMode == MODE_TRACKING) trackMode = MODE_PAUSED;
-        Serial.println(F("[OTA] update started; tracking paused"));
+        Log.println(F("[OTA] update started; tracking paused"));
       })
-      .onEnd([]() { Serial.println(F("[OTA] update complete; rebooting")); })
+      .onEnd([]() { Log.println(F("[OTA] update complete; rebooting")); })
       .onError([](ota_error_t error) {
-        Serial.print(F("[OTA] ERROR code="));
-        Serial.println((unsigned int)error);
+        Log.print(F("[OTA] ERROR code="));
+        Log.println((unsigned int)error);
       });
   ArduinoOTA.begin();
   otaReady = true;
-  Serial.print(F("[OTA] ready: shore-spotter-server.local / "));
-  Serial.println(WiFi.localIP());
+  Log.print(F("[OTA] ready: shore-spotter-server.local / "));
+  Log.println(WiFi.localIP());
 }
 #endif
 
@@ -1390,9 +2126,9 @@ static void showLowBatteryAndPowerOff() {
   display.drawStr(16, 28, "LOW BATTERY");
   display.drawStr(10, 46, "Shutting down");
   display.sendBuffer();
-  Serial.print(F("[PWR] LOW BATTERY ("));
-  Serial.print(cachedBatteryMv);
-  Serial.println(F(" mV) -> power off"));
+  Log.print(F("[PWR] LOW BATTERY ("));
+  Log.print(cachedBatteryMv);
+  Log.println(F(" mV) -> power off"));
   delay(2500);
   display.clearBuffer();
   display.sendBuffer();
@@ -1483,6 +2219,11 @@ static void wakeClientScreen() {
 
 void setup() {
   Serial.begin(115200);
+  // Never let logging stall the firmware. Without this, a board plugged into a
+  // PC with no terminal open blocks up to 100 ms per write once the CDC ring
+  // buffer fills (HWCDC.cpp: tx_timeout_ms) — on battery it never happens,
+  // which is why the symptom only ever showed up on the bench.
+  Serial.setTxTimeoutMs(0);
   delay(1200);
   bootMs = millis();
   nodeId = derivedNodeId();
@@ -1492,6 +2233,7 @@ void setup() {
       delay(1000);
     }
   }
+  computeAirtimeBudget();
 
 #if defined(ROLE_CLIENT)
   loadClientSettings();
@@ -1501,6 +2243,7 @@ void setup() {
   pinMode(GPS_EN_PIN, OUTPUT);
   digitalWrite(GPS_EN_PIN, HIGH);
 
+  GPSSerial.setRxBufferSize(GPS_RX_BUFFER_BYTES);  // must precede begin()
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   pmuOnline = initPmu();
@@ -1521,17 +2264,23 @@ void setup() {
 
   showClientBootScreen();  // show MAC / batt / temp for 10 s then turn off OLED
 
-  Serial.println(F("[CLIENT] mode active: send position packets"));
-  Serial.print(F("[CLIENT] node id (chip MAC last 2 bytes) = 0x"));
-  Serial.println(nodeId, HEX);
-  Serial.println(F("[CLIENT] Add this id to SERVER CLIENT_WHITELIST to authorise."));
-  Serial.print(F("[CLIENT] GPS UART baud="));
-  Serial.println(GPS_BAUD);
-  Serial.print(F("[CLIENT] TX power="));
-  Serial.print(currentTxPowerDbm);
-  Serial.print(F(" dBm (ATPC="));
-  Serial.print(atpcEnabled ? F("on") : F("off"));
-  Serial.println(F(")"));
+  Log.println(F("[CLIENT] mode active: send position packets"));
+  Log.print(F("[CLIENT] node id (chip MAC last 2 bytes) = 0x"));
+  Log.println(nodeId, HEX);
+  Log.println(F("[CLIENT] Add this id to SERVER CLIENT_WHITELIST to authorise."));
+  Log.print(F("[CLIENT] GPS UART baud="));
+  Log.println(GPS_BAUD);
+  Log.print(F("[CLIENT] TX power="));
+  Log.print(currentTxPowerDbm);
+  Log.print(F(" dBm (ATPC="));
+  Log.print(atpcEnabled ? F("on") : F("off"));
+  Log.println(F(")"));
+
+  // Arm non-blocking ACK reception (see onClientDio1) and start the position
+  // cadence from now, so the 10 s boot screen does not count as a missed slot.
+  radio.setDio1Action(onClientDio1);
+  radio.startReceive();
+  nextSendMs = millis();
 #endif
 
 #if defined(ROLE_SERVER)
@@ -1546,6 +2295,7 @@ void setup() {
   // Server also reads its own GPS so it can compute bearing to the client.
   pinMode(GPS_EN_PIN, OUTPUT);
   digitalWrite(GPS_EN_PIN, HIGH);
+  GPSSerial.setRxBufferSize(GPS_RX_BUFFER_BYTES);  // must precede begin()
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
@@ -1568,17 +2318,17 @@ void setup() {
 
   nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
   nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
-  Serial.println(F("[SERVER] mode active: receive position packets"));
+  Log.println(F("[SERVER] mode active: receive position packets"));
   loadServerSettings();
-  Serial.print(F("[SERVER] whitelist ("));
-  Serial.print(clientWhitelistCount);
-  Serial.print(F(" entries): "));
+  Log.print(F("[SERVER] whitelist ("));
+  Log.print(clientWhitelistCount);
+  Log.print(F(" entries): "));
   for (size_t i = 0; i < clientWhitelistCount; i++) {
-    Serial.print(F("0x"));
-    Serial.print(clientWhitelist[i], HEX);
-    if (i + 1 < clientWhitelistCount) Serial.print(' ');
+    Log.print(F("0x"));
+    Log.print(clientWhitelist[i], HEX);
+    if (i + 1 < clientWhitelistCount) Log.print(' ');
   }
-  Serial.println();
+  Log.println();
 
   // Connect to the phone-provided hotspot in station mode.
   // Credentials come from include/wifi_config.h (WIFI_SSID / WIFI_PASSWORD).
@@ -1586,34 +2336,35 @@ void setup() {
   WiFi.setHostname("shore-spotter-server");
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print(F("[WiFi] Connecting to hotspot \""));
-  Serial.print(WIFI_SSID);
-  Serial.print(F("\" "));
+  Log.print(F("[WiFi] Connecting to hotspot \""));
+  Log.print(WIFI_SSID);
+  Log.print(F("\" "));
   uint32_t wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED &&
          millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
     delay(250);
-    Serial.print('.');
+    Log.print('.');
   }
-  Serial.println();
+  Log.println();
 
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
   display.drawStr(0, 12, "SHORE SPOTTER");
   display.drawHLine(0, 14, 128);
   if (WiFi.status() == WL_CONNECTED) {
-    cachedApIp = WiFi.localIP().toString();
-    Serial.print(F("[WiFi] Connected. IP: "));
-    Serial.println(cachedApIp);
-    Serial.print(F("[WiFi] Open browser -> http://"));
-    Serial.println(cachedApIp);
+    cachedApIpAddr = WiFi.localIP();
+    cachedApIp = cachedApIpAddr.toString();
+    Log.print(F("[WiFi] Connected. IP: "));
+    Log.println(cachedApIp);
+    Log.print(F("[WiFi] Open browser -> http://"));
+    Log.println(cachedApIp);
     display.drawStr(0, 32, "WiFi connected");
     display.drawStr(0, 48, cachedApIp.c_str());
   } else {
     cachedApIp = "";
-    Serial.println(F("[WiFi] Hotspot connect FAILED."));
-    Serial.println(F("[WiFi] Check SSID/password in include/wifi_config.h."));
-    Serial.println(F("[WiFi] LoRa tracking still runs; WiFi will auto-retry."));
+    Log.println(F("[WiFi] Hotspot connect FAILED."));
+    Log.println(F("[WiFi] Check SSID/password in include/wifi_config.h."));
+    Log.println(F("[WiFi] LoRa tracking still runs; WiFi will auto-retry."));
     display.drawStr(0, 32, "WiFi FAILED");
     display.drawStr(0, 48, "see wifi_config.h");
   }
@@ -1633,11 +2384,42 @@ void loop() {
 #if defined(ROLE_CLIENT)
   serviceGps();
 
+  // Non-blocking ACK drain (see onClientDio1). Kept ahead of the transmit slots
+  // below: those clear clientRxFlag to swallow their own TxDone pulse, and would
+  // otherwise discard an ACK that happened to land in the same millisecond.
+  if (clientRxFlag) {
+    clientRxFlag = false;
+    uint8_t ackBuf[ACK_PACKET_LEN];
+    int ackState = radio.readData(ackBuf, sizeof(ackBuf));
+    if (ackState == RADIOLIB_ERR_NONE) {
+      size_t n = radio.getPacketLength();
+      if (n > sizeof(ackBuf)) n = sizeof(ackBuf);
+      AckPayload ack{};
+      if (parseAckPacket(ackBuf, n, ack)) {
+        lastAckRxMs = millis();
+        ackRxCount++;
+        lastAckRssiDbm10 = ack.rssiDbm10;
+        lastAckSnrDb10 = ack.snrDb10;
+        Log.print(F("[CLIENT] ACK seq="));
+        Log.print(ack.ackSeq);
+        Log.print(F(" | up(srv heard us) rssi="));
+        Log.print(ack.rssiDbm10 / 10.0f, 1);
+        Log.print(F(" snr="));
+        Log.print(ack.snrDb10 / 10.0f, 1);
+        Log.print(F(" | down(we heard ack) rssi="));
+        Log.print(radio.getRSSI(), 1);
+        Log.print(F(" snr="));
+        Log.println(radio.getSNR(), 1);
+      }
+    }
+    radio.startReceive();  // re-arm for the next ACK
+  }
+
   if (millis() >= nextBatteryMs) {
     nextBatteryMs = millis() + BATTERY_UPDATE_MS;
     cachedBatteryMv = readBatteryMilliVolts();
-    Serial.print(F("[CLIENT] Battery update mV="));
-    Serial.println(cachedBatteryMv);
+    Log.print(F("[CLIENT] Battery update mV="));
+    Log.println(cachedBatteryMv);
     checkLowBatteryAndMaybeShutdown();
   }
 
@@ -1648,82 +2430,71 @@ void loop() {
 
   if (millis() >= nextSendMs) {
     nextSendMs = millis() + SEND_INTERVAL_MS;
+    lastSendMs = millis();
 
     uint8_t buf[DATA_PACKET_LEN];
     size_t len = buildDataPacket(buf);
     int state = radio.transmit(buf, len);
+    // Re-arm RX before the (comparatively slow) serial log below: the server
+    // starts its ACK within a few ms of our TxDone.
+    clientRxFlag = false;  // swallow the TxDone pulse from our own transmission
+    radio.startReceive();
 
     if (state == RADIOLIB_ERR_NONE) {
-      Serial.print(F("[CLIENT] TX ok seq="));
-      Serial.print((uint16_t)(txSeq - 1));
-      Serial.print(F(" | GPS fix="));
-      Serial.print(gps.location.isValid() ? 1 : 0);
-      Serial.print(F(" sats="));
-      Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
-      Serial.print(F(" hdop="));
-      if (gps.hdop.isValid()) Serial.print(gps.hdop.hdop(), 1);
-      else Serial.print(F("--"));
-      Serial.print(F(" age="));
-      Serial.print(gps.location.age());
-      Serial.print(F("ms spd="));
-      Serial.print(gps.speed.isValid() ? gps.speed.mps() : 0.0, 1);
-      Serial.print(F("m/s crs="));
-      Serial.print(gps.course.isValid() ? gps.course.deg() : 0.0, 0);
-      Serial.print(F(" | LoRa up(srv heard us) rssi="));
-      Serial.print(lastAckRssiDbm10 / 10.0f, 1);
-      Serial.print(F(" snr="));
-      Serial.print(lastAckSnrDb10 / 10.0f, 1);
-      Serial.print(F(" txpwr="));
-      Serial.print(currentTxPowerDbm);
-      Serial.print(F("dBm acks="));
-      Serial.print(ackRxCount);
-      Serial.print(F(" miss="));
-      Serial.println(ackMissCount);
+      Log.print(F("[CLIENT] TX ok seq="));
+      Log.print((uint16_t)(txSeq - 1));
+      Log.print(F(" | GPS fix="));
+      Log.print(gps.location.isValid() ? 1 : 0);
+      Log.print(F(" sats="));
+      Log.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+      Log.print(F(" hdop="));
+      if (gps.hdop.isValid()) Log.print(gps.hdop.hdop(), 1);
+      else Log.print(F("--"));
+      Log.print(F(" age="));
+      Log.print(gps.location.age());
+      Log.print(F("ms spd="));
+      Log.print(gps.speed.isValid() ? gps.speed.mps() : 0.0, 1);
+      Log.print(F("m/s crs="));
+      Log.print(gps.course.isValid() ? gps.course.deg() : 0.0, 0);
+      Log.print(F(" | LoRa up(srv heard us) rssi="));
+      Log.print(lastAckRssiDbm10 / 10.0f, 1);
+      Log.print(F(" snr="));
+      Log.print(lastAckSnrDb10 / 10.0f, 1);
+      Log.print(F(" txpwr="));
+      Log.print(currentTxPowerDbm);
+      Log.print(F("dBm acks="));
+      Log.print(ackRxCount);
+      Log.print(F(" miss="));
+      Log.println(ackMissCount);
     } else {
-      Serial.print(F("[CLIENT] TX failed, code="));
-      Serial.println(state);
+      Log.print(F("[CLIENT] TX failed, code="));
+      Log.println(state);
     }
   }
 
-  if (millis() >= nextTelemetryMs) {
-    nextTelemetryMs = millis() + TELEMETRY_INTERVAL_MS;
-    uint8_t tbuf[TELEMETRY_PACKET_LEN];
-    size_t tlen = buildTelemetryPacket(tbuf);
-    int tstate = radio.transmit(tbuf, tlen);
-    if (tstate == RADIOLIB_ERR_NONE) {
-      Serial.print(F("[CLIENT] TELEMETRY TX ok batt_mV="));
-      Serial.println(cachedBatteryMv);
-    } else {
-      Serial.print(F("[CLIENT] TELEMETRY TX failed, code="));
-      Serial.println(tstate);
+  // Telemetry waits for the quiet slot of the position cycle (see
+  // TELEMETRY_SLOT_MIN_MS); loop() spins fast enough that the slot is never
+  // missed once the packet is due.
+  if (millis() >= nextTelemetryMs && lastSendMs != 0) {
+    uint32_t sinceSend = millis() - lastSendMs;
+    if (sinceSend >= telemetrySlotMinMs && sinceSend <= telemetrySlotMaxMs) {
+      nextTelemetryMs = millis() + TELEMETRY_INTERVAL_MS;
+      uint8_t tbuf[TELEMETRY_PACKET_LEN];
+      size_t tlen = buildTelemetryPacket(tbuf);
+      int tstate = radio.transmit(tbuf, tlen);
+      clientRxFlag = false;
+      radio.startReceive();
+      if (tstate == RADIOLIB_ERR_NONE) {
+        Log.print(F("[CLIENT] TELEMETRY TX ok batt_mV="));
+        Log.println(cachedBatteryMv);
+      } else {
+        Log.print(F("[CLIENT] TELEMETRY TX failed, code="));
+        Log.println(tstate);
+      }
     }
   }
 
-  uint8_t ackBuf[ACK_PACKET_LEN];
-  int ackState = radio.receive(ackBuf, sizeof(ackBuf));
-  if (ackState == RADIOLIB_ERR_NONE) {
-    size_t n = radio.getPacketLength();
-    if (n > sizeof(ackBuf)) n = sizeof(ackBuf);
-    AckPayload ack{};
-    if (parseAckPacket(ackBuf, n, ack)) {
-      lastAckedSeq = ack.ackSeq;
-      lastAckRxMs = millis();
-      ackRxCount++;
-      lastAckRssiDbm10 = ack.rssiDbm10;
-      lastAckSnrDb10 = ack.snrDb10;
-      Serial.print(F("[CLIENT] ACK seq="));
-      Serial.print(ack.ackSeq);
-      Serial.print(F(" | up(srv heard us) rssi="));
-      Serial.print(ack.rssiDbm10 / 10.0f, 1);
-      Serial.print(F(" snr="));
-      Serial.print(ack.snrDb10 / 10.0f, 1);
-      Serial.print(F(" | down(we heard ack) rssi="));
-      Serial.print(radio.getRSSI(), 1);
-      Serial.print(F(" snr="));
-      Serial.println(radio.getSNR(), 1);
-    }
-  }
-  if (txSeq > 5 && (millis() - lastAckRxMs > 15000) &&
+  if (txSeq > 5 && (millis() - lastAckRxMs > ACK_STALE_MS) &&
       (millis() - lastAckMissMarkMs > 5000)) {
     ackMissCount++;
     lastAckMissMarkMs = millis();
@@ -1732,7 +2503,10 @@ void loop() {
   evaluateAtpc();
 
   // PWR key: short-press wakes the screen 10 s, long-press shuts down.
-  if (pmuOnline) {
+  // Polled on a timer (see PMU_KEY_POLL_MS) — loop() no longer blocks, so every
+  // pass would otherwise cost two I2C transactions on the PMU bus.
+  if (pmuOnline && millis() >= nextPmuKeyMs) {
+    nextPmuKeyMs = millis() + PMU_KEY_POLL_MS;
     pmu.getIrqStatus();
     if (pmu.isPekeyShortPressIrq()) {
       wakeClientScreen();
@@ -1755,6 +2529,13 @@ void loop() {
       drawClientInfoScreen();
     }
   }
+
+  // Nothing in this loop blocks any more, so without an explicit yield the task
+  // would spin at full CPU and never let the core's idle task run — wasted
+  // battery on a device that has to last a session in the water. At
+  // CONFIG_FREERTOS_HZ=1000 this is a 1 ms tick, far finer than anything above.
+  // (The server gets the same yield for free from WebServer::handleClient().)
+  delay(1);
 #endif
 
 #if defined(ROLE_SERVER)
@@ -1768,7 +2549,8 @@ void loop() {
   }
 
   if (millis() >= nextMagMs) {
-    nextMagMs = millis() + MAG_SAMPLE_MS;
+    nextMagMs = millis() + (magCalState == MAGCAL_COLLECTING ? MAG_CAL_SAMPLE_MS
+                                                            : MAG_SAMPLE_MS);
     sampleMag();
   }
 
@@ -1781,12 +2563,21 @@ void loop() {
   // WiFi watchdog: re-attempt the hotspot every WIFI_RETRY_INTERVAL_MS while
   // offline, and refresh the cached IP once (re)connected.
   if (WiFi.status() == WL_CONNECTED) {
-    if (cachedApIp.isEmpty()) {
-      cachedApIp = WiFi.localIP().toString();
+    // Re-read on change, not just when empty: a DHCP renewal can hand out a
+    // different address without the link ever reporting disconnected, and the
+    // old code would then show a stale IP on the OLED forever. Compared as an
+    // IPAddress so the common case allocates no String — loop() runs at ~1 kHz.
+    IPAddress ip = WiFi.localIP();
+    if (ip != cachedApIpAddr) {
+      cachedApIpAddr = ip;
+      cachedApIp = ip.toString();
+      Log.print(F("[WiFi] address is now "));
+      Log.println(cachedApIp);
     }
     initArduinoOta();
   } else {
     cachedApIp = "";
+    cachedApIpAddr = IPAddress();
     if (millis() >= nextWifiRetryMs) {
       nextWifiRetryMs = millis() + WIFI_RETRY_INTERVAL_MS;
       wifiReconnectingUntilMs = millis() + 2000;  // show "reconnecting" briefly
@@ -1795,18 +2586,21 @@ void loop() {
   }
 
   // Long-press PWR → show shutdown screen then power off
-  if (pmuOnline) {
+  if (pmuOnline && millis() >= nextPmuKeyMs) {
+    nextPmuKeyMs = millis() + PMU_KEY_POLL_MS;
     pmu.getIrqStatus();
     if (pmu.isPekeyLongPressIrq()) {
       pmu.clearIrqStatus();
       showShutdownAndPowerOff();
     }
+    pmu.clearIrqStatus();  // don't let unrelated latched IRQs accumulate
   }
 
   // Interrupt-driven RX: the DIO1 ISR sets rxDoneFlag; the loop stays
   // non-blocking so httpServer.handleClient() above replies instantly.
   if (rxDoneFlag) {
     rxDoneFlag = false;
+    bool ackSent = false;
     uint8_t buf[DATA_PACKET_LEN];
     int state = radio.readData(buf, sizeof(buf));
 
@@ -1836,50 +2630,57 @@ void loop() {
         pktsThisWindow = 0;
         pktWindowStartMs = millis();
       }
-      updateTracking();  // steer the camera servo toward the surfer (if tracking)
+      // Servo steering is NOT driven from here — it runs on the TRACK_UPDATE_MS
+      // tick in loop() so the pan keeps going between (and through missing)
+      // packets. This handler only refreshes the data it feeds on.
 
-      uint8_t ackBuf[ACK_PACKET_LEN];
-      size_t ackLen = buildAckPacket(ackBuf, d.srcId, d.seq, lastRssi, lastSnr);
-      if (radio.transmit(ackBuf, ackLen) == RADIOLIB_ERR_NONE) {
-        ackTxCount++;
+      // Acknowledge only every ACK_EVERY_N-th sequence number (see ACK_EVERY_N).
+      // Keyed on the client's seq, so packet loss cannot slide the schedule.
+      if (d.seq % ACK_EVERY_N == 0) {
+        uint8_t ackBuf[ACK_PACKET_LEN];
+        size_t ackLen = buildAckPacket(ackBuf, d.srcId, d.seq, lastRssi, lastSnr);
+        ackSent = true;  // TxDone pulses on DIO1 whether or not the TX succeeded
+        if (radio.transmit(ackBuf, ackLen) == RADIOLIB_ERR_NONE) {
+          ackTxCount++;
+        }
       }
 
-      Serial.print(F("[SERVER] RX DATA | from=0x"));
-      Serial.print(d.srcId, HEX);
-      Serial.print(F(" seq="));
-      Serial.print(d.seq);
-      Serial.print(F(" lat="));
-      Serial.print(d.lat, 6);
-      Serial.print(F(" lon="));
-      Serial.print(d.lon, 6);
-      Serial.print(F(" fix="));
-      Serial.print(d.fix);
-      Serial.print(F(" sats="));
-      Serial.print(d.satellites != 0xFF ? (int)d.satellites : -1);
-      Serial.print(F(" hdop="));
-      if (d.hdop10 != 0xFF) Serial.print(d.hdop10 / 10.0f, 1);
-      else Serial.print(F("--"));
-      Serial.print(F(" spd="));
-      Serial.print(d.speedCmS);
-      Serial.print(F("cm/s crs="));
-      Serial.print(d.courseDeg10 / 10.0f, 0);
-      Serial.print(F(" acc="));
-      Serial.print(d.accelCmS2 / 100.0f, 2);
-      Serial.print(F("m/s2 | LoRa rssi="));
-      Serial.print(lastRssi);
-      Serial.print(F(" snr="));
-      Serial.print(lastSnr);
-      Serial.print(F(" | SRV-GPS fix="));
-      Serial.print(gps.location.isValid() ? 1 : 0);
-      Serial.print(F(" sats="));
-      Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
-      Serial.print(F(" hdop="));
-      if (gps.hdop.isValid()) Serial.print(gps.hdop.hdop(), 1);
-      else Serial.print(F("--"));
-      Serial.print(F(" | drop="));
-      Serial.print(rxDropCount);
-      Serial.print(F(" err="));
-      Serial.println(rxErrorCount);
+      Log.print(F("[SERVER] RX DATA | from=0x"));
+      Log.print(d.srcId, HEX);
+      Log.print(F(" seq="));
+      Log.print(d.seq);
+      Log.print(F(" lat="));
+      Log.print(d.lat, 6);
+      Log.print(F(" lon="));
+      Log.print(d.lon, 6);
+      Log.print(F(" fix="));
+      Log.print(d.fix);
+      Log.print(F(" sats="));
+      Log.print(d.satellites != 0xFF ? (int)d.satellites : -1);
+      Log.print(F(" hdop="));
+      if (d.hdop10 != 0xFF) Log.print(d.hdop10 / 10.0f, 1);
+      else Log.print(F("--"));
+      Log.print(F(" spd="));
+      Log.print(d.speedCmS);
+      Log.print(F("cm/s crs="));
+      Log.print(d.courseDeg10 / 10.0f, 0);
+      Log.print(F(" acc="));
+      Log.print(d.accelCmS2 / 100.0f, 2);
+      Log.print(F("m/s2 | LoRa rssi="));
+      Log.print(lastRssi);
+      Log.print(F(" snr="));
+      Log.print(lastSnr);
+      Log.print(F(" | SRV-GPS fix="));
+      Log.print(gps.location.isValid() ? 1 : 0);
+      Log.print(F(" sats="));
+      Log.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+      Log.print(F(" hdop="));
+      if (gps.hdop.isValid()) Log.print(gps.hdop.hdop(), 1);
+      else Log.print(F("--"));
+      Log.print(F(" | drop="));
+      Log.print(rxDropCount);
+      Log.print(F(" err="));
+      Log.println(rxErrorCount);
     } else {
       DecodedTelemetry t{};
       if (parseTelemetryPacket(buf, n, t)) {
@@ -1887,52 +2688,61 @@ void loop() {
         haveTelemetry = true;
         lastTelemetryRxMs = millis();
         rxTelemetryCount++;
-        Serial.print(F("[SERVER] RX TELEMETRY | from=0x"));
-        Serial.print(t.srcId, HEX);
-        Serial.print(F(" batt_mV="));
-        Serial.print(t.batteryMv);
-        Serial.print(F(" temp="));
+        Log.print(F("[SERVER] RX TELEMETRY | from=0x"));
+        Log.print(t.srcId, HEX);
+        Log.print(F(" batt_mV="));
+        Log.print(t.batteryMv);
+        Log.print(F(" temp="));
         if (t.tempC != INT8_MIN) {
-          Serial.print((int)t.tempC);
-          Serial.print(F("C hum="));
-          Serial.print(t.humidityPct);
-          Serial.println('%');
+          Log.print((int)t.tempC);
+          Log.print(F("C hum="));
+          Log.print(t.humidityPct);
+          Log.println('%');
         } else {
-          Serial.println(F("N/A"));
+          Log.println(F("N/A"));
         }
       } else {
         rxDropCount++;
-        Serial.println(F("[SERVER] RX dropped (foreign/invalid packet)"));
+        Log.println(F("[SERVER] RX dropped (foreign/invalid packet)"));
       }
     }
     } else {
       rxErrorCount++;
-      Serial.print(F("[SERVER] RX failed, code="));
-      Serial.println(state);
+      Log.print(F("[SERVER] RX failed, code="));
+      Log.println(state);
     }
-    rxDoneFlag = false;       // ignore the ACK's own TxDone pulse on DIO1
+    // Only swallow the DIO1 pulse when we actually transmitted — on the cycles
+    // that skip the ACK the flag can only mean a genuine packet arrived while
+    // this handler was running, and clearing it would drop that packet.
+    if (ackSent) rxDoneFlag = false;
     radio.startReceive();     // re-arm for the next packet
+  }
+
+  // Camera tracking tick: 20 Hz, independent of the 1 Hz packet arrival.
+  if (millis() >= nextTrackMs) {
+    nextTrackMs = millis() + TRACK_UPDATE_MS;
+    updateTracking();
   }
 
   // Periodic idle log when no packet has arrived for a while.
   if (millis() >= nextServerIdleLogMs &&
       (!havePkt || millis() - lastRxMs > 2500)) {
     nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
-    Serial.print(F("[SERVER] idle | mode="));
-    Serial.print(trackModeStr(trackMode));
-    Serial.print(F(" SRV-GPS fix="));
-    Serial.print(gps.location.isValid() ? 1 : 0);
-    Serial.print(F(" sats="));
-    Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
-    Serial.print(F(" hdop="));
-    if (gps.hdop.isValid()) Serial.print(gps.hdop.hdop(), 1);
-    else Serial.print(F("--"));
-    Serial.print(F(" head="));
-    if (magOnline && magHeadingDeg >= 0) Serial.print(magHeadingDeg, 1);
-    else Serial.print(F("N/A"));
-    Serial.print(F(" servo="));
-    Serial.print(servoAngleDeg, 1);
-    Serial.println(F(" (waiting for client packets)"));
+    Log.print(F("[SERVER] idle | mode="));
+    Log.print(trackModeStr(trackMode));
+    Log.print(F(" SRV-GPS fix="));
+    Log.print(gps.location.isValid() ? 1 : 0);
+    Log.print(F(" sats="));
+    Log.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+    Log.print(F(" hdop="));
+    if (gps.hdop.isValid()) Log.print(gps.hdop.hdop(), 1);
+    else Log.print(F("--"));
+    Log.print(F(" head="));
+    if (magOnline && magHeadingDeg >= 0) Log.print(magHeadingDeg, 1);
+    else Log.print(F("N/A"));
+    Log.print(F(" servo="));
+    Log.print(servoAngleDeg, 1);
+    Log.println(F(" (waiting for client packets)"));
   }
 
   if (millis() >= nextDisplayMs) {
