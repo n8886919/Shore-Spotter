@@ -73,7 +73,7 @@ ACK 只有 Client 會用到（ATPC 的上行品質來源 + 連線存活判斷）
 | 欄位 | 型別 | 說明 |
 |---|---|---|
 | `magic` | `uint8` | 固定 `0x53` |
-| `version` | `uint8` | 目前為 `1` |
+| `version` | `uint8` | 目前為 `3`（與 `protocol.h` 的 `PROTO_VERSION` 同步；不符會被靜默丟棄）|
 | `networkId` | `uint8` | 邏輯群組 ID，預設 `0x01` |
 | `srcId` | `uint16` | 發送方 ID（ESP32 MAC 末 2 bytes，開機自動衍生）|
 | `dstId` | `uint16` | 目標 ID（Server = `0x0010`，廣播 = `0xFFFF`）|
@@ -87,7 +87,7 @@ ACK 只有 Client 會用到（ATPC 的上行品質來源 + 連線存活判斷）
 |---|---|---|
 | `latE7` | `int32` | 緯度 × 1e7（定點數，7 位小數）|
 | `lonE7` | `int32` | 經度 × 1e7 |
-| `fix` | `uint8` | GPS fix（`0`=無效，`1`=有效）|
+| `fix` | `uint8` | GPS fix（`0`=無效，`1`=有效）。**語意是「現在有沒有定位」而不是「曾經定位過」**：TinyGPSPlus 的 `isValid()` 一旦為真就永遠為真，所以韌體另外檢查 `age() < 3 s`（`GPS_FIX_MAX_AGE_MS`）。天線入水或走進死角時這欄會回到 `0`，`latE7/lonE7` 也就不會是凍結的舊值。|
 | `speedCmS` | `uint16` | 瞬間速度，cm/s（由 GPS 計算）|
 | `courseDeg10` | `uint16` | 行進方向，0.1° 單位（0–3599）|
 | `accelCmS2` | `int16` | 縱向加速度，cm/s²（指數平滑）|
@@ -145,6 +145,23 @@ Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修�
 ## `GET /`
 
 回傳完整 Web UI（單頁 HTML，內嵌 Servo 控制 + Canvas 極座標雷達圖，無外部 CDN 依賴）。
+兩個分頁：**雷達**（雷達／地圖 + 手動／自動）與**資訊**（遙測、校正、軌跡匯出）。
+
+## `GET /favicon.ico`
+
+回 `204 No Content`。
+
+沒有這個 handler 的話，瀏覽器自動發出的 favicon 請求會落到 `onNotFound` 的
+`302 -> /`，於是**每開一次頁面就多抓一次完整的 44 KB HTML**。監控頁的 `<head>`
+另外放了 `<link rel="icon" href="data:,">` 從源頭抑制這個請求，這裡是備援
+（PWA、直接開 `/log` 等情況）。
+
+## `GET /log`
+
+回傳獨立的執行紀錄檢視頁（另一份單頁 HTML）。從「資訊」頁的
+**開啟執行紀錄（新分頁）** 按鈕以 `window.open('/log')` 開啟，資料仍走
+[`/api/log`](#apilog)。原本紀錄是 Web UI 的第三個分頁，看 log 就得放掉雷達畫面；
+拆成獨立網址後可以並排在另一個瀏覽器分頁。
 
 ## `GET /api/track`
 
@@ -189,7 +206,10 @@ Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修�
     "target": 87.0,
     "mode": "tracking",
     "calibrated": true,
-    "mount_offset_deg": 12.5
+    "mount_offset_deg": 12.5,
+    "cal_heading": 170.5,
+    "pose_delta_deg": -18.0,
+    "pose_err_deg": 0.71
   },
   "mag": {
     "online": true,
@@ -218,6 +238,9 @@ Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修�
 | `servo.mode` | `idle` / `manual` / `tracking` / `paused` |
 | `servo.calibrated` | 是否已鎖定 `mount_offset`（按過 start）|
 | `servo.mount_offset_deg` | Servo→世界座標的安裝偏移角，校正後鎖定 |
+| `servo.cal_heading` | 鎖定 `mount_offset` 當時的站體 heading（存在 NVS） |
+| `servo.pose_delta_deg` | 目前 heading 與上者的差：站體從校正姿勢轉了多少 |
+| `servo.pose_err_deg` | 該姿勢差造成的指向誤差**上限** = `2 × ellipse_deg × abs(sin(pose_delta))`。磁力計軌跡是橢圓時 heading 誤差是方位的 sin2θ 函數，`mount_offset` 只吸收了校正姿勢那一點；轉回校正姿勢或就地重新校正即歸零 |
 | `mag.online` | 磁力計（QMC6310）是否在線 |
 | `mag.heading` | 攝影站板子的羅盤航向（度），無效時為 `-1` |
 | `client.satellites` / `server.satellites` | 雙方使用中衛星數，`-1` = 無效 |
@@ -227,7 +250,15 @@ Server 維護 `clientWhitelist[]`（最多 16 筆，執行期可透過 API 修�
 
 > 過去 5 分鐘軌跡不再由 API 回傳；前端每秒把 `client`/`server` 當下位置附加到本地陣列（最多 300 點），重整頁會重新累積。
 
-> GPS 品質判定（三級門檻，兩端一致）：**Good** = fix 且 HDOP ≤ 2.0 且 sats ≥ 6；**OK** = fix 且 HDOP ≤ 5.0 且 sats ≥ 4；其餘為 **Bad**。OLED 另用 **Miss** 表示「無衛星/無定位」（LoRa 則為未收到封包）。
+> GPS 品質判定（四級，韌體與監控頁共用同一組門檻，見 `geo::gpsSignal()` 與 web_ui.h 的 `gpsGrade()`）：
+> **Good** = 有定位 且 HDOP ≤ 1.5 且 sats ≥ 8；**OK** = 有定位 且 HDOP ≤ 3.0 且 sats ≥ 6；
+> **Bad** = 收得到衛星但定位不堪用（無定位／sats < 4／達不到 OK）；**Miss** = 完全沒訊號。
+> LoRa 的 **Miss** 表示未收到封包。
+
+> API 回傳的是原始 `hdop` 與 `satellites`；**Web UI 顯示時才換算**成操作者看得懂的形式：
+> 「預期精度」＝ `hdop × 2.5 m`（2.5 m 為單頻消費級模組的典型 1σ UERE），「衛星」＝
+> 少／普通／好（`≥8` 好、`≥6` 普通、其餘少，與上面的 Good/OK 門檻同一組數字）。
+> 要原始數字的話直接讀 API。
 
 ## `GET /api/status`
 
@@ -267,18 +298,74 @@ GPS 訊號品質、LoRa 訊號統計、Servo 校正狀態。
   },
   "servo": {
     "angle": 87.0,
+    "target": 88.2,
     "mode": "tracking",
     "calibrated": true,
-    "mount_offset_deg": 12.5
+    "pwm_ok": true,
+    "mount_offset_deg": 12.5,
+    "cal_heading": 153.0,
+    "pose_delta_deg": 0.4,
+    "pose_err_deg": 0.01
   },
   "mag": {
     "online": true,
     "heading": 153.0,
     "calibrated": true,
     "residual_deg": 0.82
-  }
+  },
+  "alerts": [
+    {
+      "id": "client_water",
+      "level": "error",
+      "title": "追蹤器可能已經進水",
+      "detail": "防水盒裡的濕度到了 92%。請立刻請衝浪者上岸，把裝置擦乾並檢查防水圈有沒有夾到東西。"
+    }
+  ]
 }
 ```
+
+> `servo` 與 `mag` 兩個區塊與 [`GET /api/track`](#get-apitrack) **完全相同**（同一個
+> `appendServoMagJson()`）。原本兩個端點各寫一份、欄位還不一致，前端得靠兩個端點
+> 拼一份狀態；現在改哪一邊都不會走岔。
+
+### `alerts` — 現場提醒
+
+給站在沙灘上的人看的訊息，不是給工程師看的。判斷與措辭都在韌體端
+（`main.cpp` 的 `appendAlertsJson()`，門檻在 [`include/alerts.h`](../include/alerts.h)），
+監控頁只負責畫成最上方那條訊息列 —— 這樣之後 OLED 要顯示同一組提醒不必再實作一次規則。
+
+陣列已依嚴重度排序（`error` 在前）。沒有任何異常時是空陣列。
+
+| 欄位 | 說明 |
+|---|---|
+| `id` | 穩定識別字，前端可用來去重或記住「已讀」|
+| `level` | `error` = 現在就要處理／`warn` = 留意 |
+| `title` | 一句話說發生什麼事 |
+| `detail` | 說明 + 該做什麼，內含當下的實際數值 |
+
+目前定義的提醒：
+
+| `id` | 等級 | 觸發條件 | 意思 |
+|---|---|---|---|
+| `client_water` | error | 盒內濕度 ≥ 90% | 追蹤器幾乎確定進水 |
+| `client_water` | warn | 濕度 ≥ 80% **且**比基準高 ≥ 15 點 | 可能正在滲水 |
+| `client_batt` | error / warn | 電量 ≤ 10% / ≤ 20% | 追蹤器快沒電 |
+| `client_temp` | error / warn | 溫度 ≥ 60°C / ≥ 50°C | 追蹤器過熱 |
+| `client_gps` | warn | 客端 GPS 分級為 Bad/Miss | 鏡頭可能追錯位置 |
+| `client_link` | error / warn | 未收到封包 ≥ 30 s / ≥ 10 s | 失聯 |
+| `client_never` | warn | 開機後從未收到封包 | 沒開機或不在白名單 |
+| `srv_water` | warn | 站體濕度同上規則 | 攝影站受潮 |
+| `srv_batt` | error / warn | 同上（充電中不觸發）| 攝影站快沒電 |
+| `srv_temp` | error / warn | 同上 | 攝影站過熱 |
+| `srv_gps` | warn | 站體 GPS 分級 Bad/Miss | 方位計算會偏 |
+| `servo_fault` | error | `servoPwmReady == false` | 雲台沒有反應 |
+| `mount_uncal` | warn | 未鎖定 `mount_offset` | 自動追蹤不能用 |
+| `mag_uncal` | warn | 磁力計在線但未校正 | 被撞動後會修反方向 |
+| `pose_moved` | warn | `pose_err_deg` ≥ 2° | 站體被轉動過 |
+
+**濕度為什麼要看基準而不是絕對值**：海邊空氣本來就 80% 起跳，封盒時關進潮濕空氣是常態，
+只用絕對門檻會整天誤報。進水真正的特徵是「相對開機值單調上升」，所以兩條規則並用：
+絕對值破 90% 直接判定，其餘看相對開機第一筆讀數的升幅。
 
 | 欄位 | 說明 |
 |---|---|
@@ -304,9 +391,15 @@ GPS 訊號品質、LoRa 訊號統計、Servo 校正狀態。
 | `health.reset_reason` | ESP 重啟原因代碼 |
 | `health.rx_error` | LoRa 接收錯誤碼累計 |
 | `servo.angle` | Servo 目前角度（0–180°）|
+| `servo.target` | 追蹤時的目標角度 |
 | `servo.mode` | `idle` / `manual` / `tracking` / `paused` |
 | `servo.calibrated` | 是否已鎖定 `mount_offset` |
+| `servo.pwm_ok` | LEDC PWM 是否正常；`false` 代表雲台完全無法控制 |
 | `servo.mount_offset_deg` | Servo→世界座標安裝偏移角 |
+| `servo.cal_heading` | 鎖定 `mount_offset` 當下的站體航向，`null` = 未校正 |
+| `servo.pose_delta_deg` | 現在的航向與 `cal_heading` 的差 |
+| `servo.pose_err_deg` | 該姿態差隱含的瞄準誤差上界 |
+| `alerts[]` | 現場提醒，見上一節 |
 | `mag.online` | 磁力計（QMC6310）是否在線 |
 | `mag.heading` | 攝影站板子羅盤航向（度），`-1` = 無效 |
 
@@ -383,11 +476,34 @@ mount_offset = 地標方位 − heading + 目前 servo 角度
 
 錯誤：`400`（缺參數 / 座標超出範圍）、`409`（`need server GPS fix`）。
 
+### 磁偏角：整個系統都不需要
+
+早期有過「朝向法」「方位角法」兩種讓操作者手動輸入方位的形式，已經**移除**：手工對方位
+是 2~5° 的誤差，還多一個磁北／真北搞錯就靜靜偏 4~5° 的風險，換來的只是省下 30 秒照準。
+
+因此磁偏角在韌體裡**完全沒有入口**：地標的方位由座標算出（本來就是真方位），
+而磁力計自己的零點永遠不需要它——追蹤公式只用 heading 的**差值**，絕對值被
+`mount_offset` 吸收掉了。羅盤也不再出現在任何流程裡。
+
+### 鎖定時用的 heading
+
+回應帶 `method`（固定為 `landmark`）、`heading`（實際鎖進去的 heading）與
+`heading_samples`。
+
+heading 取的是**最近 5 秒的向量平均**（`MAG_AVG_WINDOW` = 25 筆 @ 5 Hz），不是按下瞬間
+那一筆：一次取樣的雜訊會被寫成永久存在 NVS 的常數。向量平均而非角度平均，因為角度在
+360/0 交界無法平均。這只對零均值雜訊有效——hard-iron、servo 鋼齒輪的 soft-iron、傾斜
+都是確定性誤差，平均多久都不會消失。
+
 ## `/api/log`
 
 攝影站的滾動執行紀錄。韌體把所有 log 同時寫到 USB 序列埠和一個 **4 KB 環形緩衝**，
-網頁「紀錄」分頁可直接看——機器架在沙灘腳架上時不可能接筆電讀序列埠，而
+[`GET /log`](#get-log) 那頁可直接看——機器架在沙灘腳架上時不可能接筆電讀序列埠，而
 **espota 只上傳韌體、不提供任何 log**。
+
+> 收包**不是**一包一行：那樣 4 KB 會在約 16 秒內被洗完。RX 改成累積後每 60 秒一行統計
+> （`[SERVER] RX 60s | pkt=59/60 (98%) ... `，含掉包率、RSSI/SNR 的 min/avg/max、雙方
+> GPS、距離方位、servo 與模式），所以同一個緩衝大約能留 30 分鐘以上。
 
 ```
 GET  /api/log?from=<絕對位移>   取得該位移之後的新內容
@@ -404,7 +520,9 @@ POST /api/log                   清除緩衝
 位移是單調遞增的總位元組數，所以前端輪詢只會拿到新內容。裝置重開後 `logTotal` 歸零、
 位移倒退，此時一樣回 `X-Log-Dropped: 1` 並從頭給起。
 
-> 前端只在「紀錄」分頁可見時才輪詢（每 2 秒），因為 ESP32 的 WebServer 一次只服務一個連線。
+> `/log` 那頁只在**瀏覽器分頁在前景時**才輪詢（每 2 秒，靠 `visibilitychange` 起停），
+> 因為 ESP32 的 WebServer 一次只服務一個連線；忘在背景的紀錄分頁會一直跟雷達分頁的
+> 1 Hz `/api/track` 搶連線。
 
 ## `/api/mag/calibrate`
 
@@ -416,23 +534,48 @@ POST /api/mag/calibrate?action=cancel 中止
 GET  /api/mag/calibrate              查詢進度
 ```
 
-開始後把**整台機器水平慢慢轉一整圈**。韌體以 20 Hz 取樣，每當向量轉過 2° 收一筆
-（最多 180 筆），並以 36 個 10° 的分格統計涵蓋率；收滿 34/36 格就自動做最小平方圓擬合，
-圓心即為 hard-iron 偏移，寫入 NVS。逾時 120 秒。
+開始後把**整台機器順時針（從上往下看）慢慢轉一整圈**。韌體以 20 Hz 取樣，每當向量轉過
+2° 收一筆（最多 180 筆，三軸都存），並以 36 個 10° 的分格統計涵蓋率；收滿 34/36 格就自動
+做最小平方圓擬合，圓心即為 hard-iron 偏移，寫入 NVS。逾時 120 秒。
+
+這一圈同時決定**板子怎麼擺**：三軸中「轉一圈幾乎不變」的那一軸就是沿著世界垂直方向的
+軸，另兩軸就是水平面，heading 只由那兩軸算。所以板子平放、立起、側立都可以（見
+[hardware.md](hardware.md) 的擺放要求）。軸對的順序取循環序（`axisA × axisB = +up`），
+若這一圈的角度累積是負的就把兩軸互換——也就是說**旋轉方向決定 heading 的正負號**，
+轉反了 heading 會反向（log 會用磁傾角交叉檢查並警告，但以旋轉方向為準）。
+
+涵蓋率每收到一筆就用**目前選定的平面重算全部樣本**，而不是只把新分格 OR 進去：
+最初幾度的移動可能指向錯的平面，那些殘留的分格會讓半圈被誤判成整圈。
+
+**不必剛好轉 360°**：完成條件是 34/36 格（≈340°）。多轉、來回修、中途停手都可以——
+取樣緩衝滿了會**折半抽稀**（有效間隔 2°→4°→8°，仍細於 10° 的分格）而不是停止收樣，
+所以手轉的回頭晃動不會把預算吃光導致進度條永遠卡住。**速度不必平滑**（忽快忽慢、停頓都可以），只要淨方向一致；
+下限是別快到 2 秒一圈（20 Hz 取樣，快過 200°/s 才會跳過 10° 的分格），建議 10~30 秒。
 
 ```json
 {"state":"done","online":true,"coverage_pct":100,"samples":178,"calibrated":true,
- "residual_deg":0.82,"field_gauss":0.3714,"offset_x":0.0213,"offset_y":-0.0147,
- "heading":47.2,"error":""}
+ "residual_deg":0.82,"ellipse_deg":0.31,"scatter_deg":0.76,"sweep_deg":358,
+ "field_gauss":0.3714,"axes":"X,Y",
+ "offset_a":0.0213,"offset_b":-0.0147,"heading":47.2,"error":""}
 ```
 
 | 欄位 | 說明 |
 |---|---|
 | `state` | `idle` / `collecting` / `done` / `failed` |
 | `coverage_pct` | 轉圈涵蓋率（僅 `collecting` 時有意義）|
-| `residual_deg` | 擬合殘差換算成 heading 誤差。**< 1° = 安裝乾淨**；好幾度代表 soft-iron（servo 鋼齒輪），該把板子移遠 |
+| `residual_deg` | 總殘差換算成 heading 誤差。**< 1° = 安裝乾淨** |
+| `ellipse_deg` | 殘差裡的**系統性**部分：軌跡是橢圓而不是圓（soft iron／板子沒擺正交／轉的時候整體傾斜）。值＝橢圓造成的最大 heading 誤差 `atan(amp/r)`。轉得再平滑都不會降，只能移動板子 |
+| `scatter_deg` | 扣掉橢圓後剩下的**隨機**部分：轉動中的晃動、震動、servo 電流、感測器雜訊。這個大就改在腳架雲台上慢慢轉 |
+| `sweep_deg` | 上次校正實際轉過的淨角度，用來確認那一圈是否乾淨 |
 | `field_gauss` | 擬合出的水平磁場強度。台灣應該接近 **0.37 G**，差太多代表有強烈局部干擾 |
+| `axes` | 判定出的水平面兩軸，例如 `X,Y`（平放）或 `Z,X`（立起）。未校正時是預設的 `X,Y` |
+| `offset_a` / `offset_b` | 上述兩軸的 hard-iron 偏移（Gauss），heading 前先減掉 |
 | `error` | `field over range — board is too close to the servo` / `no rotation detected` / `incomplete turn` / `circle fit failed` |
+
+> `incomplete turn`（或進度條卡在低百分比跑不完）最常見的原因不是轉得不夠，而是**換過
+> 擺法卻沿用舊校正**之外的另一面：轉的圈不夠完整。進度條算的是**轉過角度的涵蓋率**
+> （36 格要滿 34 格 = 94%），所以來回擺動、只轉 3/4 圈、或中途停手都會停在那個數字。
+> NVS 的校正版本是 `MAG_CAL_VERSION`（現為 2，v2 才存軸對），升版後舊值自動失效。
 
 > 沒有 hard-iron 校正時，heading 是真實方位角被正弦扭曲後的結果（板上 18650 的鍍鎳鋼殼
 > 就足以造成 20~30° 且**隨面向而變**的誤差）。這正是為什麼未校正時 `mount_offset` 換個

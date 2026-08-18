@@ -27,6 +27,18 @@ LCD顯示: 連線狀態 / 電量 / 濕度 / GPS狀態 / 監控頁面IP
 
 `upload_port` / `monitor_port` 依作業系統手動指定即可，`platformio.ini` 裡每個 environment 下面都留了 Windows（`COMx`）與 Linux（`/dev/ttyACM*` 或 `/dev/ttyUSB*`）的範例，要用哪個就拿掉那兩行前面的 `;`、其餘保持註解。同時插兩塊板時，先用 `ls /dev/tty*`（Linux）確認各板實際對應的裝置名稱，再分別填進 `tbeam-client` / `tbeam-server` 對應的 environment。
 
+## 跑測試
+
+指向計算（角度環繞、方位角、磁力計圓擬合）與現場提醒的門檻都抽在
+`include/geo_math.h` / `include/alerts.h`，兩個檔案都不依賴 Arduino，所以可以在筆電上直接驗：
+
+```bash
+pio test -e native
+```
+
+這些函式的共同特性是「算錯了不會有任何錯誤訊息」，而在板子上驗證它們的唯一辦法是人站在
+腳架旁邊轉一圈，所以特別值得有測試。
+
 ## Server 透過 Wi-Fi 更新（PlatformIO espota）
 
 第一次必須用 `tbeam-server` 經 USB 燒錄，讓板子取得 OTA 功能。之後電腦與 Server 連在同一個手機熱點時，可使用 `tbeam-server-ota`：

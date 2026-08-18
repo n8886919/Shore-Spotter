@@ -3,6 +3,9 @@
 - `docs/features.md` — 韌體功能/流程/狀態/OLED 顯示
 - `docs/hardware.md` — 腳位與接線
 - `include/protocol.h` — client/server 共用的 LoRa 封包定義
+- `include/geo_math.h` — 純數學（角度/方位/圓擬合/電量/GPS 分級），不依賴 Arduino
+- `include/alerts.h` — 現場提醒的門檻與分級，不依賴 Arduino
+- `test/` — `pio test -e native` 在筆電上跑的單元測試（測上面兩個 header）
 - `include/wifi_config.h` — 手機熱點 SSID/密碼設定（SERVER 開機連線用）
 - `include/web_ui.h` — 內嵌監控頁
 

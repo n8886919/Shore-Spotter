@@ -7,9 +7,11 @@
 // the phone also has mobile data; offline it falls back to tracks + scale bar.
 //
 // Operator flow:
-//   One-time, on the 資訊 page: magnetometer hard-iron calibration (spin the rig
-//   through one turn), then landmark calibration (centre a distant landmark in
-//   the viewfinder and paste its coordinates). Both are solo, and together they
+//   One-time, on the 資訊 page: magnetometer hard-iron calibration (turn the rig
+//   through one clockwise circle — which also tells the firmware which way the
+//   board is mounted), then landmark calibration (centre a distant landmark in
+//   the viewfinder and paste its coordinates — the only way to lock the aim, and
+//   the only one that needs no compass). Both are solo, and together they
 //   make mount_offset a constant that survives being packed up and set down at
 //   another spot — so later sessions need no aiming at all.
 //   手動 (Manual): drag the overlaid slider to aim the camera manually.
@@ -18,7 +20,13 @@
 // Layout: full-height, no-scroll, two top tabs — 雷達 (radar/map canvas with the
 //   雷達/地圖 + 手動/自動 toggles and the slider overlaid at the bottom) and
 //   資訊 (live telemetry grid). The canvas auto-sizes to its container, and the
-//   surfer marker carries a GPS-status tag (sats / HDOP / Good-Normal-Bad).
+//   surfer marker carries a GPS-status tag (衛星 少/普通/好, 預期精度 ±N m,
+//   Good/OK/Bad).
+// GPS is reported in operator terms, not receiver terms: the satellite count
+//   becomes 少/普通/好 and HDOP becomes 預期精度 in metres (see accM() below).
+// The rolling firmware log is no longer a tab here — the 資訊 page has a button
+//   that opens WEB_LOG_HTML (served at /log) in a separate browser tab, so it
+//   can be watched next to the radar instead of replacing it.
 static const char WEB_UI_HTML[] = R"rawlit(
 <!DOCTYPE html>
 <html lang="zh-Hant">
@@ -31,6 +39,9 @@ static const char WEB_UI_HTML[] = R"rawlit(
 <meta name="theme-color" content="#0d1117">
 <meta name="apple-mobile-web-app-title" content="Shore Spotter">
 <link rel="manifest" href="/manifest.json">
+<!-- 空的 icon：沒有這行瀏覽器會自動去要 /favicon.ico，多一趟往返打在只能同時
+     服務一個連線的 ESP32 上。 -->
+<link rel="icon" href="data:,">
 <title>Shore Spotter</title>
 <style>
 :root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;
@@ -99,12 +110,6 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .hint3{display:block;margin-top:6px;font-size:11px;color:var(--mut);line-height:1.45}
 .bar{height:6px;border-radius:3px;background:#21262d;overflow:hidden;margin-top:8px}
 .bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
-#pgLog{overflow:hidden}
-#logBox{flex:1;min-height:0;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-all;
-  font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--fg)}
-.logBar{flex:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.logBar label{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:5px}
-.logBar button{flex:0 0 auto;min-width:72px}
 .r b{font-variant-numeric:tabular-nums}
 .cmp{width:100%;border-collapse:collapse;font-size:13px}
 .cmp th,.cmp td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:right;
@@ -112,13 +117,35 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .cmp tr:last-child td{border-bottom:0}
 .cmp th:first-child,.cmp td:first-child{text-align:left;color:var(--mut);font-weight:400}
 .cmp thead th{color:var(--fg);font-weight:700}
+/* 現場提醒訊息列：釘在最上方、兩個分頁都看得到。內容來自 /api/status 的
+   alerts 陣列（措辭與門檻都在韌體端，見 main.cpp 的 appendAlertsJson）。 */
+.alertBar{flex:none;display:none;flex-direction:column;background:var(--card);
+  border-bottom:1px solid var(--line)}
+.alertBar.on{display:flex}
+.ahead{display:flex;align-items:center;gap:8px;padding:10px 12px;font-size:13px;
+  font-weight:700;cursor:pointer;-webkit-user-select:none;user-select:none}
+.ahead .chev{margin-left:auto;color:var(--mut);font-size:11px;font-weight:400}
+.alertBar.err .ahead{color:var(--bad)}
+.alertBar.warn .ahead{color:var(--warn)}
+.alist{display:flex;flex-direction:column;gap:1px;max-height:34vh;overflow:auto;
+  border-top:1px solid var(--line)}
+.alertBar.fold .alist{display:none}
+.al{display:flex;gap:9px;padding:9px 12px;background:var(--bg)}
+.al .dot{flex:none;width:8px;height:8px;border-radius:50%;margin-top:5px}
+.al.error .dot{background:var(--bad)}
+.al.warn .dot{background:var(--warn)}
+.al .txt{min-width:0}
+.al .t{font-size:13px;font-weight:700;margin-bottom:3px}
+.al.error .t{color:var(--bad)}
+.al.warn .t{color:var(--warn)}
+.al .d{font-size:12px;color:var(--mut);line-height:1.55}
 </style>
 </head>
 <body>
+<div id="alertBar" class="alertBar"></div>
 <nav class="tabs">
   <button id="tabRadar" class="on" type="button">雷達</button>
   <button id="tabInfo" type="button">資訊</button>
-  <button id="tabLog" type="button">紀錄</button>
 </nav>
 
 <main>
@@ -164,7 +191,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
         <tbody>
           <tr><td>定位</td><td id="sFix">--</td><td id="cFix">--</td></tr>
           <tr><td>衛星</td><td id="sSat">--</td><td id="cSat">--</td></tr>
-          <tr><td>HDOP</td><td id="sHdop">--</td><td id="cHdop">--</td></tr>
+          <tr><td>預期精度</td><td id="sAcc">--</td><td id="cAcc">--</td></tr>
           <tr><td>電量</td><td id="sBattV">--</td><td id="cBattV">--</td></tr>
           <tr><td>溫度</td><td id="sTemp">--</td><td id="cTemp">--</td></tr>
           <tr><td>濕度</td><td id="sHum">--</td><td id="cHum">--</td></tr>
@@ -197,37 +224,52 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
       <div class="sub">1 · 磁力計 hard-iron</div>
       <div class="r"><span>狀態</span><b id="mcState">--</b></div>
-      <div class="r"><span>擬合殘差</span><b id="mcRes">--</b></div>
+      <div class="r"><span>擬合殘差（總）</span><b id="mcRes">--</b></div>
+      <div class="r"><span>├ 橢圓（soft iron／不正交）</span><b id="mcEll">--</b></div>
+      <div class="r"><span>└ 散射（晃動／雜訊）</span><b id="mcSct">--</b></div>
       <div class="r"><span>磁場強度</span><b id="mcFld">--</b></div>
+      <div class="r"><span>上次轉過角度</span><b id="mcSwp">--</b></div>
+      <div class="r"><span>水平面軸</span><b id="mcAxes">--</b></div>
       <div class="bar"><i id="mcBar"></i></div>
       <div class="calRow"><button id="btnMagCal" type="button">開始磁力計校正</button></div>
-      <span class="hint3">按下後把整台機器放腳架上，<b>慢慢水平轉一整圈</b>（15~30 秒）。
-        校正值跟著板子走，換浪點不用重做。殘差 &lt;1° 代表安裝位置乾淨；
-        好幾度表示 servo 的鋼齒輪在干擾，應該把板子移遠而不是將就。</span>
+      <span class="hint3">按下後把整台機器放腳架上，<b>順時針（從上往下看）水平轉一整圈</b>。
+        <b>不必剛好 360°</b>——進度條是 10° 分格的覆蓋率，滿 34/36 格（≈340°）就會自己完成，
+        多轉、來回修、中途停手都沒關係。<b>速度也不必平滑</b>，忽快忽慢、停一下都行，只要淨方向一致。
+        唯一的下限是別快到 <b>2 秒一圈</b>（取樣 20 Hz，快過 200°/s 才會跳格）；
+        建議 10~30 秒。
+        真正會傷品質的是<b>轉的時候板子跟著晃</b>——要在腳架雲台上轉，不要手捧著轉。
+        板子<b>平放或立起來都可以</b>，這一圈同時判斷哪兩軸是水平面（見「水平面軸」）；
+        但<b>方向要對</b>，反了 heading 的正負會相反。
+        殘差看下面兩項哪個大：<b>橢圓</b>大 = soft iron（servo 鋼齒輪）或板子沒擺正交，
+        轉得再漂亮也不會變好，要移動板子；<b>散射</b>大 = 轉的時候在晃或吃到 servo 電流。</span>
 
-      <div class="sub" style="margin-top:16px">2 · 地標校正（鎖定 mount_offset）</div>
+      <div class="sub" style="margin-top:16px">2 · 地標校正（鎖定 mount_offset，做一次就永久有效）</div>
       <div class="r"><span>目前 mount_offset</span><b id="mcOff">--</b></div>
+      <div class="r"><span>與校正姿勢的方位差</span><b id="mcPose">--</b></div>
+      <div class="r"><span>└ 該姿勢差造成的指向誤差</span><b id="mcPoseErr">--</b></div>
+
       <div class="calRow">
         <input id="lmCoord" type="text" placeholder="25.033611, 121.565000">
         <button id="btnLmCal" type="button">用目前鏡頭指向校正</button>
       </div>
       <span class="hint3">servo 設 90°，從<b>觀景窗</b>把 1 km 以外的地標對到畫面正中央，
-        貼上該地標座標（Google Maps 右鍵可複製）再按鈕。不需要追蹤器在場、不需要第二個人。
-        先做完步驟 1，否則這個值換場地就失效。</span>
+        貼上該地標座標（Google Maps 右鍵可複製）再按鈕。需要攝影站有 GPS fix，
+        但不需要追蹤器在場、不需要第二個人，也<b>完全不涉及羅盤與磁偏角</b>
+        （座標算出來的就是真方位），照準精度 0.1° 級。
+        <b>盡量選跟浪區同方向的地標</b>（外海的燈塔、防波堤端、離岸礁、遠處岬角）：
+        校正姿勢與拍攝姿勢的方位差越小，上面那個「姿勢差造成的指向誤差」就越接近 0，
+        因為磁力計的橢圓誤差會自己抵銷掉。先做完步驟 1。</span>
+
     </div>
     <div class="card" style="flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <button id="btnClear" type="button">清除軌跡</button>
       <button id="btnExport" type="button">匯出 GPX（可上傳 Strava）</button>
       <span id="exportHint" class="hint2" style="margin-left:0">網頁最多保留過去 2 小時軌跡，雷達／地圖仍只顯示最近 5 分鐘；匯出後會自動清空。GPX 檔請自行到 Strava 網頁上傳</span>
     </div>
-  </section>
-  <section id="pgLog" class="page">
-    <div class="card logBar">
-      <button id="btnLogClear" type="button">清除</button>
-      <label><input id="logFollow" type="checkbox" checked> 自動捲到最新</label>
-      <span id="logStat" class="hint2">--</span>
+    <div class="card" style="flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <button id="btnLog" type="button">開啟執行紀錄（新分頁）</button>
+      <span class="hint2" style="margin-left:0">韌體的滾動 log（4 KB 環形緩衝）。開在另一個分頁，雷達畫面就不用讓位；那個分頁切到背景時會自動停止輪詢，避免和這裡搶 ESP32 的單一連線</span>
     </div>
-    <pre id="logBox" class="card"></pre>
   </section>
 </main>
 
@@ -235,7 +277,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
 <script>
 var $=function(id){return document.getElementById(id);};
-var last={track:null,status:null};
+var last={track:null,status:null,alerts:[]};
 var dragging=false;
 var servoPendingAngle=null;
 var servoSendTimer=0;
@@ -268,13 +310,48 @@ function post(url){
 // ---- controls ----
 // Send at most one request at a time and collapse rapid slider events to the
 // newest angle. This keeps motion responsive without flooding the ESP32.
+//
+// The timeout matters more than it looks. The ESP's web server serves one client
+// at a time and closes the connection per request, so an aim POST can be left
+// hanging while /api/track or /api/log holds the socket. Without a timeout that
+// single hung fetch leaves servoSending stuck true for good: every later drag is
+// dropped in silence, the slider and the angle readout still move, and the
+// camera never does. Only a page reload brings it back — which is exactly what
+// "manual mode stopped working" looks like from the beach.
+var SERVO_SEND_TIMEOUT_MS=2000;
+var lastServoWarn='',lastServoWarnMs=0;
+// Aim failures used to be swallowed whole, so a firmware 409 ("pause tracking
+// first") or 503 ("servo PWM unavailable") was indistinguishable from a dead
+// slider. Show the reason, but collapse repeats — one drag can fail 20 times.
+function servoWarn(m){
+  var t=Date.now();
+  if(m===lastServoWarn&&t-lastServoWarnMs<5000)return;
+  lastServoWarn=m;lastServoWarnMs=t;toast(m);
+}
+// Always settles, never rejects, so the queue below cannot deadlock.
+function postServoAngle(v){
+  var ac=(typeof AbortController!=='undefined')?new AbortController():null;
+  var timer=setTimeout(function(){if(ac)ac.abort();},SERVO_SEND_TIMEOUT_MS);
+  return fetch('/api/servo?angle='+encodeURIComponent(v),
+               ac?{method:'POST',signal:ac.signal}:{method:'POST'})
+    .then(function(r){
+      return r.json().catch(function(){return{};}).then(function(j){
+        if(!r.ok||j.ok===false)servoWarn(j.error||('HTTP '+r.status));
+      });
+    })
+    .catch(function(e){
+      servoWarn(e&&e.name==='AbortError'?'角度指令逾時，岸上端沒回應'
+                                        :'角度指令送不出去，檢查 WiFi');
+    })
+    .then(function(){clearTimeout(timer);});
+}
 function sendPendingServoAngle(){
   servoSendTimer=0;
   if(servoSending||servoPendingAngle===null)return;
   var v=servoPendingAngle;
   servoPendingAngle=null;
   servoSending=true;
-  post('/api/servo?angle='+encodeURIComponent(v)).catch(function(){}).then(function(){
+  postServoAngle(v).then(function(){
     servoSending=false;
     if(servoPendingAngle!==null){
       if(servoDragEnded)sendPendingServoAngle();
@@ -326,19 +403,15 @@ function showPage(p){
   page=p;
   $('tabRadar').classList.toggle('on',p==='radar');
   $('tabInfo').classList.toggle('on',p==='info');
-  $('tabLog').classList.toggle('on',p==='log');
   $('pgRadar').classList.toggle('on',p==='radar');
   $('pgInfo').classList.toggle('on',p==='info');
-  $('pgLog').classList.toggle('on',p==='log');
   if(p==='radar')redraw();
-  // Only poll the log while its tab is visible — no point spending the ESP's
-  // single-client web server on it otherwise.
-  if(p==='log'){pumpLog();if(!logTimer)logTimer=setInterval(pumpLog,2000);}
-  else if(logTimer){clearInterval(logTimer);logTimer=0;}
 }
 $('tabRadar').onclick=function(){showPage('radar');};
 $('tabInfo').onclick=function(){showPage('info');};
-$('tabLog').onclick=function(){showPage('log');};
+// The log lives on its own page (/log) in a separate browser tab, so watching it
+// no longer means giving up the radar.
+$('btnLog').onclick=function(){window.open('/log','_blank');};
 function fitCanvas(){
   var c=$('radar'),w=Math.round(c.clientWidth),h=Math.round(c.clientHeight);
   if(w>0&&h>0&&(c.width!==w||c.height!==h)){c.width=w;c.height=h;}
@@ -425,6 +498,25 @@ function applyMode(sv){
   }
 }
 
+// HDOP is a dimensionless multiplier, which nobody on a beach can act on.
+// Horizontal accuracy ~= HDOP x UERE, and 2.5 m is the usual 1-sigma UERE for a
+// consumer single-band module like the ATGM336H, so HDOP 1.2 reads as +-3 m.
+// The wire format still carries HDOP (protocol.h unchanged) — this is display
+// only, so the number stays comparable with any other GPS tool.
+var UERE_M=2.5;
+function accM(hdop){return hdop>=0?hdop*UERE_M:null;}
+// Whole metres only: UERE is a rule of thumb, so a decimal would claim accuracy
+// the estimate does not have.
+function fmtAcc(hdop){var a=accM(hdop);
+  return a==null?'--':('\u00b1'+Math.round(a)+' m');}
+// Satellite count as words for the same reason: 8 vs 11 changes no decision,
+// "夠不夠" does. Thresholds match gpsGrade() below so the two never disagree.
+function satWord(sats){
+  if(sats<0)return '--';
+  if(sats>=8)return '好';
+  if(sats>=6)return '普通';
+  return '少';
+}
 // GPS quality grade (same thresholds as the firmware, shared by both ends).
 function gpsGrade(sats,hdop){
   if(sats<0||hdop<0||sats<=0)return 'miss';
@@ -438,7 +530,7 @@ function drawGpsTag(x,px,py,W,H,title,sats,hdop){
   var g=gpsGrade(sats,hdop);
   var col=g==='good'?'#3fb950':g==='ok'?'#d29922':g==='bad'?'#f85149':'#8b949e';
   var l1=title;
-  var l2=(sats>=0?('sats '+sats):'sats --')+'  HDOP '+(hdop>=0?hdop.toFixed(1):'--');
+  var l2='衛星 '+satWord(sats)+'   '+fmtAcc(hdop);
   var l3=g==='good'?'GPS Good':g==='ok'?'GPS OK':g==='bad'?'GPS Bad':'GPS Miss';
   x.font='11px system-ui';x.textBaseline='alphabetic';
   var bw=Math.max(x.measureText(l1).width,x.measureText(l2).width,
@@ -531,18 +623,22 @@ function refresh(){
     var dist=geoDist(d.server,d.client);
     // --- Server block ---
     $('sFix').textContent=d.server.fix?'有':'無';
-    $('sSat').textContent=d.server.satellites>=0?d.server.satellites:'--';
-    $('sHdop').textContent=d.server.hdop>=0?d.server.hdop.toFixed(1):'--';
+    $('sSat').textContent=satWord(d.server.satellites);
+    $('sAcc').textContent=fmtAcc(d.server.hdop);
     $('sBattV').textContent=(d.server.batt_pct>=0?d.server.batt_pct+'%':'--')+
       (d.server.charging?' \u26a1':'');
     $('sTemp').textContent=d.server.temp_c==null?'--':d.server.temp_c+'°C';
     $('sHum').textContent=d.server.humidity_pct==null?'--':d.server.humidity_pct+'%';
     $('sHdg').textContent=d.mag.online&&d.mag.heading>=0?d.mag.heading.toFixed(0)+'°':'--';
     $('mcOff').textContent=d.servo.calibrated?d.servo.mount_offset_deg.toFixed(1)+'°':'未校正';
+    $('mcPose').textContent=d.servo.pose_delta_deg==null?'--':
+      (d.servo.pose_delta_deg>0?'+':'')+d.servo.pose_delta_deg.toFixed(0)+'°';
+    $('mcPoseErr').textContent=d.servo.pose_err_deg==null?'--':
+      '\u2264'+d.servo.pose_err_deg.toFixed(2)+'°';
     // --- Client block ---
     $('cFix').textContent=d.client.fix?'有':'無';
-    $('cSat').textContent=d.client.satellites>=0?d.client.satellites:'--';
-    $('cHdop').textContent=d.client.hdop>=0?d.client.hdop.toFixed(1):'--';
+    $('cSat').textContent=satWord(d.client.satellites);
+    $('cAcc').textContent=fmtAcc(d.client.hdop);
     $('cDist').textContent=(d.server.fix&&d.client.fix&&dist!=null)?dist.toFixed(0)+' m':'--';
     $('cBrg').textContent=d.bearing>=0?d.bearing.toFixed(0)+'°':'--';
     $('cLink').textContent=d.linked?'ONLINE':'離線';
@@ -554,9 +650,45 @@ function refresh(){
   }).catch(function(){}).then(function(){refreshing=false;});
 }
 
+// ---- 現場提醒 -------------------------------------------------------------
+// 判斷與措辭全在韌體（main.cpp 的 appendAlertsJson / include/alerts.h），這裡只
+// 負責畫。好處是 OLED 之後要顯示同一組提醒時不必再實作一次規則。
+var alertsFold=false, alertsSig='';
+function escHtml(t){
+  return String(t).replace(/[&<>"]/g,function(c){
+    return c==='&'?'&amp;':c==='<'?'&lt;':c==='>'?'&gt;':'&quot;';});
+}
+function renderAlerts(list){
+  var bar=$('alertBar');
+  list=list||[];
+  // 每 3 秒重畫一次會把使用者正在捲動的清單捲回頂端，所以內容沒變就不動它。
+  var sig=alertsFold+'|'+list.map(function(a){return a.id+a.level+a.detail;}).join('|');
+  if(sig===alertsSig)return;
+  alertsSig=sig;
+  if(!list.length){bar.className='alertBar';bar.innerHTML='';return;}
+  var nErr=0;
+  for(var i=0;i<list.length;i++)if(list[i].level==='error')nErr++;
+  var head='<div class="ahead"><span>'+(nErr?'⛔':'⚠')+'</span><span>'+
+    (nErr?nErr+' 項要立刻處理'+(list.length>nErr?('，另有 '+(list.length-nErr)+' 項提醒'):'')
+        :list.length+' 項提醒')+
+    '</span><span class="chev">'+(alertsFold?'展開':'收合')+'</span></div>';
+  var items='';
+  for(var j=0;j<list.length;j++){
+    var a=list[j];
+    items+='<div class="al '+(a.level==='error'?'error':'warn')+'">'+
+      '<span class="dot"></span><div class="txt"><div class="t">'+escHtml(a.title)+
+      '</div><div class="d">'+escHtml(a.detail)+'</div></div></div>';
+  }
+  bar.className='alertBar on '+(nErr?'err':'warn')+(alertsFold?' fold':'');
+  bar.innerHTML=head+'<div class="alist">'+items+'</div>';
+  bar.firstChild.onclick=function(){alertsFold=!alertsFold;alertsSig='';renderAlerts(last.alerts);};
+}
+
 function refreshStatus(){
   fetch('/api/status').then(function(r){return r.json();}).then(function(s){
     last.status=s;
+    last.alerts=s.alerts||[];
+    renderAlerts(last.alerts);
     $('sRssi').textContent=s.lora.rssi?s.lora.rssi.toFixed(0)+' dBm':'--';
     $('sSnr').textContent=s.lora.snr!=null?s.lora.snr.toFixed(1)+' dB':'--';
     $('sDrop').textContent=(s.lora.drop_rate*100).toFixed(1)+'%';
@@ -805,36 +937,6 @@ function drawMap(d,dist){
 
 showPage('radar');
 refresh();refreshStatus();
-// ---- log ----
-// The firmware keeps a 4 KB ring buffer and hands back only what we have not
-// seen, keyed on an absolute byte offset, so polling stays cheap.
-var logNext=0, logTimer=0, logBusy=false;
-function pumpLog(){
-  if(logBusy)return;
-  logBusy=true;
-  fetch('/api/log?from='+logNext).then(function(r){
-    var n=parseInt(r.headers.get('X-Log-Next')||'0',10);
-    var dropped=r.headers.get('X-Log-Dropped')==='1';
-    return r.text().then(function(t){return{t:t,n:n,d:dropped};});
-  }).then(function(o){
-    var box=$('logBox');
-    // Follow only if already pinned to the bottom, so reading scrollback is not
-    // yanked away every 2 s.
-    var atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
-    if(o.d&&logNext!==0)box.textContent+='\n--- 略過部分紀錄（緩衝已滿或裝置重開）---\n';
-    if(o.t)box.textContent+=o.t;
-    if(box.textContent.length>60000)box.textContent=box.textContent.slice(-40000);
-    logNext=o.n;
-    $('logStat').textContent=o.n+' bytes';
-    if($('logFollow').checked&&atEnd)box.scrollTop=box.scrollHeight;
-  }).catch(function(){}).then(function(){logBusy=false;});
-}
-$('btnLogClear').onclick=function(){
-  post('/api/log').then(function(){
-    $('logBox').textContent='';logNext=0;pumpLog();
-  }).catch(function(){});
-};
-
 // ---- calibration ----
 var magPollTimer=0;
 function renderMagCal(m){
@@ -843,7 +945,11 @@ function renderMagCal(m){
   else if(m.state==='failed'&&m.error)st='失敗：'+m.error;
   $('mcState').textContent=st;
   $('mcRes').textContent=m.residual_deg==null?'--':m.residual_deg.toFixed(2)+'°';
+  $('mcEll').textContent=m.ellipse_deg==null?'--':m.ellipse_deg.toFixed(2)+'°';
+  $('mcSct').textContent=m.scatter_deg==null?'--':m.scatter_deg.toFixed(2)+'°';
+  $('mcSwp').textContent=m.sweep_deg?Math.round(m.sweep_deg)+'°':'--';
   $('mcFld').textContent=m.field_gauss==null?'--':m.field_gauss.toFixed(3)+' G';
+  $('mcAxes').textContent=m.calibrated?(m.axes||'--'):'未判定（預設 X,Y）';
   var pct=m.state==='collecting'?m.coverage_pct:(m.calibrated?100:0);
   $('mcBar').style.width=pct+'%';
   $('btnMagCal').textContent=m.state==='collecting'
@@ -855,7 +961,15 @@ function pollMagCal(){
     if(m.state==='collecting'){magPollTimer=setTimeout(pollMagCal,300);}
     else{
       magPollTimer=0;
-      if(m.state==='done')toast('磁力計校正完成，殘差 '+m.residual_deg.toFixed(2)+'°');
+      if(m.state==='done'){
+        toast('校正完成：殘差 '+m.residual_deg.toFixed(2)+'°（橢圓 '+
+          m.ellipse_deg.toFixed(2)+'° + 散射 '+m.scatter_deg.toFixed(2)+
+          '°），轉過 '+Math.round(m.sweep_deg)+'°，水平面軸 '+m.axes);
+        if(m.ellipse_deg>1&&m.ellipse_deg>2*m.scatter_deg)
+          setTimeout(function(){toast('橢圓為主：soft iron 或板子沒擺正交，轉得再順也沒用，要移動板子');},2800);
+        else if(m.scatter_deg>1&&m.scatter_deg>2*m.ellipse_deg)
+          setTimeout(function(){toast('散射為主：轉的時候板子在晃，改在腳架雲台上轉並保持水平');},2800);
+      }
       else if(m.state==='failed')toast('校正失敗：'+(m.error||'未知'));
     }
   }).catch(function(){magPollTimer=0;});
@@ -865,7 +979,7 @@ $('btnMagCal').onclick=function(){
   post('/api/mag/calibrate'+(busy?'?action=cancel':'')).then(function(m){
     renderMagCal(m);
     if(magPollTimer){clearTimeout(magPollTimer);magPollTimer=0;}
-    if(m.state==='collecting'){toast('開始轉圈：慢慢水平轉一整圈');pollMagCal();}
+    if(m.state==='collecting'){toast('開始轉圈：慢慢順時針水平轉一整圈');pollMagCal();}
   }).catch(function(){});
 };
 // Accepts "25.033611, 121.565000" — the exact format Google Maps copies.
@@ -881,6 +995,7 @@ $('btnLmCal').onclick=function(){
   }).catch(function(){});
 };
 
+refreshStatus();          // 提醒不要等到第一個 3 秒週期才出現
 setInterval(refresh,1000);
 setInterval(refreshStatus,3000);
 fetch('/api/mag/calibrate').then(function(r){return r.json();})
@@ -889,3 +1004,85 @@ fetch('/api/mag/calibrate').then(function(r){return r.json();})
 </body>
 </html>
 )rawlit";
+
+// Standalone log viewer served at /log, opened from the 資訊 page in its own
+// browser tab. It used to be a third tab inside WEB_UI_HTML, which meant reading
+// the log cost you the radar; a separate tab can sit next to it instead.
+//
+// The firmware keeps a 4 KB ring buffer and hands back only what this page has
+// not seen yet, keyed on an absolute byte offset, so polling stays cheap.
+// It polls only while the tab is actually on screen: the ESP32's WebServer
+// serves one connection at a time, so a forgotten background log tab would keep
+// stealing turns from the radar tab's 1 Hz /api/track.
+static const char WEB_LOG_HTML[] = R"loglit(
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<title>Shore Spotter · 紀錄</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#3b82f6}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif}
+body{height:100dvh;display:flex;flex-direction:column;overflow:hidden;padding:10px;gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.head{flex:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.head button{padding:9px 14px;border-radius:8px;border:1px solid var(--line);
+  background:#21262d;color:var(--fg);font-size:13px;font-weight:600;cursor:pointer;
+  font-family:inherit}
+.head button:hover{border-color:var(--acc)}
+.head label{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:5px}
+.head #stat{font-size:11px;color:var(--mut);margin-left:auto}
+#box{flex:1;min-height:0;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-all;
+  font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--fg)}
+</style>
+</head>
+<body>
+<div class="card head">
+  <button id="btnClear" type="button">清除</button>
+  <label><input id="follow" type="checkbox" checked> 自動捲到最新</label>
+  <span id="stat">--</span>
+</div>
+<pre id="box" class="card"></pre>
+
+<script>
+var $=function(id){return document.getElementById(id);};
+var next=0, timer=0, busy=false;
+function pump(){
+  if(busy)return;
+  busy=true;
+  fetch('/api/log?from='+next).then(function(r){
+    var n=parseInt(r.headers.get('X-Log-Next')||'0',10);
+    var dropped=r.headers.get('X-Log-Dropped')==='1';
+    return r.text().then(function(t){return{t:t,n:n,d:dropped};});
+  }).then(function(o){
+    var box=$('box');
+    // Follow only if already pinned to the bottom, so reading scrollback is not
+    // yanked away every 2 s.
+    var atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
+    if(o.d&&next!==0)box.textContent+='\n--- 略過部分紀錄（緩衝已滿或裝置重開）---\n';
+    if(o.t)box.textContent+=o.t;
+    if(box.textContent.length>60000)box.textContent=box.textContent.slice(-40000);
+    next=o.n;
+    $('stat').textContent=o.n+' bytes';
+    if($('follow').checked&&atEnd)box.scrollTop=box.scrollHeight;
+  }).catch(function(){}).then(function(){busy=false;});
+}
+function start(){if(!timer){pump();timer=setInterval(pump,2000);}}
+function stop(){if(timer){clearInterval(timer);timer=0;}}
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden)stop();else start();
+});
+$('btnClear').onclick=function(){
+  fetch('/api/log',{method:'POST'})
+    .then(function(){$('box').textContent='';next=0;pump();})
+    .catch(function(){});
+};
+start();
+</script>
+</body>
+</html>
+)loglit";
