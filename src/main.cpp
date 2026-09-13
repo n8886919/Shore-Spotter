@@ -14,14 +14,27 @@
 #include <U8g2lib.h>
 
 #include "protocol.h"  // shared LoRa wire protocol (client + server)
+#include "firmware_version.h"
 #include "geo_math.h"  // pure maths (angles / bearing / circle fit / grading)
+#include "tracking_policy.h"
+#include "loop_metrics.h"
+#include "gnss_snapshot.h"
+#include "lora_schedule.h"
+#include "async_lora_ack.h"
 
 #if defined(ROLE_SERVER)
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoOTA.h>
-#include <SensorQMC6310.hpp>  // SensorLib: QMC6310 magnetometer (station heading)
 #include "alerts.h"    // 現場提醒的門檻與分級
+#include "uart_servo_mode.h"  // UART input, shared with GPS tracking
+#include "servo_motion.h"
+#include "control_cadence.h"
+#include "command_freshness.h"
+#include "client_binding.h"
+#include "packet_diagnostics.h"
+#include "http_timing.h"
+#include "magnetic_declination.h"
 #include "web_icon.h"  // 分頁圖示（由 tools/make_icon.py 產生）
 #include "web_ui.h"
 #include "wifi_config.h"  // phone hotspot SSID / password (edit there)
@@ -73,7 +86,7 @@ constexpr int TX_POWER_MIN_DBM = 10;
 constexpr int TX_POWER_MAX_DBM = 22;
 constexpr uint32_t ATPC_EVAL_MS = 15000;
 
-constexpr uint32_t SEND_INTERVAL_MS = 1000;
+constexpr uint32_t SEND_INTERVAL_MS = 500;  // RF 2 Hz; GNSS epochs are measured separately
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000;  // battery + env packet rate
 // TELEMETRY_INTERVAL_MS is an exact multiple of SEND_INTERVAL_MS, so a telemetry
 // packet that is simply "due" always lands on top of a position packet and the
@@ -85,19 +98,9 @@ constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000;  // battery + env packet rate
 constexpr uint32_t TELEMETRY_SLOT_GUARD_MS = 80;
 constexpr uint32_t BATTERY_UPDATE_MS = 5000;
 
-// The server acknowledges every ACK_EVERY_N-th position packet instead of all
-// of them. An ACK is ~185 ms of airtime at SF9/CR4-5 and only the client
-// consumes it — for ATPC and link liveness, neither of which needs 1 Hz
-// resolution. Selection is by sequence number rather than a server-side counter
-// so a dropped packet cannot slide the schedule, and both ends agree on which
-// seq carries an ACK without extra state.
-//
-// Keep this a power of two: seq is uint16_t, and 65536 % N == 0 only then, so
-// the cadence stays continuous across sequence wrap. Also note txSeq is shared
-// with telemetry packets, so the 30 s telemetry burns one sequence number and
-// the ACK spacing shows a single 3- or 5-packet gap around it. Both are
-// cosmetic — nothing keys off the ACK arriving on an exact schedule.
-constexpr uint16_t ACK_EVERY_N = 4;
+// DATA owns its sequence. Telemetry cannot consume an ACK slot; selection stays
+// aligned even through packet loss and uint16 wrap (N must divide 65536).
+constexpr uint16_t ACK_EVERY_N = 8;
 constexpr uint32_t ACK_PERIOD_MS = ACK_EVERY_N * SEND_INTERVAL_MS;
 // Client link thresholds derived from the ACK cadence so they cannot drift out
 // of sync when ACK_EVERY_N changes. At N=4 these evaluate to the 16 s / 20 s
@@ -119,10 +122,11 @@ constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;  // server: re-attempt hotspot
 // and polling the PMU every pass would mean thousands of I2C transactions per
 // second for a button that only needs to feel instant to a human.
 constexpr uint32_t PMU_KEY_POLL_MS = 100;
-// GPS UART is 9600 baud (960 B/s); the default 256 B driver buffer overflows in
-// 267 ms, which is shorter than a single blocking LoRa transmit. 1 KB covers a
-// full second of NMEA so no sentence is lost while the radio is busy.
+// The GNSS collector discards queued input after a >200 ms servicing gap.
+// RF TX is non-blocking; this buffer is a bound, not a guarantee against loss.
 constexpr size_t GPS_RX_BUFFER_BYTES = 1024;
+constexpr uint32_t GPS_BACKLOG_GUARD_MS = 200;
+constexpr uint16_t I2C_TRANSACTION_TIMEOUT_MS = 10;
 
 // Battery percentage scale (single Li-ion cell): 0% at 3.2 V, 100% at 4.15 V.
 constexpr uint16_t BATT_EMPTY_MV = 3200;       // 0 %
@@ -136,76 +140,29 @@ constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
 #if defined(ROLE_SERVER)
 // Camera servo (GXServo QY3242BLS/GX3242 42KG) driven by ESP32 LEDC PWM on IO21.
 constexpr int SERVO_PIN = 21;
-constexpr int SERVO_MIN_US = 500;    // -> 0 deg
-constexpr int SERVO_MAX_US = 2500;   // -> 180 deg
-constexpr uint32_t SERVO_PWM_HZ = 333;
+constexpr uint32_t SERVO_PWM_HZ = servo_profile::kPwmHz;
 // ESP32-S3 LEDC timers support at most 14-bit resolution.  A 16-bit attach is
 // rejected by Arduino-ESP32 3.x, leaving the pin with no PWM output.
-constexpr uint8_t SERVO_PWM_RES_BITS = 14;
-constexpr uint32_t SERVO_PWM_MAX_DUTY = (1UL << SERVO_PWM_RES_BITS) - 1;
+constexpr uint8_t SERVO_PWM_RES_BITS = servo_profile::kPwmResolutionBits;
 constexpr int SERVO_LEDC_CH = 0;     // LEDC channel (arduino-esp32 2.x)
-constexpr uint8_t SERVO_CAL_VERSION = 2;  // v2 uses CCW-positive servo geometry
-constexpr uint32_t MAG_SAMPLE_MS = 200;
-// Heading low-pass, applied to the field vector (see sampleMag).
-// alpha = 1 - exp(-MAG_SAMPLE_MS / tau) with tau = 0.5 s.
-constexpr float MAG_FILTER_ALPHA = 0.33f;
-
 // Camera tracking loop. The servo is refreshed far faster than position packets
-// arrive (1 Hz): between packets the surfer's position is dead-reckoned from the
+// arrive (2 Hz RF, independently of GNSS epochs): between fresh packets the
+// surfer's position is dead-reckoned from the
 // velocity vector already carried in PositionPayload, so the camera pans
 // continuously instead of stepping once per received packet — and keeps panning
 // through a dropped packet instead of freezing for a whole second.
-constexpr uint32_t TRACK_UPDATE_MS = 50;      // 20 Hz servo refresh
+constexpr uint32_t TRACK_UPDATE_MS = control_cadence::kGpsPeriodMs;
 constexpr float DR_MIN_SPEED_CMS = 30.0f;     // below this the GPS course is noise
-constexpr float DR_MAX_AGE_S = 2.0f;          // stop projecting after ~2 lost packets
-constexpr float SERVO_MAX_SLEW_DEG_S = 120.0f;  // pan rate limit (smooth footage)
+constexpr float DR_MAX_AGE_S = 2.0f;          // source + RF + receive age ceiling
+constexpr const char *GPS_PREDICTION_KEY = "gpspredict";
 
-// --- Magnetometer hard-iron calibration -----------------------------------
-// Spin the whole station through one slow horizontal turn, CLOCKWISE seen from
-// above; the firmware fits a circle to the locus and stores its centre as the
-// hard-iron offset.
-//
-// That turn also tells the firmware HOW THE BOARD IS MOUNTED. Whichever sensor
-// axis barely moves through a horizontal turn is the one lying along the world
-// vertical, so the other two span the horizontal plane and are the pair the
-// heading has to come from. This is why the board no longer has to lie flat:
-// standing it on edge only moves the constant axis from Z to X or Y. The pair is
-// kept in cyclic order (axisA x axisB = +up) and swapped if the locus turned out
-// to run the other way, which settles the sign from data instead of from a guess
-// about which way the sensor is silkscreened.
-//
-// Why it matters: uncalibrated, heading is a sine-distorted function of true
-// yaw. The on-board 18650's nickel-plated steel can sits centimetres from the
-// sensor and can offset the field by tens of uT against a ~37 uT horizontal
-// field, so the distortion reaches 20-30 deg AND varies with which way the rig
-// faces. That is precisely what makes a stored mount_offset stop being valid
-// after the station is packed up and set down facing a different way at another
-// spot — i.e. it is the reason the aim calibration currently has to be redone
-// every session. Fix the hard iron and mount_offset becomes a true constant.
-constexpr uint32_t MAG_CAL_SAMPLE_MS = 50;        // 20 Hz while collecting
-constexpr size_t   MAG_CAL_MAX_SAMPLES = 180;
-constexpr float    MAG_CAL_MIN_STEP_DEG = 2.0f;   // spread samples round the circle
-constexpr uint8_t  MAG_CAL_BINS = 36;             // 10 deg coverage bins
-constexpr uint8_t  MAG_CAL_BINS_REQUIRED = 34;    // allow a small gap
-constexpr uint32_t MAG_CAL_TIMEOUT_MS = 120000;
-constexpr uint8_t  MAG_CAL_VERSION = 2;  // v2 also stores the horizontal pair
-
-// --- Heading freeze --------------------------------------------------------
-// The live heading is not used while tracking: it is snapshotted when tracking
-// starts so magnetometer noise (servo current, vibration, filter ripple) never
-// reaches the servo. Only a change bigger than the deadband is taken to mean
-// the tripod was genuinely moved, which re-snapshots. With GPS at ~1 m the
-// magnetometer is otherwise the dominant error term in the pointing budget.
-constexpr float MAG_FREEZE_DEADBAND_DEG = 2.0f;
 #endif
 
 // GPS UART defaults (common on T-Beam family, override if your board differs).
-// TinyGPSPlus 的 isValid() 只要「曾經」定位成功就永遠是 true —— 失去定位之後
-// lat/lon/speed/course 全部凍結在最後一筆，只有 age() 會漲（見 TinyGPS++.cpp
-// 的 commit() 只在 sentenceHasFix 為真時呼叫）。所以判斷「現在有沒有定位」一律
-// 要看 age()，否則天線入水或走進死角時，系統會非常有自信地一直對著一個人早就
-// 不在的座標，而且不會有任何徵兆。NMEA 是 1 Hz，這裡容忍約 3 筆遺失。
-constexpr uint32_t GPS_FIX_MAX_AGE_MS = 3000;
+// Freshness comes from the coherent NMEA collector, not TinyGPS's latched
+// isValid(). Repeated epochs do not renew it; the caller also budgets the
+// UART age uncertainty. RF retransmission never makes an old fix new.
+constexpr uint32_t GPS_FIX_MAX_AGE_MS = tracking_policy::kGpsFreshMs;
 
 constexpr int GPS_RX_PIN = 9;
 constexpr int GPS_TX_PIN = 8;
@@ -222,8 +179,7 @@ constexpr int OLED_SCL_PIN = 18;
 // SH1106 的位址取決於板上是哪一版磁力計：QMC6310U 在 0x1C -> 螢幕 0x3C；
 // QMC6310N 在 0x3C -> 螢幕 0x3D（見 docs/hardware.md 的 I2C 位址表）。寫死
 // 0x3C 在 N 版板子上會讓 u8g2 把畫面資料寫進磁力計的暫存器，螢幕全黑而且沒有
-// 任何錯誤訊息。SERVER 開機時由 initMag() 探測到的位址回推，CLIENT 沒有磁力計
-// 所以維持預設值。
+// 任何錯誤訊息。detectOledAddress() 獨立偵測螢幕，不初始化板上磁力計。
 constexpr uint8_t OLED_ADDR_DEFAULT = 0x3C;
 constexpr uint8_t OLED_ADDR_ALT = 0x3D;
 static uint8_t oledI2CAddr = OLED_ADDR_DEFAULT;
@@ -315,9 +271,11 @@ struct DecodedData {
   uint8_t  fix;
   uint16_t speedCmS;
   uint16_t courseDeg10;
-  int16_t  accelCmS2;
-  uint8_t  satellites;
+  uint8_t  satellites;  // class lower bound for gates only; never exposed as an exact count
+  uint8_t  satelliteClass;
   uint8_t  hdop10;
+  uint8_t  age10ms;
+  bool     velocityValid;
 };
 
 struct DecodedTelemetry {
@@ -325,24 +283,22 @@ struct DecodedTelemetry {
   uint16_t batteryMv;
   int8_t   tempC;       // INT8_MIN = no sensor
   uint8_t  humidityPct; // 0xFF = no sensor
+  uint8_t  satellites;  // exact low-rate diagnostic; never used to gate live DATA
 };
 
-// Runtime-mutable whitelist — seeded from DEFAULT_WHITELIST at boot.
-// Each id = last 2 bytes of the client ESP32 chip MAC (printed at boot).
-constexpr uint16_t DEFAULT_WHITELIST[] = {0xE91C};  // 48:ca:43:57:e9:1c (COM7)
-constexpr size_t   WHITELIST_MAX = 16;
-static uint16_t clientWhitelist[WHITELIST_MAX]{};
-static size_t   clientWhitelistCount = 0;
-
+// Exactly one bound GPS client. srcId remains in the wire protocol so future
+// multi-client support can reuse this filter and select a ClientState explicitly.
+constexpr uint16_t DEFAULT_GPS_CLIENT_ID = 0;  // a new station must be explicitly paired
+static uint16_t gpsClientId = DEFAULT_GPS_CLIENT_ID;  // 0 = intentionally unbound
 static bool isClientAllowed(uint16_t id) {
-  for (size_t i = 0; i < clientWhitelistCount; i++) {
-    if (clientWhitelist[i] == id) return true;
-  }
-  return false;
+  return gpsClientId != 0 && id == gpsClientId;
 }
 #endif
 
 uint16_t txSeq = 0;
+uint16_t telemetrySeq = 0;
+uint16_t diagnosticSeq = 0;
+uint32_t nextDiagnosticMs = 0;
 uint32_t nextSendMs = 0;
 uint32_t lastSendMs = 0;  // start of the last position TX (telemetry slot anchor)
 uint32_t nextTelemetryMs = 0;
@@ -351,6 +307,12 @@ uint32_t nextBatteryMs = 0;
 // Telemetry quiet slot, filled in by computeAirtimeBudget() at boot.
 uint32_t telemetrySlotMinMs = 0;
 uint32_t telemetrySlotMaxMs = 0;
+uint32_t dataAirtimeMs = 0, ackAirtimeMs = 0, telemetryAirtimeMs = 0;
+uint32_t diagnosticAirtimeMs = 0;
+uint32_t dataSkippedSlots = 0;
+static gnss_snapshot::Collector gnssCollector;
+static uint32_t gpsLastServiceMs = 0, gpsBacklogDrops = 0;
+static bool gpsServiceStarted = false;
 uint16_t cachedBatteryMv = 0;
 bool pmuOnline = false;
 uint16_t nodeId = 0;  // set in setup() from chip MAC last 2 bytes
@@ -358,10 +320,6 @@ uint16_t nodeId = 0;  // set in setup() from chip MAC last 2 bytes
 static uint32_t bootMs = 0;
 
 #if defined(ROLE_CLIENT)
-// Client-side velocity / acceleration tracking
-static uint16_t prevSpeedCmS   = 0;
-static uint32_t prevSpeedMs    = 0;
-static int16_t  smoothAccelCmS2 = 0;
 static uint32_t lastAckRxMs = 0;
 static uint32_t ackRxCount = 0;
 static uint32_t ackMissCount = 0;
@@ -369,7 +327,14 @@ static uint32_t lastAckMissMarkMs = 0;
 static int8_t currentTxPowerDbm = TX_POWER_DBM;
 static bool atpcEnabled = true;
 static int16_t lastAckRssiDbm10 = -1270;
-static int8_t lastAckSnrDb10 = -127;
+static int8_t lastAckSnrQuarterDb = -128;
+static lora_schedule::AckWindow expectedAck;
+static uint32_t ackRejectedCount = 0, clientTxCount = 0, clientTxErrors = 0;
+static uint32_t nextClientRxRetryMs = 0;
+static bool clientRxReady = false, haveDataSent = false, lastDataAckCycle = false;
+static bool clientSendingData = false;
+static uint16_t sendingDataSeq = 0;
+static uint8_t clientTxBuffer[DATA_PACKET_LEN];
 static uint32_t nextAtpcEvalMs = 0;
 
 // Client OLED wake state (short-press PWR turns the screen on for a few seconds)
@@ -388,6 +353,9 @@ static uint32_t nextClientOledRefreshMs = 0;
 // a flag and loop() drains the packet when one genuinely arrives.
 volatile bool clientRxFlag = false;
 void IRAM_ATTR onClientDio1() { clientRxFlag = true; }
+static async_lora_ack::Transmitter<SX1262> clientTransmitter(
+    radio, clientRxFlag, RADIOLIB_SX126X_IRQ_TX_DONE,
+    RADIOLIB_SX126X_IRQ_TIMEOUT, RADIOLIB_ERR_TX_TIMEOUT);
 #endif
 
 // Derive a node id from the last 2 bytes of the ESP32's factory-burned MAC.
@@ -396,30 +364,44 @@ static uint16_t derivedNodeId() {
   uint8_t mac[6];
   esp_efuse_mac_get_default(mac);
   uint16_t id = ((uint16_t)mac[4] << 8) | mac[5];
-  // Avoid colliding with reserved SERVER_ID.
-  return id == SERVER_ID ? id ^ 0x0100 : id;
+  // The 16-bit suffix is not globally unique. Reserved values need remapping;
+  // the operator still pairs the actual Client ID explicitly.
+  return id == 0 || id == ID_BROADCAST || id == SERVER_ID ? id ^ 0x0100 : id;
 }
 
 #if defined(ROLE_SERVER)
-DecodedData lastData{};
-bool havePkt = false;
-uint32_t lastRxMs = 0;
-float lastRssi = 0;
-float lastSnr = 0;
+// Per-client records are grouped for future extension; one instance is active.
+struct ClientState {
+  DecodedData position{};
+  DecodedTelemetry telemetry{0, 0, INT8_MIN, 0xFF, 0xFF};
+  bool havePosition = false;
+  bool haveTelemetry = false;
+  uint32_t positionRxMs = 0;
+  uint32_t telemetryRxMs = 0;
+  float rssi = 0;
+  float snr = 0;
+  int humidityBaselinePct = -1;
+};
+static ClientState gpsClient;
+// Existing formatters use aliases to the one active record.
+static DecodedData &lastData = gpsClient.position;
+static bool &havePkt = gpsClient.havePosition;
+static uint32_t &lastRxMs = gpsClient.positionRxMs;
+static float &lastRssi = gpsClient.rssi;
+static float &lastSnr = gpsClient.snr;
+// Raw event measurements may come from another client or a rejected frame.
+static float receivedPacketRssi = 0;
+static float receivedPacketSnr = 0;
 uint32_t nextDisplayMs = 0;
 uint32_t nextWifiRetryMs = 0;
 uint32_t wifiReconnectingUntilMs = 0;
 bool otaReady = false;
 uint32_t nextServerIdleLogMs = 0;
 
-// Telemetry (slow path, MSG_TELEMETRY every 30 s)
-DecodedTelemetry lastTelemetry{0, 0, INT8_MIN, 0xFF};
-bool haveTelemetry = false;
-uint32_t lastTelemetryRxMs = 0;
-
-// 進水偵測的基準濕度（-1 = 還沒有基準）。見 include/alerts.h：單看絕對值會誤報，
-// 因為海邊空氣本來就 80% 起跳；進水真正的特徵是相對開機值單調上升。
-static int clientHumBaselinePct = -1;
+static DecodedTelemetry &lastTelemetry = gpsClient.telemetry;
+static bool &haveTelemetry = gpsClient.haveTelemetry;
+static uint32_t &lastTelemetryRxMs = gpsClient.telemetryRxMs;
+static int &clientHumBaselinePct = gpsClient.humidityBaselinePct;
 static int serverHumBaselinePct = -1;
 
 // LoRa rolling stats (last RSSI_WINDOW received packets)
@@ -432,101 +414,63 @@ static uint32_t pktsThisWindow  = 0;
 static uint32_t pktWindowStartMs = 0;
 static float    cachedPktRate   = 0.0f;  // pkts/s averaged over ~60 s
 
-// Servo + tracking state.
-// Geometry (viewed from above, increasing servo angle turns CCW while compass
-// bearings increase CW): world_bearing = mag_heading - servo_angle + mountOffset
-//   * Manual: operator nudges servo_angle until the camera is on the surfer.
-//   * Start : mountOffset is locked from the current (bearing, heading, angle).
-//   * Track : servo_angle = heading_now + mountOffset - bearing_now (clamped 0..180).
-// The magnetometer term lets the station be bumped/rotated mid-session.
-enum TrackMode : uint8_t { MODE_IDLE, MODE_MANUAL, MODE_TRACKING, MODE_PAUSED };
-static TrackMode trackMode = MODE_MANUAL;
-static float servoAngleDeg = 90.0f;   // current commanded servo angle (0..180)
-static float servoTargetDeg = 90.0f;  // desired angle while tracking
-static float mountOffsetDeg = 0.0f;   // servo-to-world mounting offset (persisted)
-// The heading the station was facing when that offset was locked. mount_offset is
-// only exactly right in that pose: an elliptical magnetometer locus (see
-// magCalEllipseDeg) makes the heading error a function of which way the rig faces,
-// and only the DIFFERENCE between the calibration pose and the current one leaks
-// into the aim. Keeping the pose lets the firmware state that error instead of
-// leaving the operator to wonder — turn back toward the calibration pose, or
-// recalibrate where you actually stand, and it goes to zero.
-static float mountCalHeadingDeg = -1.0f;
-static bool  mountCalibrated = false;
-static bool  servoPwmReady = false;
-static uint32_t nextTrackMs = 0;      // TRACK_UPDATE_MS tick
-static uint32_t lastServoStepMs = 0;  // 0 = no previous step (slew dt unknown)
-static float frozenHeadingDeg = 0.0f; // heading snapshot in use while tracking
-static bool  headingFrozen = false;
+// Increasing Servo angle turns the camera CCW. The fixed-tripod magnetic
+// reference is entered from the compass on the lens, and kept only in RAM.
+using TrackMode = tracking_policy::Mode;
+static TrackMode trackMode = TrackMode::Manual;
+static TrackMode lastTrackingMode = TrackMode::Uart;
+static tracking_policy::Source controlSource = tracking_policy::Source::Hold;
+static tracking_policy::Selector sourceSelector;
+static float servoAngleDeg = 90.0f;
+static float servoTargetDeg = 90.0f;
+static float mountOffsetDeg = 0.0f;
+static float declinationDeg = 0.0f;
+static bool declinationReady = false;
+static bool mountCalibrated = false;
+static bool gpsPredictionEnabled = true;  // alpha = 1; false selects alpha = 0
+static bool servoPwmReady = false;
+static control_cadence::GpsCadence gpsCadence;
+static uint32_t servoLastDuty=UINT32_MAX;
+static uint8_t oledNextRow=8;
+static uint32_t oledFrames=0;
+static servo_motion::Controller servoMotion;
+static command_freshness::HttpGate commandGate;
+static command_freshness::RadioSequence gpsSequence;
+static uint32_t controlBootId = 0;
+static uint32_t rejectedMotionCommands = 0, rejectedGpsSequence = 0;
+static uart_servo_mode::Endpoint uartServoMode;
 
-// Magnetometer (QMC6310) — station board heading in degrees (-1 = invalid)
-static SensorQMC6310 mag;
-static bool  magOnline = false;
-static float magHeadingDeg = -1.0f;
-static uint32_t nextMagMs = 0;
-
-// The two sensor axes that span the horizontal plane (0=X, 1=Y, 2=Z) and the
-// hard-iron offset on each in Gauss, subtracted before the heading is computed.
-// X,Y with zero offsets until calibrated, which is exactly the flat-board,
-// uncorrected behaviour this replaces.
-static uint8_t magAxisA = 0;
-static uint8_t magAxisB = 1;
-static float magOffsetA = 0.0f;
-static float magOffsetB = 0.0f;
-static bool  magCalibrated = false;
-static float magCalResidualDeg = -1.0f;  // total fit residual; -1 = unknown
-static float magCalFieldGauss = -1.0f;   // fitted radius, sanity check vs ~0.37 G
-// The total residual lumps together two faults that need opposite fixes, so it is
-// split. An ELLIPTICAL locus (soft iron from the servo's steel gears, a board that
-// is not square to gravity, or the board tilting as it is turned) shows up as a
-// 2-theta component of the radial error; vibration and sensor noise are whatever
-// is left. "Move the board" vs "turn it more steadily" — one lumped number cannot
-// tell you which.
-static float magCalEllipseDeg = -1.0f;   // max heading error implied by the ellipse
-static float magCalScatterDeg = -1.0f;   // random part, after the ellipse is removed
-static float magCalSweepDeg = 0.0f;      // net rotation actually turned
-
-// Heading low-pass state (file scope so a fresh calibration can re-seed it).
-static float magFiltX = 0.0f;
-static float magFiltY = 0.0f;
-static bool  magFiltInit = false;
-
-// A one-shot heading sample taken at lock time bakes that instant's noise into a
-// constant that then lives in NVS for every later session. So the lock uses the
-// mean field vector over the last few seconds instead. Averaging the VECTOR and
-// not the angle: degrees cannot be averaged across the 360/0 wrap. This only
-// helps against the zero-mean part of the error — hard iron, the servo's steel
-// gears and tilt are all deterministic and survive any amount of averaging.
-constexpr uint8_t MAG_AVG_WINDOW = 25;  // 25 samples at 5 Hz = 5 s
-static float   magAvgX[MAG_AVG_WINDOW];
-static float   magAvgY[MAG_AVG_WINDOW];
-static uint8_t magAvgIdx = 0;
-static uint8_t magAvgCount = 0;
-
-enum MagCalState : uint8_t {
-  MAGCAL_IDLE, MAGCAL_COLLECTING, MAGCAL_DONE, MAGCAL_FAILED
+struct MetricsClock {
+  static uint32_t micros() { return ::micros(); }
+  static uint32_t nowUs() { return ::micros(); }
 };
-static MagCalState magCalState = MAGCAL_IDLE;
-// Raw 3-axis samples: which two of them matter is only known once the turn has
-// gone far enough to show which axis is the vertical one. The collector keeps its
-// own copy of the pair so a cancelled or timed-out turn cannot leave the live
-// heading using a plane guessed from a quarter of a circle.
-static float    magCalRaw[MAG_CAL_MAX_SAMPLES][3];
-static uint8_t  magCalAxisA = 0;
-static uint8_t  magCalAxisB = 1;
-static size_t   magCalCount = 0;
-static uint64_t magCalBinMask = 0;
-static uint32_t magCalStartMs = 0;
-static float    magCalMin[3] = {0, 0, 0}, magCalMax[3] = {0, 0, 0};
-static float    magCalLastAngle = 0.0f;
-static bool     magCalHaveLast = false;
-static bool     magCalOverflowSeen = false;
-static const char *magCalError = "";
+using MeasureDuration = loop_metrics::Measure<MetricsClock>;
+static loop_metrics::Gap controlGap;
+static loop_metrics::Duration loopDuration, httpDuration, envDuration;
+static loop_metrics::Duration pmuDuration, oledDuration, loraDuration, otaDuration, motionDuration;
+
 static uint32_t rxDataCount = 0;
 static uint32_t rxTelemetryCount = 0;
 static uint32_t rxDropCount = 0;
 static uint32_t rxErrorCount = 0;
 static uint32_t ackTxCount = 0;
+static uint32_t ackErrorCount = 0;
+static uint32_t ackSkippedCount = 0;
+static packet_diagnostics::Ring<64> packetEvents;
+static uint32_t rejectedLength = 0, rejectedFormat = 0, rejectedBinding = 0;
+static uint32_t invalidFixPackets = 0, invalidVelocityPackets = 0;
+static uint32_t lastDataIntervalMs = 0, maxDataIntervalMs = 0;
+static uint32_t sourceEpochUpdates = 0, lastSourceEpochIntervalMs = 0;
+static uint32_t lastEstimatedSourceMs = 0;
+static bool haveSourceEstimate = false;
+static DiagnosticPayload lastClientDiagnostic{};
+static bool haveClientDiagnostic = false;
+static uint32_t lastClientDiagnosticMs = 0, rxDiagnosticCount = 0;
+static uint32_t sequenceMissing = 0, sequenceResyncs = 0, rxWinMissing = 0;
+static int16_t lastAckError = 0;
+static bool serverRxReady = true;
+static uint32_t nextServerRxRetryMs = 0;
+constexpr uint32_t ACK_START_MAX_AGE_MS = 50;
 
 // Per-minute RX summary window (see RX_SUMMARY_MS).
 static uint32_t nextRxSummaryMs = 0;
@@ -538,65 +482,42 @@ static bool     rxWinHaveSeq = false;
 static float    rxWinRssiMin = 0, rxWinRssiMax = 0, rxWinSnrMin = 0, rxWinSnrMax = 0;
 static double   rxWinRssiSum = 0, rxWinSnrSum = 0;
 
-WebServer httpServer(80);
+http_timing::Server<WebServer, MetricsClock> httpServer(80);
 
-// Interrupt-driven LoRa RX: DIO1 fires on RxDone; the ISR only sets a flag so
-// the main loop never blocks in receive() and the web server stays responsive.
-volatile bool rxDoneFlag = false;
-void IRAM_ATTR onLoRaDio1() { rxDoneFlag = true; }
+// DIO1 reports either RxDone or TxDone. The ACK state owns it while sending.
+volatile bool serverRadioIrq = false;
+volatile uint32_t serverRadioIrqMs = 0;
+void IRAM_ATTR onLoRaDio1() {
+  serverRadioIrqMs = millis();
+  serverRadioIrq = true;
+}
+static async_lora_ack::Transmitter<SX1262> ackTransmitter(
+    radio, serverRadioIrq, RADIOLIB_SX126X_IRQ_TX_DONE,
+    RADIOLIB_SX126X_IRQ_TIMEOUT, RADIOLIB_ERR_TX_TIMEOUT);
+static uint8_t ackPacketBuffer[ACK_PACKET_LEN];
 #endif
 
 #if defined(ROLE_SERVER)
-// 收到的每一種封包都要通過同一組檢查：magic / version / networkId / 收件人 /
-// msgType / payload 長度 / 白名單。抄成兩份的話，之後加 MSG_HELLO 就會有第三份，
-// 而漏掉其中一項檢查是不會有任何徵兆的。
-static bool validateHeader(const uint8_t *buf, size_t n, uint8_t wantMsgType,
-                           size_t wantPayloadLen, PacketHeader &hdr) {
-  if (n < sizeof(PacketHeader)) return false;
-  memcpy(&hdr, buf, sizeof(hdr));
-
-  // NETWORK_ID 才是權威的群組判斷（sync word 只是 PHY 層的粗篩）。
-  if (hdr.magic != PROTO_MAGIC || hdr.version != PROTO_VERSION) return false;
-  if (hdr.networkId != NETWORK_ID) return false;
-  if (hdr.dstId != SERVER_ID && hdr.dstId != ID_BROADCAST) return false;
-  if (hdr.msgType != wantMsgType || hdr.payloadLen != wantPayloadLen) return false;
-  if (n < sizeof(PacketHeader) + hdr.payloadLen + MAC_LEN) return false;
-  if (!isClientAllowed(hdr.srcId)) return false;  // 不在白名單
-
-  // NOTE (stage 2): verify the trailing MAC_LEN-byte HMAC over header+payload here.
-  return true;
-}
-
+// Decode helpers enforce exact v4 wire lengths before any payload is used.
 static bool parseDataPacket(const uint8_t *buf, size_t n, DecodedData &out) {
-  PacketHeader hdr;
-  if (!validateHeader(buf, n, MSG_DATA, sizeof(PositionPayload), hdr)) return false;
-
-  PositionPayload pos;
-  memcpy(&pos, buf + sizeof(PacketHeader), sizeof(pos));
-
-  out.srcId       = hdr.srcId;
-  out.seq         = hdr.seq;
-  out.fix         = pos.fix;
-  out.lat         = pos.latE7 / 1e7;
-  out.lon         = pos.lonE7 / 1e7;
-  out.speedCmS    = pos.speedCmS;
+  PacketHeader hdr{}; PositionPayload pos{};
+  if (!protocol::decodeData(buf, n, hdr, pos) || !isClientAllowed(hdr.clientId)) return false;
+  out.srcId = hdr.clientId; out.seq = hdr.seq;
+  out.fix = pos.fix; out.lat = pos.latE6 / 1e6; out.lon = pos.lonE6 / 1e6;
+  out.speedCmS = pos.speedDmS == 255 ? UINT16_MAX : uint16_t(pos.speedDmS) * 10;
   out.courseDeg10 = pos.courseDeg10;
-  out.accelCmS2   = pos.accelCmS2;
-  out.satellites  = pos.satellites;
-  out.hdop10      = pos.hdop10;
+  out.satelliteClass = pos.satelliteClass;
+  out.satellites = protocol::satLowerBound(pos.satelliteClass);
+  out.hdop10 = pos.hdop10; out.age10ms = pos.age10ms;
+  out.velocityValid = pos.velocityValid;
   return true;
 }
 
 static bool parseTelemetryPacket(const uint8_t *buf, size_t n, DecodedTelemetry &out) {
-  PacketHeader hdr;
-  if (!validateHeader(buf, n, MSG_TELEMETRY, sizeof(TelemetryPayload), hdr)) return false;
-
-  TelemetryPayload tel;
-  memcpy(&tel, buf + sizeof(PacketHeader), sizeof(tel));
-  out.srcId       = hdr.srcId;
-  out.batteryMv   = tel.batteryMv;
-  out.tempC       = tel.tempC;
-  out.humidityPct = tel.humidityPct;
+  PacketHeader hdr{}; TelemetryPayload tel{};
+  if (!protocol::decodeTelemetry(buf, n, hdr, tel) || !isClientAllowed(hdr.clientId)) return false;
+  out.srcId = hdr.clientId; out.batteryMv = tel.batteryMv;
+  out.tempC = tel.tempC; out.humidityPct = tel.humidityPct; out.satellites = tel.satellites;
   return true;
 }
 #endif
@@ -619,6 +540,9 @@ using geo::gpsSignal;
 using geo::loraSignal;
 
 static uint16_t readBatteryMilliVolts() {
+#if defined(ROLE_SERVER)
+  MeasureDuration timing(pmuDuration);
+#endif
   if (!pmuOnline) {
     return 0;
   }
@@ -632,11 +556,15 @@ static uint16_t readBatteryMilliVolts() {
 
 // True when external (USB / Type-C) power is present — board runs "plugged in".
 static bool batteryCharging() {
+#if defined(ROLE_SERVER)
+  MeasureDuration timing(pmuDuration);
+#endif
   return pmuOnline && pmu.isVbusIn();
 }
 
 static bool initPmu() {
   PMUWire.begin(PMU_SDA_PIN, PMU_SCL_PIN);
+  PMUWire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
   if (!pmu.begin(PMUWire, AXP2101_SLAVE_ADDRESS, PMU_SDA_PIN, PMU_SCL_PIN)) {
     Log.println(F("[PMU] AXP2101 init failed"));
     return false;
@@ -656,14 +584,44 @@ static bool initPmu() {
 }
 
 static void serviceGps() {
+  const uint32_t now = millis();
+  if (!gpsServiceStarted || now - gpsLastServiceMs > GPS_BACKLOG_GUARD_MS) {
+    // Discard bytes accumulated while blocked (including the boot screen).
+    // The collector waits for a new '$' and a newer epoch after this reset.
+    gnssCollector.invalidate(now);
+    while (GPSSerial.available() > 0) GPSSerial.read();
+    if (gpsServiceStarted) ++gpsBacklogDrops;
+    gpsServiceStarted = true;
+  }
+  gpsLastServiceMs = now;
   while (GPSSerial.available() > 0) {
-    gps.encode(GPSSerial.read());
+    const char c = static_cast<char>(GPSSerial.read());
+    gps.encode(c);  // retained for UTC date and legacy display metadata
+    gnssCollector.feed(c, millis());
   }
 }
 
 // 「現在真的有定位」。見 GPS_FIX_MAX_AGE_MS —— isValid() 單獨用是不夠的。
 static bool gpsFixFresh() {
-  return gps.location.isValid() && gps.location.age() < GPS_FIX_MAX_AGE_MS;
+  gnss_snapshot::Snapshot sample;
+  return gnssCollector.sample(millis(), sample) && sample.fix &&
+         sample.sourceAgeMs < GPS_FIX_MAX_AGE_MS &&
+         sample.sourceAgeMs + sample.ageUncertaintyMs < GPS_FIX_MAX_AGE_MS;
+}
+#if defined(ROLE_SERVER)
+static double stationLatitude() {
+  gnss_snapshot::Snapshot sample; gnssCollector.sample(millis(), sample); return sample.lat;
+}
+static double stationLongitude() {
+  gnss_snapshot::Snapshot sample; gnssCollector.sample(millis(), sample); return sample.lon;
+}
+#endif
+
+// OLED address detection must remain independent of the removed magnetometer.
+// On the N board the OLED is 0x3D and 0x3C belongs to the unused QMC sensor.
+static void detectOledAddress() {
+  Wire.beginTransmission(OLED_ADDR_ALT);
+  oledI2CAddr = Wire.endTransmission() == 0 ? OLED_ADDR_ALT : OLED_ADDR_DEFAULT;
 }
 
 static bool initEnvSensor() {
@@ -677,6 +635,9 @@ static bool initEnvSensor() {
 }
 
 static void sampleEnvSensor() {
+#if defined(ROLE_SERVER)
+  MeasureDuration timing(envDuration);
+#endif
   if (!envSensorOnline) {
     cachedTempC10 = INT16_MIN;
     cachedHumidityPct = 0xFF;
@@ -710,116 +671,53 @@ static SigLevel serverGpsState() {
   return gpsSignal(fix, sats, hdop);
 }
 
-static void saveWhitelistToNvs() {
-  String packed;
-  for (size_t i = 0; i < clientWhitelistCount; i++) {
-    if (i > 0) packed += ',';
-    char hex[5];
-    snprintf(hex, sizeof(hex), "%04X", clientWhitelist[i]);
-    packed += hex;
-  }
-  prefs.putString("wl", packed);
-}
-
-static void loadWhitelistFromNvs() {
-  String packed = prefs.getString("wl", "");
-  clientWhitelistCount = 0;
-  if (packed.length() == 0) {
-    for (uint16_t id : DEFAULT_WHITELIST) {
-      if (clientWhitelistCount < WHITELIST_MAX) {
-        clientWhitelist[clientWhitelistCount++] = id;
-      }
-    }
+static void loadGpsClientBinding() {
+  if (prefs.isKey("gpsclient")) {
+    const uint16_t saved = prefs.getUShort("gpsclient", 0);
+    gpsClientId = client_binding::validId(saved) ? saved : 0;
     return;
   }
-  int start = 0;
-  while (start < packed.length() && clientWhitelistCount < WHITELIST_MAX) {
-    int comma = packed.indexOf(',', start);
-    if (comma < 0) comma = packed.length();
-    String token = packed.substring(start, comma);
-    if (token.length() > 0) {
-      clientWhitelist[clientWhitelistCount++] =
-          static_cast<uint16_t>(strtoul(token.c_str(), nullptr, 16));
-    }
-    start = comma + 1;
+  // Migrate once, preserving an explicitly empty legacy whitelist.
+  if (prefs.isKey("wl")) {
+    const String packed = prefs.getString("wl", "");
+    gpsClientId = client_binding::fromLegacyList(packed.c_str(), packed.length());
+  } else {
+    gpsClientId = DEFAULT_GPS_CLIENT_ID;
   }
-}
-
-static void saveMountOffsetToNvs() {
-  prefs.putFloat("mountoff", mountOffsetDeg);
-  prefs.putFloat("mounthd", mountCalHeadingDeg);
-  prefs.putBool("mountcal", mountCalibrated);
-  prefs.putUChar("mountver", SERVO_CAL_VERSION);
+  if (prefs.putUShort("gpsclient", gpsClientId) != sizeof(uint16_t)) {
+    Log.println(F("[CLIENT] binding migration could not be saved"));
+  }
 }
 
 static void loadServerSettings() {
   prefs.begin("shorespotter", false);
-  loadWhitelistFromNvs();
-  if (prefs.getUChar("mountver", 0) == SERVO_CAL_VERSION) {
-    mountOffsetDeg = prefs.getFloat("mountoff", 0.0f);
-    mountCalHeadingDeg = prefs.getFloat("mounthd", -1.0f);
-    mountCalibrated = prefs.getBool("mountcal", false);
-  } else {
-    // Older offsets used the opposite servo direction and are not compatible.
-    mountOffsetDeg = 0.0f;
-    mountCalibrated = false;
-  }
-
-  if (prefs.getUChar("magver", 0) == MAG_CAL_VERSION) {
-    magAxisA = prefs.getUChar("magaxa", 0);
-    magAxisB = prefs.getUChar("magaxb", 1);
-    if (magAxisA > 2 || magAxisB > 2 || magAxisA == magAxisB) {
-      magAxisA = 0;  // corrupt pair: fall back to the flat-board plane
-      magAxisB = 1;
-    }
-    magOffsetA = prefs.getFloat("magoa", 0.0f);
-    magOffsetB = prefs.getFloat("magob", 0.0f);
-    magCalibrated = prefs.getBool("magcal", false);
-    magCalResidualDeg = prefs.getFloat("magres", -1.0f);
-    magCalEllipseDeg = prefs.getFloat("magell", -1.0f);
-    magCalScatterDeg = prefs.getFloat("magsct", -1.0f);
-    magCalFieldGauss = prefs.getFloat("magfld", -1.0f);
-    if (magCalibrated) magCalState = MAGCAL_DONE;
-  }
+  loadGpsClientBinding();
+  double speed=servo_motion::kDefaultSpeed;
+  servo_motion::decodeSpeed(prefs.getUInt(servo_motion::kSpeedKey,0),speed);
+  servoMotion.setSpeed(speed);
+  const uint32_t prediction = prefs.getUInt(GPS_PREDICTION_KEY, 1);
+  gpsPredictionEnabled = prediction <= 1 ? prediction == 1 : true;
+  // Old acceleration/jerk/deadband profiles are deliberately ignored.
+  // Old mount* and mag* NVS keys are ignored. No calibration is persisted.
+  mountOffsetDeg = 0.0f;
+  mountCalibrated = false;
 }
 
 static size_t buildAckPacket(uint8_t *buf, uint16_t dstId, uint16_t ackSeq,
                              float rssi, float snr) {
-  PacketHeader hdr{};
-  hdr.magic = PROTO_MAGIC;
-  hdr.version = PROTO_VERSION;
-  hdr.networkId = NETWORK_ID;
-  hdr.srcId = SERVER_ID;
-  hdr.dstId = dstId;
-  hdr.msgType = MSG_ACK;
-  hdr.seq = txSeq++;
-  hdr.payloadLen = sizeof(AckPayload);
-
-  AckPayload ack{};
-  ack.ackSeq = ackSeq;
-  ack.rssiDbm10 = static_cast<int16_t>(lround(rssi * 10.0f));
-  ack.snrDb10 = static_cast<int8_t>(lround(snr * 10.0f));
-
-  size_t off = 0;
-  memcpy(buf + off, &hdr, sizeof(hdr)); off += sizeof(hdr);
-  memcpy(buf + off, &ack, sizeof(ack)); off += sizeof(ack);
-  memset(buf + off, 0, MAC_LEN); off += MAC_LEN;
-  return off;
+  const PacketHeader hdr{dstId, ackSeq, MSG_ACK};
+  AckPayload ack{}; ack.ackSeq = ackSeq;
+  ack.rssiDbm10 = static_cast<int16_t>(constrain(lroundf(rssi * 10), -32768L, 32767L));
+  ack.snrQuarterDb = static_cast<int8_t>(constrain(lroundf(snr * 4), -128L, 127L));
+  return protocol::encodeAck(buf, ACK_PACKET_LEN, hdr, ack);
 }
 #endif
 
 #if defined(ROLE_CLIENT)
 static bool parseAckPacket(const uint8_t *buf, size_t n, AckPayload &out) {
-  if (n < sizeof(PacketHeader) + sizeof(AckPayload) + MAC_LEN) return false;
-  PacketHeader hdr;
-  memcpy(&hdr, buf, sizeof(hdr));
-  if (hdr.magic != PROTO_MAGIC || hdr.version != PROTO_VERSION) return false;
-  if (hdr.networkId != NETWORK_ID) return false;
-  if (hdr.msgType != MSG_ACK) return false;
-  if (hdr.srcId != SERVER_ID || hdr.dstId != nodeId) return false;
-  if (hdr.payloadLen != sizeof(AckPayload)) return false;
-  memcpy(&out, buf + sizeof(PacketHeader), sizeof(out));
-  return true;
+  PacketHeader hdr{};
+  return protocol::decodeAck(buf, n, hdr, out) && hdr.clientId == nodeId &&
+         expectedAck.accept(out.ackSeq, millis());
 }
 
 static void saveClientSettings() {
@@ -842,7 +740,8 @@ static void applyTxPower(int8_t pwrDbm) {
   radio.standby();
   int st = radio.setOutputPower(target);
   clientRxFlag = false;
-  radio.startReceive();
+  clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+  if (!clientRxReady) nextClientRxRetryMs = millis() + 100;
   if (st == RADIOLIB_ERR_NONE) {
     currentTxPowerDbm = target;
     saveClientSettings();
@@ -854,7 +753,7 @@ static void applyTxPower(int8_t pwrDbm) {
 
 static void evaluateAtpc() {
   if (!atpcEnabled) return;
-  if (millis() < nextAtpcEvalMs) return;
+  if (!loop_metrics::due(millis(), nextAtpcEvalMs)) return;
   nextAtpcEvalMs = millis() + ATPC_EVAL_MS;
 
   // No ACK for a while: push one step up.
@@ -865,9 +764,9 @@ static void evaluateAtpc() {
 
   // Strong link -> step down, weak link -> step up.
   // lastAckRssiDbm10 is negative dBm * 10.
-  if (lastAckRssiDbm10 > -700 && lastAckSnrDb10 > 80) {
+  if (lastAckRssiDbm10 > -700 && lastAckSnrQuarterDb > 32) {
     applyTxPower(currentTxPowerDbm - 1);
-  } else if (lastAckRssiDbm10 < -980 || lastAckSnrDb10 < 20) {
+  } else if (lastAckRssiDbm10 < -980 || lastAckSnrQuarterDb < 8) {
     applyTxPower(currentTxPowerDbm + 1);
   }
 }
@@ -875,91 +774,68 @@ static void evaluateAtpc() {
 
 #if defined(ROLE_CLIENT)
 static size_t buildDataPacket(uint8_t *buf) {
-  PacketHeader hdr{};
-  hdr.magic = PROTO_MAGIC;
-  hdr.version = PROTO_VERSION;
-  hdr.networkId = NETWORK_ID;
-  hdr.srcId = nodeId;
-  hdr.dstId = SERVER_ID;
-  hdr.msgType = MSG_DATA;
-  hdr.seq = txSeq++;
-  hdr.payloadLen = sizeof(PositionPayload);
-
+  const PacketHeader hdr{nodeId, txSeq++, MSG_DATA};
   PositionPayload pos{};
-  pos.fix = gpsFixFresh() ? 1 : 0;
-  if (pos.fix) {
-    pos.latE7 = static_cast<int32_t>(lround(gps.location.lat() * 1e7));
-    pos.lonE7 = static_cast<int32_t>(lround(gps.location.lng() * 1e7));
-  }
-  // Velocity vector from GPS (speed in cm/s, course in 0.1° units)
-  if (gps.speed.isValid()) {
-    uint16_t curSpeedCmS = static_cast<uint16_t>(gps.speed.mps() * 100.0f);
-    pos.speedCmS = curSpeedCmS;
-    uint32_t nowMs = millis();
-    if (prevSpeedMs > 0) {
-      float dt = (nowMs - prevSpeedMs) / 1000.0f;
-      if (dt > 0.05f) {
-        int16_t rawAccel = static_cast<int16_t>(
-            (int32_t(curSpeedCmS) - int32_t(prevSpeedCmS)) / dt);
-        smoothAccelCmS2 = static_cast<int16_t>(smoothAccelCmS2 * 0.8f + rawAccel * 0.2f);
-      }
+  pos.speedDmS = 255; pos.courseDeg10 = 4095;
+  pos.hdop10 = 255; pos.age10ms = 255;
+  gnss_snapshot::Snapshot sample;
+  if (gnssCollector.sample(millis(), sample)) {
+    pos.age10ms = protocol::quantizeAge(sample.sourceAgeMs);
+    const bool fresh = sample.sourceAgeMs < tracking_policy::kGpsFreshMs &&
+        sample.sourceAgeMs + sample.ageUncertaintyMs < tracking_policy::kGpsFreshMs;
+    pos.fix = sample.fix && fresh && isfinite(sample.lat) && isfinite(sample.lon);
+    if (pos.fix) {
+      pos.latE6 = static_cast<int32_t>(lround(sample.lat * 1e6));
+      pos.lonE6 = static_cast<int32_t>(lround(sample.lon * 1e6));
+      if (!protocol::coordinatesFit(pos.latE6, pos.lonE6)) pos.fix = false;
     }
-    prevSpeedCmS = curSpeedCmS;
-    prevSpeedMs  = nowMs;
+    pos.satelliteClass = fresh ? protocol::satClass(sample.satellites) : 0;
+    pos.hdop10 = fresh ? protocol::quantizeHdop(sample.hdop) : 255;
+    if (fresh && sample.velocityValid) {
+      pos.speedDmS = protocol::quantizeSpeed(sample.speedMps);
+      if (isfinite(sample.courseDeg) && sample.courseDeg >= 0 && sample.courseDeg < 360)
+        pos.courseDeg10 = static_cast<uint16_t>(lround(sample.courseDeg * 10)) % 3600;
+      pos.velocityValid = pos.fix && pos.speedDmS != 255 &&
+          sample.speedMps >= 0.3 && pos.courseDeg10 < 3600;
+    }
   }
-  pos.accelCmS2 = smoothAccelCmS2;
-  if (gps.course.isValid()) {
-    pos.courseDeg10 = static_cast<uint16_t>(gps.course.deg() * 10.0f);
-  }
-  if (gps.satellites.isValid()) {
-    uint32_t sv = gps.satellites.value();
-    pos.satellites = (sv > 254) ? 254 : static_cast<uint8_t>(sv);
-  } else {
-    pos.satellites = 0xFF;
-  }
-  if (gps.hdop.isValid()) {
-    long hv = lround(gps.hdop.hdop() * 10.0);
-    if (hv < 0) hv = 0;
-    if (hv > 254) hv = 254;
-    pos.hdop10 = static_cast<uint8_t>(hv);
-  } else {
-    pos.hdop10 = 0xFF;
-  }
-
-  size_t off = 0;
-  memcpy(buf + off, &hdr, sizeof(hdr));
-  off += sizeof(hdr);
-  memcpy(buf + off, &pos, sizeof(pos));
-  off += sizeof(pos);
-  memset(buf + off, 0, MAC_LEN);  // MAC reserved (stage 2)
-  off += MAC_LEN;
-  return off;
+  return protocol::encodeData(buf, DATA_PACKET_LEN, hdr, pos);
 }
 
 static size_t buildTelemetryPacket(uint8_t *buf) {
-  PacketHeader hdr{};
-  hdr.magic      = PROTO_MAGIC;
-  hdr.version    = PROTO_VERSION;
-  hdr.networkId  = NETWORK_ID;
-  hdr.srcId      = nodeId;
-  hdr.dstId      = SERVER_ID;
-  hdr.msgType    = MSG_TELEMETRY;
-  hdr.seq        = txSeq++;
-  hdr.payloadLen = sizeof(TelemetryPayload);
-
+  const PacketHeader hdr{nodeId, telemetrySeq++, MSG_TELEMETRY};
   TelemetryPayload tel{};
-  tel.batteryMv   = cachedBatteryMv;
-  tel.tempC       = (cachedTempC10 == INT16_MIN)
-                        ? INT8_MIN
-                        : (int8_t)constrain((long)lround(cachedTempC10 / 10.0),
-                                            -127L, 127L);
+  tel.batteryMv = cachedBatteryMv;
+  tel.tempC = cachedTempC10 == INT16_MIN ? INT8_MIN :
+      static_cast<int8_t>(constrain(lround(cachedTempC10 / 10.0), -127L, 127L));
   tel.humidityPct = cachedHumidityPct;
+  gnss_snapshot::Snapshot sample;
+  tel.satellites = gnssCollector.sample(millis(), sample) && sample.haveGga &&
+      sample.sourceAgeMs + sample.ageUncertaintyMs < tracking_policy::kGpsFreshMs ? sample.satellites : 255;
+  return protocol::encodeTelemetry(buf, TELEMETRY_PACKET_LEN, hdr, tel);
+}
+#endif
 
-  size_t off = 0;
-  memcpy(buf + off, &hdr, sizeof(hdr));  off += sizeof(hdr);
-  memcpy(buf + off, &tel, sizeof(tel));  off += sizeof(tel);
-  memset(buf + off, 0, MAC_LEN);         off += MAC_LEN;
-  return off;
+#if defined(ROLE_CLIENT)
+static size_t buildDiagnosticPacket(uint8_t *buf) {
+  const PacketHeader hdr{nodeId, diagnosticSeq++, MSG_DIAGNOSTIC};
+  DiagnosticPayload diag{};
+  const auto &stats = gnssCollector.stats();
+  auto clipped = [](uint32_t n) { return static_cast<uint16_t>(n > 65535 ? 65535 : n); };
+  diag.epochIntervalMs = clipped(stats.lastEpochIntervalMs);
+  diag.backlogDrops = clipped(gpsBacklogDrops);
+  diag.nmeaErrors = clipped(stats.rejectedSentences);
+  diag.txErrors = clipped(clientTxErrors);
+  diag.skippedSlots = clipped(dataSkippedSlots);
+  gnss_snapshot::Snapshot sample;
+  if (gnssCollector.sample(millis(), sample)) {
+    const bool fresh = gpsFixFresh();
+    const bool vector = fresh && sample.velocityValid && sample.speedMps >= 0.3 &&
+        protocol::quantizeSpeed(sample.speedMps) != 255;
+    diag.status = 1 | (fresh ? 2 : 0) | (vector ? 4 : 0) |
+        (sample.haveGga ? 8 : 0) | (sample.haveRmc ? 16 : 0) | 32;
+  }
+  return protocol::encodeDiagnostic(buf, DIAGNOSTIC_PACKET_LEN, hdr, diag);
 }
 #endif
 
@@ -981,54 +857,28 @@ static bool initRadio() {
 // telemetry either collides forever or never finds a slot at all, both silently.
 // Call after initRadio(), which is what configures SF/CR/BW.
 static void computeAirtimeBudget() {
-  uint32_t dataMs = radio.getTimeOnAir(DATA_PACKET_LEN) / 1000;
-  uint32_t ackMs = radio.getTimeOnAir(ACK_PACKET_LEN) / 1000;
-  uint32_t telMs = radio.getTimeOnAir(TELEMETRY_PACKET_LEN) / 1000;
-
-  // Worst case: assume this cycle is one of the ACKed ones.
-  telemetrySlotMinMs = dataMs + ackMs + TELEMETRY_SLOT_GUARD_MS;
-  telemetrySlotMaxMs = (SEND_INTERVAL_MS > telMs + TELEMETRY_SLOT_GUARD_MS)
-                           ? SEND_INTERVAL_MS - telMs - TELEMETRY_SLOT_GUARD_MS
-                           : 0;
-
-  Log.print(F("[LoRa] SF"));
-  Log.print(RF_SF);
-  Log.print(F(" CR4/"));
-  Log.print(RF_CR);
-  Log.print(F(" BW"));
-  Log.print(RF_BW, 0);
-  Log.print(F("k | airtime data="));
-  Log.print(dataMs);
-  Log.print(F("ms ack="));
-  Log.print(ackMs);
-  Log.print(F("ms(1/"));
-  Log.print(ACK_EVERY_N);
-  Log.print(F(") tel="));
-  Log.print(telMs);
-  Log.print(F("ms | duty="));
-  Log.print((dataMs + ackMs / ACK_EVERY_N) * 100 / SEND_INTERVAL_MS);
-  Log.println('%');
-
-  if (telemetrySlotMaxMs <= telemetrySlotMinMs) {
-    // Airtime no longer fits inside one send interval. Degrade to "any time
-    // after the ACK should be done" rather than stalling telemetry silently.
-    telemetrySlotMinMs = dataMs + ackMs;
-    telemetrySlotMaxMs = SEND_INTERVAL_MS;
-    Log.println(F("[LoRa] WARNING: airtime exceeds SEND_INTERVAL_MS; "
-                     "telemetry may collide with position packets"));
-  }
-  Log.print(F("[LoRa] telemetry slot = "));
-  Log.print(telemetrySlotMinMs);
-  Log.print(F(".."));
-  Log.print(telemetrySlotMaxMs);
-  Log.println(F(" ms after position TX"));
+  dataAirtimeMs = (radio.getTimeOnAir(DATA_PACKET_LEN) + 999) / 1000;
+  ackAirtimeMs = (radio.getTimeOnAir(ACK_PACKET_LEN) + 999) / 1000;
+  telemetryAirtimeMs = (radio.getTimeOnAir(TELEMETRY_PACKET_LEN) + 999) / 1000;
+  diagnosticAirtimeMs = (radio.getTimeOnAir(DIAGNOSTIC_PACKET_LEN) + 999) / 1000;
+  telemetrySlotMinMs = dataAirtimeMs + TELEMETRY_SLOT_GUARD_MS;
+  telemetrySlotMaxMs = SEND_INTERVAL_MS > telemetryAirtimeMs + TELEMETRY_SLOT_GUARD_MS ?
+      SEND_INTERVAL_MS - telemetryAirtimeMs - TELEMETRY_SLOT_GUARD_MS : 0;
+  Log.print(F("[LoRa] v4 bytes DATA/ACK/TEL="));
+  Log.print(DATA_PACKET_LEN); Log.print('/'); Log.print(ACK_PACKET_LEN); Log.print('/'); Log.println(TELEMETRY_PACKET_LEN);
+  Log.print(F("[LoRa] airtime_ms DATA/ACK/TEL="));
+  Log.print(dataAirtimeMs); Log.print('/'); Log.print(ackAirtimeMs); Log.print('/'); Log.println(telemetryAirtimeMs);
+  Log.print(F("[LoRa] RF interval_ms=")); Log.print(SEND_INTERVAL_MS);
+  Log.print(F(" ACK every DATA=")); Log.println(ACK_EVERY_N);
+  if (telemetrySlotMaxMs < telemetrySlotMinMs)
+    Log.println(F("[LoRa] no telemetry slot: defer, never cross DATA deadline"));
 }
 
 // --- 無線電回復 ------------------------------------------------------------
 // SX1262 若因為 SPI 干擾或狀態機卡住而停止工作，原本兩端都只會印一行 log 然後
 // 安靜地永遠壞下去。CLIENT 平時螢幕是關的，沒有任何外部徵兆；SERVER 則是站在
 // 沙灘上的人完全不知道為什麼鏡頭不動了。這裡在連續失敗到一定次數後重新初始化。
-constexpr uint8_t RADIO_TX_FAIL_LIMIT = 5;    // client：連續 5 秒送不出去
+constexpr uint8_t RADIO_TX_FAIL_LIMIT = 5;    // client：連續 5 次 TX／RX 恢復失敗
 constexpr uint16_t RADIO_RX_ERR_LIMIT = 30;   // server：連續 30 次讀取錯誤
 constexpr uint32_t RADIO_RECOVER_MIN_MS = 30000;  // 兩次重建之間的最短間隔
 
@@ -1060,54 +910,269 @@ static bool recoverRadio() {
   clientRxFlag = false;
 #else
   radio.setDio1Action(onLoRaDio1);
-  rxDoneFlag = false;
+  serverRadioIrq = false;
 #endif
-  radio.startReceive();
+  if (radio.startReceive() != RADIOLIB_ERR_NONE) {
+    Log.println(F("[LoRa] ERROR: RX restart failed after re-init"));
+    return false;
+  }
   radioFailStreak = 0;
   Log.println(F("[LoRa] radio re-init ok"));
   return true;
 }
 
-#if defined(ROLE_SERVER)
-static const char *trackModeStr(TrackMode m) {
-  switch (m) {
-    case MODE_TRACKING: return "tracking";
-    case MODE_PAUSED:   return "paused";
-    case MODE_MANUAL:   return "manual";
-    default:            return "idle";
+#if defined(ROLE_CLIENT)
+static void handleClientTxResult(const async_lora_ack::Result &result) {
+  using async_lora_ack::Event;
+  if (result.event == Event::None || result.event == Event::Started) return;
+  clientRxReady = result.rxStatus == RADIOLIB_ERR_NONE;
+  if (!clientRxReady) nextClientRxRetryMs = millis() + 100;
+  if (result.event == Event::Sent) {
+    radioFailStreak = 0;
+    if (clientSendingData) { ++clientTxCount; haveDataSent = true; }
+  } else {
+    ++clientTxErrors;
+    if (clientSendingData) { expectedAck.clear(); haveDataSent = false; }
+    Log.print(F("[CLIENT] TX error=")); Log.println(result.txStatus);
+    if (++radioFailStreak >= RADIO_TX_FAIL_LIMIT) clientRxReady = recoverRadio();
   }
 }
 
-static bool servoWriteMicros(int us) {
-  if (!servoPwmReady) return false;
-  us = constrain(us, SERVO_MIN_US, SERVO_MAX_US);
-  // Convert the requested high pulse directly to a duty value.  This remains
-  // accurate at the GXServo's 333 Hz refresh rate (period ~= 3003 us).
-  uint32_t duty = (uint32_t)(((uint64_t)us * SERVO_PWM_HZ *
-                              SERVO_PWM_MAX_DUTY + 500000ULL) /
-                             1000000ULL);
+static void serviceClientRadio() {
+  handleClientTxResult(clientTransmitter.service(millis()));
+  if (clientTransmitter.active()) return;
+  if (!clientRxReady && loop_metrics::due(millis(), nextClientRxRetryMs)) {
+    clientRxFlag = false;
+    clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+    nextClientRxRetryMs = millis() + 100;
+    if (!clientRxReady && ++radioFailStreak >= RADIO_TX_FAIL_LIMIT) clientRxReady = recoverRadio();
+  }
+  if (!clientRxReady || !clientRxFlag) return;
+  clientRxFlag = false;
+  uint8_t buf[255];
+  const size_t actualLength = radio.getPacketLength();
+  const int state = radio.readData(buf, actualLength <= sizeof(buf) ? actualLength : sizeof(buf));
+  AckPayload ack{};
+  if (state == RADIOLIB_ERR_NONE && actualLength == ACK_PACKET_LEN &&
+      parseAckPacket(buf, actualLength, ack)) {
+    lastAckRxMs = millis(); ++ackRxCount;
+    lastAckRssiDbm10 = ack.rssiDbm10; lastAckSnrQuarterDb = ack.snrQuarterDb;
+  } else ++ackRejectedCount;
+  clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+  if (!clientRxReady) nextClientRxRetryMs = millis() + 100;
+}
+
+static void serviceClientTransmit() {
+  serviceClientRadio();
+  const uint32_t now = millis();
+  if (lora_schedule::claim(now, SEND_INTERVAL_MS, nextSendMs, dataSkippedSlots)) {
+    if (clientTransmitter.active() || !clientRxReady) { ++dataSkippedSlots; return; }
+    serviceGps();  // never package bytes still waiting in the UART queue
+    sendingDataSeq = txSeq;
+    lastDataAckCycle = sendingDataSeq % ACK_EVERY_N == 0;
+    if (!lora_schedule::dataFits(millis(), nextSendMs, dataAirtimeMs, ackAirtimeMs,
+                                TELEMETRY_SLOT_GUARD_MS, lastDataAckCycle)) {
+      ++dataSkippedSlots; return;
+    }
+    const size_t length = buildDataPacket(clientTxBuffer);
+    if (!length) { ++clientTxErrors; return; }
+    lastSendMs = millis(); haveDataSent = false;
+    clientSendingData = true; clientRxReady = false;
+    if (lastDataAckCycle) expectedAck.expect(sendingDataSeq, lastSendMs,
+        dataAirtimeMs + ackAirtimeMs + TELEMETRY_SLOT_GUARD_MS);
+    else expectedAck.clear();
+    handleClientTxResult(clientTransmitter.start(clientTxBuffer, length, lastSendMs,
+                                                dataAirtimeMs + TELEMETRY_SLOT_GUARD_MS));
+    return;
+  }
+  if (!clientTransmitter.active() && clientRxReady) {
+    const bool telemetryDue = loop_metrics::due(now, nextTelemetryMs);
+    const bool diagnosticDue = loop_metrics::due(now, nextDiagnosticMs);
+    const bool sendDiagnostic = diagnosticDue && !telemetryDue;
+    const uint32_t extraMs = sendDiagnostic ? diagnosticAirtimeMs : telemetryAirtimeMs;
+    if ((telemetryDue || diagnosticDue) && lora_schedule::telemetryFits(now, lastSendMs,
+        nextSendMs, dataAirtimeMs, extraMs, TELEMETRY_SLOT_GUARD_MS, haveDataSent, lastDataAckCycle)) {
+      const size_t length = sendDiagnostic ? buildDiagnosticPacket(clientTxBuffer) : buildTelemetryPacket(clientTxBuffer);
+      if (!length) return;
+      if (sendDiagnostic) nextDiagnosticMs = now + TELEMETRY_INTERVAL_MS;
+      else nextTelemetryMs = now + TELEMETRY_INTERVAL_MS;
+      clientSendingData = false; clientRxReady = false;
+      handleClientTxResult(clientTransmitter.start(clientTxBuffer, length, now,
+                                                  extraMs + TELEMETRY_SLOT_GUARD_MS));
+    }
+  }
+}
+#endif
+
+#if defined(ROLE_SERVER)
+static void recordPacketEvent(packet_diagnostics::Kind kind, uint32_t ms,
+                              const uint8_t *raw = nullptr, size_t length = 0,
+                              const DecodedData *data = nullptr, int16_t code = 0) {
+  packet_diagnostics::Event event;
+  event.kind = kind; event.ms = ms; event.length = length; event.code = code;
+  event.rssiDbm10 = static_cast<int16_t>(lroundf(receivedPacketRssi * 10));
+  event.snrQuarterDb = static_cast<int16_t>(lroundf(receivedPacketSnr * 4));
+  if (raw) {
+    event.rawLength = length < sizeof(event.raw) ? length : sizeof(event.raw);
+    memcpy(event.raw, raw, event.rawLength);
+    PacketHeader header{};
+    if (protocol::decodeHeader(raw, length, header)) {
+      event.clientId = header.clientId; event.seq = header.seq;
+    }
+  }
+  if (data) {
+    event.clientId = data->srcId; event.seq = data->seq;
+    event.sourceAgeMs = data->age10ms == 255 ? UINT16_MAX : uint16_t(data->age10ms) * 10;
+    event.flags = (data->fix ? 1 : 0) | (data->velocityValid ? 2 : 0);
+  }
+  packetEvents.push(event);
+}
+
+static void handleAckResult(const async_lora_ack::Result &result) {
+  using async_lora_ack::Event;
+  if (result.event == Event::None || result.event == Event::Started) return;
+  if (result.event == Event::Sent) {
+    ++ackTxCount;
+    ++rxWinAck;
+  } else if (result.event == Event::Failed || result.event == Event::Timeout) {
+    ++ackErrorCount;
+    lastAckError = result.txStatus;
+    recordPacketEvent(packet_diagnostics::Kind::AckError, millis(), nullptr, 0, nullptr, result.txStatus);
+  }
+  serverRxReady = result.rxStatus == RADIOLIB_ERR_NONE;
+  if (!serverRxReady) {
+    ++rxErrorCount;
+    ++rxWinErr;
+    rxWinLastErr = result.rxStatus;
+    nextServerRxRetryMs = millis() + 100;
+  }
+}
+
+static void serviceServerRadio() {
+  MeasureDuration timing(loraDuration);
+  handleAckResult(ackTransmitter.service(millis()));
+  if (!ackTransmitter.active() && !serverRxReady &&
+      loop_metrics::due(millis(), nextServerRxRetryMs)) {
+    serverRadioIrq = false;
+    const int16_t status = radio.startReceive();
+    serverRxReady = status == RADIOLIB_ERR_NONE;
+    nextServerRxRetryMs = millis() + 100;
+    if (!serverRxReady && ++radioFailStreak >= RADIO_RX_ERR_LIMIT) {
+      serverRxReady = recoverRadio();
+    }
+  }
+}
+#endif
+
+#if defined(ROLE_SERVER)
+static const char *trackModeStr(TrackMode mode) {
+  switch (mode) {
+    case TrackMode::Gps: return "gps";
+    case TrackMode::Uart: return "uart";
+    case TrackMode::Paused: return "paused";
+    default: return "manual";
+  }
+}
+
+static bool gpsTrackingUsable();
+static bool gpsModeAvailable();
+static void updateTracking();
+
+static bool setServoAngle(float deg) {
+  if (!servoPwmReady || !isfinite(deg)) return false;
+  deg = constrain(deg, 0.0f, 180.0f);
+  const uint32_t duty = servo_profile::dutyForAngle(deg);
+  if (duty == servoLastDuty) {
+    servoAngleDeg = deg;
+    return true;  // PWM hardware keeps sending the existing pulse
+  }
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   if (!ledcWrite(SERVO_PIN, duty)) {
     servoPwmReady = false;
     return false;
   }
-  return true;
 #else
   ledcWrite(SERVO_LEDC_CH, duty);
-  return true;
 #endif
-}
-
-static bool setServoAngle(float deg) {
-  deg = constrain(deg, 0.0f, 180.0f);
-  int us = SERVO_MIN_US +
-           (int)lroundf(deg / 180.0f * (SERVO_MAX_US - SERVO_MIN_US));
-  if (!servoWriteMicros(us)) return false;
+  servoLastDuty = duty;
   servoAngleDeg = deg;
   return true;
 }
 
+static void enterManual() {
+  uartServoMode.leave();
+  sourceSelector.reset();
+  controlSource = tracking_policy::Source::Hold;
+  servoTargetDeg = servoAngleDeg;
+  servoMotion.holdUs(micros());
+  commandGate.reset(esp_random());
+  trackMode = TrackMode::Manual;
+}
+
+static bool setGpsClientBinding(uint16_t id) {
+  if (id != 0 && !client_binding::validId(id)) return false;
+  if (prefs.putUShort("gpsclient", id) != sizeof(uint16_t)) return false;
+  if (id == gpsClientId) return true;
+  enterManual();
+  handleAckResult(ackTransmitter.cancel());
+  gpsClientId = id;
+  gpsClient = ClientState{};
+  gpsSequence = command_freshness::RadioSequence{};
+  haveClientDiagnostic = false; haveSourceEstimate = false;
+  lastDataIntervalMs = lastSourceEpochIntervalMs = 0;
+  rssiRingIdx = rssiRingCount = 0;
+  pktsThisWindow = pktWindowStartMs = 0;
+  cachedPktRate = 0.0f;
+  rxWinData = rxWinTelem = rxWinDrop = rxWinErr = rxWinAck = rxWinMissing = 0;
+  rxWinHaveSeq = false;
+  rxWinRssiSum = rxWinSnrSum = 0;
+  return true;
+}
+
+static void serviceControl() {
+  const uint32_t now = millis();
+  controlGap.observe(now);
+  if (trackMode == TrackMode::Uart) uartServoMode.poll();
+  const auto next = sourceSelector.update(
+      now, trackMode,
+      servoPwmReady && trackMode == TrackMode::Gps && gpsTrackingUsable(),
+      servoPwmReady && trackMode == TrackMode::Uart && uartServoMode.ready());
+  if (next != controlSource) {
+    controlSource = next;
+    servoMotion.holdUs(micros());
+    Log.print(F("[SERVO] source -> "));
+    Log.println(tracking_policy::sourceName(controlSource));
+  }
+  if (trackMode == TrackMode::Uart && controlSource == tracking_policy::Source::Uart) {
+    if (!servoMotion.target(uartServoMode.targetMdeg() / 1000.0)) servoMotion.holdUs(micros());
+  }
+  const bool permitted = servoPwmReady && (trackMode == TrackMode::Manual ||
+      controlSource == tracking_policy::Source::Gps ||
+      controlSource == tracking_policy::Source::Uart);
+  if (!permitted) servoMotion.holdUs(micros());
+  if(gpsCadence.poll(now)) updateTracking();
+  const uint32_t nowUs = micros();
+  {
+    MeasureDuration timing(motionDuration);
+    if (permitted && servoMotion.tickUs(nowUs) &&
+        !setServoAngle(static_cast<float>(servoMotion.position()))) {
+      servoMotion.initializeUs(servoAngleDeg, nowUs);  // retain last successful PWM command
+      servoMotion.faultUs(nowUs);
+    }
+  }
+  servoTargetDeg = static_cast<float>(servoMotion.requested());
+  if ((!servoPwmReady || servoMotion.faulted()) && trackMode != TrackMode::Paused) {
+    enterManual();
+    trackMode = TrackMode::Paused;
+    Log.println(F("[SERVO] control fault; motion paused"));
+  }
+}
+
 static bool initServo() {
+  // Diagnostics must distinguish reboots even if PWM initialization fails.
+  controlBootId = esp_random();
+  if (controlBootId == 0) controlBootId = 1;
+  commandGate.reset(esp_random());
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   servoPwmReady = ledcAttach(SERVO_PIN, SERVO_PWM_HZ, SERVO_PWM_RES_BITS);
 #else
@@ -1120,426 +1185,85 @@ static bool initServo() {
     Log.println(SERVO_PIN);
     return false;
   }
-  if (!setServoAngle(servoAngleDeg)) {  // centre on boot
-    Log.println(F("[SERVO] ERROR: initial PWM write failed"));
+  // First PWM command: physical position is unknown without servo feedback.
+  // Runtime slew starts from this commanded home; boot motion cannot be bounded.
+  if (!setServoAngle(90.0f)) {
     servoPwmReady = false;
+    Log.println(F("[SERVO] ERROR: boot centre PWM write failed"));
     return false;
   }
+  servoTargetDeg = servoAngleDeg;
+  servoMotion.initializeUs(servoAngleDeg, micros());
   Log.print(F("[SERVO] LEDC ready on IO"));
   Log.print(SERVO_PIN);
   Log.print(F(" at "));
   Log.print(SERVO_PWM_HZ);
   Log.print(F(" Hz/"));
   Log.print(SERVO_PWM_RES_BITS);
-  Log.print(F(" bit, centre "));
-  Log.print(servoAngleDeg, 0);
-  Log.println(F(" deg"));
+  Log.print(F(" bit; centred at 90 deg"));
+  Log.println();
   return true;
 }
 
-static void saveMagCalToNvs() {
-  prefs.putUChar("magaxa", magAxisA);
-  prefs.putUChar("magaxb", magAxisB);
-  prefs.putFloat("magoa", magOffsetA);
-  prefs.putFloat("magob", magOffsetB);
-  prefs.putBool("magcal", magCalibrated);
-  prefs.putFloat("magres", magCalResidualDeg);
-  prefs.putFloat("magell", magCalEllipseDeg);
-  prefs.putFloat("magsct", magCalScatterDeg);
-  prefs.putFloat("magfld", magCalFieldGauss);
-  prefs.putUChar("magver", MAG_CAL_VERSION);
+static uint32_t clientSampleAgeMs() {
+  if (!havePkt || lastData.age10ms == 255) return UINT32_MAX;
+  const uint64_t age = uint64_t(lastData.age10ms) * 10 + dataAirtimeMs + uint32_t(millis() - lastRxMs);
+  return age > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(age);
 }
-
-static void startMagCalibration() {
-  magCalState = MAGCAL_COLLECTING;
-  magCalCount = 0;
-  magCalBinMask = 0;
-  magCalHaveLast = false;
-  magCalOverflowSeen = false;
-  magCalStartMs = millis();
-  magCalError = "";
-  Log.println(F("[MAGCAL] started — turn the whole station through one slow "
-                   "full horizontal circle"));
+static bool clientFixFresh() {
+  return havePkt && lastData.fix && clientSampleAgeMs() <
+      tracking_policy::kGpsFreshMs - GPS_BACKLOG_GUARD_MS;
 }
+static bool haveBearingFix() { return clientFixFresh() && gpsFixFresh(); }
 
-static uint8_t magCalBinCount() {
-  uint8_t bits = 0;
-  for (uint8_t i = 0; i < MAG_CAL_BINS; i++) {
-    if (magCalBinMask & (1ULL << i)) bits++;
-  }
-  return bits;
-}
-
-static uint8_t magCalCoveragePct() {
-  return (uint8_t)((uint16_t)magCalBinCount() * 100 / MAG_CAL_BINS);
-}
-
-static const char *magAxisName(uint8_t a) {
-  return a == 0 ? "X" : (a == 1 ? "Y" : "Z");
-}
-
-// The axis that barely moves through a horizontal turn is the vertical one, so
-// the other two are the horizontal pair. Cyclic order ((k+1)%3, (k+2)%3) gives
-// axisA x axisB = +axis k, i.e. it assumes k points up; finishMagCalibration
-// swaps the pair if the locus says it points down instead.
-static void magCalPickPlane() {
-  uint8_t k = 0;
-  float smallest = magCalMax[0] - magCalMin[0];
-  for (uint8_t i = 1; i < 3; i++) {
-    float span = magCalMax[i] - magCalMin[i];
-    if (span < smallest) {
-      smallest = span;
-      k = i;
-    }
-  }
-  magCalAxisA = (uint8_t)((k + 1) % 3);
-  magCalAxisB = (uint8_t)((k + 2) % 3);
-}
-
-static void finishMagCalibration() {
-  magCalPickPlane();
-  float cx, cy, r;
-  if (!fitCircle(&magCalRaw[0][magCalAxisA], &magCalRaw[0][magCalAxisB], 3,
-                 magCalCount, cx, cy, r) ||
-      r <= 0.0f) {
-    magCalState = MAGCAL_FAILED;
-    magCalError = "circle fit failed";
-    Log.println(F("[MAGCAL] FAILED: circle fit did not converge"));
+static void updateDeclination() {
+  // TinyGPS date and location share the station receiver; no network/date entry.
+  // Recompute at 1 Hz, but revoke immediately when the live inputs become stale.
+  if (!gpsFixFresh() || !gps.date.isValid() || gps.date.age() >= 60000) {
+    declinationReady = false;
     return;
   }
-
-  // RMS distance from the fitted circle, expressed as the heading error it
-  // implies. A clean mount lands under ~1 deg; a few degrees means soft iron
-  // (the servo's steel gears) and the answer is to move the board, not to fit
-  // a fancier model.
-  // Handedness. The operator is asked to turn clockwise seen from above, which
-  // makes the angle round the fitted centre accumulate positive when the pair is
-  // the right way round — the same convention as the old flat-board
-  // atan2(By, Bx), so a stored mount_offset keeps its meaning. If it accumulated
-  // negative, the vertical axis runs the other way through the board: swapping
-  // the pair mirrors the angle and exchanges the fitted centre's coordinates.
-  double sweep = 0;
-  for (size_t i = 1; i < magCalCount; i++) {
-    float a0 = magCalRaw[i - 1][magCalAxisA] - cx;
-    float b0 = magCalRaw[i - 1][magCalAxisB] - cy;
-    float a1 = magCalRaw[i][magCalAxisA] - cx;
-    float b1 = magCalRaw[i][magCalAxisB] - cy;
-    sweep += angleDiff(degrees(atan2f(b1, a1)), degrees(atan2f(b0, a0)));
-  }
-  if (sweep < 0) {
-    uint8_t ta = magCalAxisA;
-    magCalAxisA = magCalAxisB;
-    magCalAxisB = ta;
-    float tc = cx;
-    cx = cy;
-    cy = tc;
-  }
-  magCalSweepDeg = (float)fabs(sweep);
-
-  // Radial error per sample, then split it. e(theta) ~= A cos2t + B sin2t is the
-  // ellipse; the samples are spread evenly round the circle by the 2 deg gate, so
-  // the cross term is negligible and each coefficient is one division.
-  double sum = 0, sA = 0, sB = 0, sAA = 0, sBB = 0;
-  for (size_t i = 0; i < magCalCount; i++) {
-    double dx = magCalRaw[i][magCalAxisA] - cx, dy = magCalRaw[i][magCalAxisB] - cy;
-    double e = sqrt(dx * dx + dy * dy) - r;
-    double t2 = 2.0 * atan2(dy, dx), c2 = cos(t2), s2 = sin(t2);
-    sum += e * e;
-    sA += e * c2;
-    sB += e * s2;
-    sAA += c2 * c2;
-    sBB += s2 * s2;
-  }
-  float rms = (float)sqrt(sum / magCalCount);
-  double ea = (sAA > 0) ? sA / sAA : 0.0;
-  double eb = (sBB > 0) ? sB / sBB : 0.0;
-  double amp = sqrt(ea * ea + eb * eb);
-  double scatter = 0;
-  for (size_t i = 0; i < magCalCount; i++) {
-    double dx = magCalRaw[i][magCalAxisA] - cx, dy = magCalRaw[i][magCalAxisB] - cy;
-    double e = sqrt(dx * dx + dy * dy) - r;
-    double t2 = 2.0 * atan2(dy, dx);
-    double res = e - (ea * cos(t2) + eb * sin(t2));
-    scatter += res * res;
-  }
-  // For semi-axes r+amp and r-amp the worst heading error is atan(amp/r) — the
-  // number that actually matters, unlike the raw Gauss amplitude.
-  magCalEllipseDeg = degrees(atanf((float)(amp / r)));
-  magCalScatterDeg = degrees(atanf((float)(sqrt(scatter / magCalCount) / r)));
-
-  magAxisA = magCalAxisA;
-  magAxisB = magCalAxisB;
-  magOffsetA = cx;
-  magOffsetB = cy;
-  magCalFieldGauss = r;
-  magCalResidualDeg = degrees(atanf(rms / r));
-  magCalibrated = true;
-  magFiltInit = false;  // re-seed the heading filter with corrected values
-  magAvgIdx = 0;        // samples taken with the old offsets are stale now
-  magAvgCount = 0;
-  magCalState = MAGCAL_DONE;
-  saveMagCalToNvs();
-
-  Log.print(F("[MAGCAL] done: horizontal axes="));
-  Log.print(magAxisName(magAxisA));
-  Log.print(',');
-  Log.print(magAxisName(magAxisB));
-  Log.print(F(" offset=("));
-  Log.print(magOffsetA, 4);
-  Log.print(F(", "));
-  Log.print(magOffsetB, 4);
-  Log.print(F(") G field="));
-  Log.print(magCalFieldGauss, 4);
-  Log.print(F(" G residual="));
-  Log.print(magCalResidualDeg, 2);
-  Log.print(F(" deg (ellipse "));
-  Log.print(magCalEllipseDeg, 2);
-  Log.print(F(" + scatter "));
-  Log.print(magCalScatterDeg, 2);
-  Log.print(F(") from "));
-  Log.print(magCalCount);
-  Log.print(F(" samples over "));
-  Log.print(magCalSweepDeg, 0);
-  Log.println(F(" deg of turn"));
-  // Which of the two dominates decides what to do next, so say it outright.
-  if (magCalEllipseDeg > 1.0f && magCalEllipseDeg > 2.0f * magCalScatterDeg) {
-    Log.println(F("[MAGCAL] locus is elliptical, not noisy: soft iron (servo steel "
-                     "gears / ferrous screws) or the board is not square to "
-                     "gravity. Turning more smoothly will not help — move the "
-                     "board."));
-  } else if (magCalScatterDeg > 1.0f && magCalScatterDeg > 2.0f * magCalEllipseDeg) {
-    Log.println(F("[MAGCAL] locus is noisy, not elliptical: the board tilted or "
-                     "vibrated during the turn (or the servo drew current). Turn "
-                     "on the tripod head, not by hand, and keep it level."));
-  }
-  if (magCalFieldGauss < 0.15f || magCalFieldGauss > 0.75f) {
-    Log.println(F("[MAGCAL] WARNING: fitted field is far from Earth's ~0.37 G "
-                     "— strong local interference?"));
-  }
-  // Independent check on the handedness decided above: in the northern
-  // hemisphere the field dips downward, so its component along the deduced "up"
-  // should be negative. Positive usually means the turn actually went
-  // anticlockwise, which leaves every later heading CHANGE with the wrong sign —
-  // the camera then corrects the wrong way after a tripod bump, with nothing
-  // else to hint at why. Hard iron on the vertical axis can flip this test too,
-  // so it only warns: the turn direction wins.
-  uint8_t upAxis = (uint8_t)(3 - magAxisA - magAxisB);
-  float upSign = (((magAxisA + 1) % 3) == magAxisB) ? 1.0f : -1.0f;
-  if (upSign * (magCalMin[upAxis] + magCalMax[upAxis]) * 0.5f > 0.0f) {
-    Log.println(F("[MAGCAL] WARNING: that turn looked anticlockwise (or the "
-                     "vertical axis is swamped by hard iron) — heading may run "
-                     "backwards. Check it: turn the tripod 90 deg clockwise and "
-                     "the heading should rise by ~90."));
-  }
+  static uint32_t lastUpdateMs = 0;
+  const uint32_t now = millis();
+  if (declinationReady && now - lastUpdateMs < 1000) return;
+  lastUpdateMs = now;
+  float year = 0.0f;
+  declinationReady = magnetic_declination::decimalYear(
+      gps.date.year(), gps.date.month(), gps.date.day(), year) &&
+      magnetic_declination::taiwanDegrees(
+          stationLatitude(), stationLongitude(), year, declinationDeg);
 }
 
-// Feed one RAW (uncalibrated) sample to the collector. Samples are accepted only
-// after the vector has swung MAG_CAL_MIN_STEP_DEG, which spreads them evenly
-// round the circle and stops a stationary rig from filling the buffer.
-static void collectMagCalSample(const float f[3]) {
-  for (uint8_t i = 0; i < 3; i++) {
-    if (magCalCount == 0) {
-      magCalMin[i] = magCalMax[i] = f[i];
-    } else {
-      if (f[i] < magCalMin[i]) magCalMin[i] = f[i];
-      if (f[i] > magCalMax[i]) magCalMax[i] = f[i];
-    }
-  }
-  magCalPickPlane();
-
-  // Bin against the running min/max midpoint rather than the origin: with a
-  // large hard-iron offset the origin can fall outside the locus entirely, and
-  // then the angle seen from it never sweeps a full 360 deg.
-  float refA = (magCalMin[magCalAxisA] + magCalMax[magCalAxisA]) * 0.5f;
-  float refB = (magCalMin[magCalAxisB] + magCalMax[magCalAxisB]) * 0.5f;
-  float ang = normalize360(degrees(atan2f(f[magCalAxisB] - refB,
-                                         f[magCalAxisA] - refA)));
-
-  if (magCalHaveLast && fabsf(angleDiff(ang, magCalLastAngle)) < MAG_CAL_MIN_STEP_DEG) {
-    return;
-  }
-  magCalLastAngle = ang;
-  magCalHaveLast = true;
-
-  if (magCalCount >= MAG_CAL_MAX_SAMPLES) {
-    // The buffer is full. Dropping new samples here would freeze the coverage
-    // mask, and the turn could then never complete — which is exactly what
-    // happens to a hand-turned rig: the 2 deg gate accepts backwards movement
-    // too, so wobble and backlash burn the budget on ground already covered.
-    // Halving instead keeps the whole turn represented, just more coarsely: the
-    // effective step doubles (2 -> 4 -> 8 deg), still finer than the 10 deg bins.
-    for (size_t i = 0; i * 2 < magCalCount; i++) {
-      magCalRaw[i][0] = magCalRaw[i * 2][0];
-      magCalRaw[i][1] = magCalRaw[i * 2][1];
-      magCalRaw[i][2] = magCalRaw[i * 2][2];
-    }
-    magCalCount = (magCalCount + 1) / 2;
-  }
-  magCalRaw[magCalCount][0] = f[0];
-  magCalRaw[magCalCount][1] = f[1];
-  magCalRaw[magCalCount][2] = f[2];
-  magCalCount++;
-
-  // Rebuild the coverage mask from every stored sample rather than OR-ing in the
-  // new bin. The first few degrees of movement can point at the wrong plane, and
-  // bins left over from that guess would let a partial turn pass as a full one.
-  // 180 atan2 per accepted sample is tens of microseconds.
-  magCalBinMask = 0;
-  for (size_t s = 0; s < magCalCount; s++) {
-    float sang = normalize360(degrees(atan2f(magCalRaw[s][magCalAxisB] - refB,
-                                            magCalRaw[s][magCalAxisA] - refA)));
-    magCalBinMask |= (1ULL << (uint8_t)(sang / (360.0f / MAG_CAL_BINS)));
-  }
-  if (magCalBinCount() >= MAG_CAL_BINS_REQUIRED) finishMagCalibration();
+// Both ends must have fresh Good or OK fixes; Bad/Miss cannot select GPS.
+static bool gpsModeAvailable() {
+  if (!haveBearingFix()) return false;
+  gnss_snapshot::Snapshot sample;
+  if (!gnssCollector.sample(millis(), sample) || sample.satellites == 255 ||
+      lastData.satellites == 255 || lastData.hdop10 == 255) return false;
+  return tracking_policy::usableGps(sample.fix, sample.satellites, sample.hdop,
+                                    sample.sourceAgeMs + sample.ageUncertaintyMs) &&
+         tracking_policy::usableGps(lastData.fix, lastData.satellites,
+                                    lastData.hdop10 / 10.0f,
+                                    clientSampleAgeMs() + GPS_BACKLOG_GUARD_MS);
 }
-
-static bool initMag() {
-  // 兩種板子版本的位址是互斥的，而且磁力計落在哪個位址就決定了螢幕在哪個位址：
-  //   QMC6310U 0x1C -> SH1106 0x3C  ／  QMC6310N 0x3C -> SH1106 0x3D
-  // 必須先試 0x1C：在 U 版板子上 0x3C 是螢幕，對它送磁力計的探測寫入毫無意義。
-  bool found = false;
-  if (mag.begin(Wire, QMC6310U_SLAVE_ADDRESS, OLED_SDA_PIN, OLED_SCL_PIN)) {
-    oledI2CAddr = OLED_ADDR_DEFAULT;
-    found = true;
-  } else if (mag.begin(Wire, QMC6310N_SLAVE_ADDRESS, OLED_SDA_PIN, OLED_SCL_PIN)) {
-    // N 版：磁力計佔了 0x3C，螢幕在 0x3D。沒有這一行的話 u8g2 會把畫面資料
-    // 寫進磁力計的暫存器 —— 螢幕全黑，而且不會有任何錯誤訊息。
-    oledI2CAddr = OLED_ADDR_ALT;
-    found = true;
-  }
-  if (found) {
-    // OSR_8 (was OSR_1) averages 8 samples inside the sensor, cutting the noise
-    // floor ~3x for free. That noise lands straight on the servo: heading feeds
-    // updateTracking() at 20 Hz and the 120 deg/s slew limit passes anything
-    // under 6 deg per tick, so an unfiltered ~0.5 deg jitter is visible shimmer
-    // on a telephoto shot.
-    // ODR drops 200 -> 50 Hz: we only sample every MAG_SAMPLE_MS (5 Hz), and a
-    // lower rate both keeps OSR_8 achievable and is quieter.
-    // Range stays at FS_8G (+/-800 uT) rather than the 4x finer FS_2G — the
-    // station sits next to a 42 kg servo motor, and saturating is worse than
-    // quantising (Earth's field is ~45 uT, so FS_8G is already ~30x finer than
-    // the noise floor).
-    mag.configMagnetometer(OperationMode::CONTINUOUS_MEASUREMENT,
-                           MagFullScaleRange::FS_8G, 50.0f,
-                           MagOverSampleRatio::OSR_8, MagDownSampleRatio::DSR_1);
-    Log.print(F("[MAG] QMC6310 init ok at 0x"));
-    Log.print(oledI2CAddr == OLED_ADDR_DEFAULT ? QMC6310U_SLAVE_ADDRESS
-                                               : QMC6310N_SLAVE_ADDRESS, HEX);
-    Log.print(F(" -> OLED at 0x"));
-    Log.println(oledI2CAddr, HEX);
-    return true;
-  }
-  Log.println(F("[MAG] QMC6310 not found (heading N/A, station assumed fixed)"));
-  return false;
-}
-
-static void sampleMag() {
-  if (!magOnline) {
-    magHeadingDeg = -1.0f;
-    return;
-  }
-  MagnetometerData d;
-  if (!mag.readData(d)) return;
-
-  if (d.overflow) {
-    if (magCalState == MAGCAL_COLLECTING) magCalOverflowSeen = true;
-    // Field exceeded full scale — the sample is meaningless. In practice this
-    // means the board is mounted too close to the servo motor or to a lead
-    // carrying servo current. Hold the last good heading and say so.
-    static uint32_t nextMagWarnMs = 0;
-    if (millis() >= nextMagWarnMs) {
-      nextMagWarnMs = millis() + 10000;
-      Log.println(F("[MAG] overflow: field over range — move the board away "
-                       "from the servo / power leads"));
-    }
-    return;
-  }
-
-  const float f[3] = {d.magnetic_field.x, d.magnetic_field.y, d.magnetic_field.z};
-
-  // Calibration runs on RAW samples: the whole point is to find the offset that
-  // is about to be subtracted below.
-  if (magCalState == MAGCAL_COLLECTING) {
-    collectMagCalSample(f);
-    if (magCalState == MAGCAL_COLLECTING &&
-        millis() - magCalStartMs > MAG_CAL_TIMEOUT_MS) {
-      magCalState = MAGCAL_FAILED;
-      magCalError = magCalOverflowSeen
-                        ? "field over range — board is too close to the servo"
-                        : (magCalCount < 8 ? "no rotation detected"
-                                           : "incomplete turn");
-      Log.print(F("[MAGCAL] FAILED: timeout at "));
-      Log.print(magCalCoveragePct());
-      Log.println(F("% coverage"));
-    }
-  }
-
-  // Hard-iron correction on the two horizontal axes. The offsets are zero and
-  // the pair is X,Y until a calibration has been run, which reproduces the
-  // original flat-board, uncorrected behaviour exactly.
-  float x = f[magAxisA] - magOffsetA;
-  float y = f[magAxisB] - magOffsetB;
-
-  magAvgX[magAvgIdx] = x;
-  magAvgY[magAvgIdx] = y;
-  magAvgIdx = (uint8_t)((magAvgIdx + 1) % MAG_AVG_WINDOW);
-  if (magAvgCount < MAG_AVG_WINDOW) magAvgCount++;
-
-  // Low-pass in vector space, not on the angle: averaging degrees is wrong
-  // across the 360/0 wrap. The station is meant to be stationary, so a ~0.5 s
-  // time constant costs nothing — it halves the noise reaching the servo and
-  // still settles a genuine tripod bump inside ~1.5 s.
-  if (!magFiltInit) {
-    magFiltX = x;
-    magFiltY = y;
-    magFiltInit = true;
-  } else {
-    magFiltX += MAG_FILTER_ALPHA * (x - magFiltX);
-    magFiltY += MAG_FILTER_ALPHA * (y - magFiltY);
-  }
-  if (magFiltX == 0.0f && magFiltY == 0.0f) return;  // degenerate, keep last
-  magHeadingDeg = normalize360(degrees(atan2f(magFiltY, magFiltX)));
-}
-
-// Heading used in tracking maths; 0 when no magnetometer (station assumed fixed).
-static float trackingHeading() {
-  return (magOnline && magHeadingDeg >= 0) ? magHeadingDeg : 0.0f;
-}
-
-// Heading used when LOCKING a calibration: the mean of the last MAG_AVG_WINDOW
-// samples rather than the latest one. Falls back to the live heading when there
-// is no history yet (straight after boot or a fresh hard-iron calibration).
-static float calibrationHeading(uint8_t *samplesUsed = nullptr) {
-  if (samplesUsed) *samplesUsed = magAvgCount;
-  if (!magOnline || magAvgCount == 0) return trackingHeading();
-  double sx = 0, sy = 0;
-  for (uint8_t i = 0; i < magAvgCount; i++) {
-    sx += magAvgX[i];
-    sy += magAvgY[i];
-  }
-  if (sx == 0.0 && sy == 0.0) return trackingHeading();
-  return normalize360(degrees(atan2(sy, sx)));
-}
-
-static bool haveBearingFix() {
-  return havePkt && lastData.fix && gpsFixFresh();
+static bool gpsTrackingUsable() {
+  return mountCalibrated && declinationReady && gpsModeAvailable();
 }
 
 // Project the last received client position forward along its velocity vector.
 //
-// Position packets arrive at 1 Hz, so lastData is already up to a second stale
-// by the time it is used; without this the camera can only step once per packet
-// and freezes completely whenever one is dropped. speedCmS / courseDeg10 are
-// already in the payload, so the projection costs nothing on the air.
-//
-// Constant velocity only: accelCmS2 is a heavily smoothed derivative of GPS
-// speed, and squaring it into the projection overshoots badly exactly when it
-// matters (a surfer dropping into a wave).
+// Alpha ON projects between packets; OFF uses the received position. The age
+// includes the source epoch estimate, RF airtime and time since reception.
+// GNSS internal latency is not measured; the additional local uncertainty guard
+// affects expiry only, never inflates the projection time.
 static void predictClientPos(double &lat, double &lon) {
   lat = lastData.lat;
   lon = lastData.lon;
-  if (lastData.speedCmS < DR_MIN_SPEED_CMS) return;  // course is noise when idle
-  float ageS = (millis() - lastRxMs) / 1000.0f;
+  if (!gpsPredictionEnabled) return;  // alpha = 0: retain the last GPS position
+  if (!lastData.velocityValid || lastData.speedCmS == UINT16_MAX ||
+      lastData.courseDeg10 >= 3600 || lastData.speedCmS < DR_MIN_SPEED_CMS) return;  // course is noise when idle
+  if (!clientFixFresh()) return;
+  float ageS = clientSampleAgeMs() / 1000.0f;
   if (ageS <= 0.0f) return;
   // Cap the projection instead of letting it run away when the link drops: the
   // camera coasts for ~2 packets, then holds.
@@ -1553,58 +1277,30 @@ static void predictClientPos(double &lat, double &lon) {
   }
 }
 
-// Recompute and command the servo while tracking.
+// Recompute the GPS target; the elapsed-time Servo output is independent.
 // Driven from loop() every TRACK_UPDATE_MS, not by packet arrival.
 static void updateTracking() {
-  if (trackMode != MODE_TRACKING || !mountCalibrated || !haveBearingFix()) {
-    lastServoStepMs = 0;  // a later resume must not see a huge slew dt
-    headingFrozen = false;
+  if (trackMode != TrackMode::Gps || controlSource != tracking_policy::Source::Gps ||
+      !gpsTrackingUsable()) {
     return;
-  }
-
-  // Heading freeze (see MAG_FREEZE_DEADBAND_DEG): snapshot on entry and hold,
-  // so magnetometer noise never reaches the servo. Only a swing bigger than the
-  // deadband counts as the tripod actually having been moved, and re-snapshots
-  // to the live value — which resets the error well inside the band, giving
-  // hysteresis for free instead of chattering at the threshold.
-  float liveHeading = trackingHeading();
-  if (!headingFrozen) {
-    frozenHeadingDeg = liveHeading;
-    headingFrozen = true;
-  } else if (fabsf(angleDiff(liveHeading, frozenHeadingDeg)) >
-             MAG_FREEZE_DEADBAND_DEG) {
-    frozenHeadingDeg = liveHeading;
   }
 
   double clientLat, clientLon;
   predictClientPos(clientLat, clientLon);
-  float bearing = (float)computeBearing(gps.location.lat(), gps.location.lng(),
+  float bearing = (float)computeBearing(stationLatitude(), stationLongitude(),
                                         clientLat, clientLon);
-  float target = normalize360(frozenHeadingDeg + mountOffsetDeg - bearing);
+  float target = normalize360(magnetic_declination::trueBearing(
+      mountOffsetDeg, declinationDeg) - bearing);
   if (target > 270.0f) target -= 360.0f;  // wrap small negatives toward 0
-  servoTargetDeg = constrain(target, 0.0f, 180.0f);
+  servoTargetDeg = constrain(target,0.0f,180.0f);
+  if (!servoMotion.target(servoTargetDeg)) servoMotion.holdUs(micros());
 
-  // Rate-limit the pan. A single bad GPS sample, or a resume from a far-off
-  // angle, would otherwise whip the camera across at the servo's full ~400°/s.
-  uint32_t now = millis();
-  float dt = (lastServoStepMs == 0) ? 0.0f : (now - lastServoStepMs) / 1000.0f;
-  lastServoStepMs = now;
-  if (dt <= 0.0f || dt > 0.5f) dt = TRACK_UPDATE_MS / 1000.0f;
-  float maxStep = SERVO_MAX_SLEW_DEG_S * dt;
-  float step = constrain(servoTargetDeg - servoAngleDeg, -maxStep, maxStep);
-
-  if (!setServoAngle(servoAngleDeg + step)) {
-    trackMode = MODE_PAUSED;
-    Log.println(F("[SERVO] ERROR: PWM write failed; tracking paused"));
-    return;
-  }
-  static uint32_t nextTrackLogMs = 0;
-  if (millis() >= nextTrackLogMs) {
-    nextTrackLogMs = millis() + 3000;
+  // Only the common motion backend can write PWM.
+  static uint32_t lastTrackLogMs = 0;
+  if (millis() - lastTrackLogMs >= 3000) {
+    lastTrackLogMs = millis();
     Log.print(F("[TRACK] bearing="));
     Log.print(bearing, 1);
-    Log.print(F(" head="));
-    Log.print(frozenHeadingDeg, 1);
     Log.print(F(" off="));
     Log.print(mountOffsetDeg, 1);
     Log.print(F(" servo="));
@@ -1615,48 +1311,28 @@ static void updateTracking() {
 }
 
 // Lock the servo-to-world offset from one statement: "the camera is looking at
-// camBearing while the servo reads servoDeg". startTracking() 與地標校正都走這裡，
-// 差別只在 camBearing 從哪來（衝浪者的實際方位，或地標的座標）。
-static float lockMountOffset(float camBearing, float servoDeg, float &headUsed,
-                             uint8_t &headSamples) {
-  headUsed = calibrationHeading(&headSamples);
-  float off = normalize360(camBearing - headUsed + servoDeg);
-  if (off > 180.0f) off -= 360.0f;
-  mountOffsetDeg = off;
+// camBearing while the servo reads servoDeg". Only explicit compass calibration writes this reference.
+static float lockMountOffset(float compassBearing, float servoDeg) {
+  mountOffsetDeg = normalize360(compassBearing + servoDeg);
+  if (mountOffsetDeg > 180.0f) mountOffsetDeg -= 360.0f;
   mountCalibrated = true;
-  mountCalHeadingDeg = headUsed;
-  headingFrozen = false;  // re-snapshot against the new offset
-  saveMountOffsetToNvs();
   return mountOffsetDeg;
 }
 
-// Lock the servo-to-world mounting offset from the current aim, then track.
-// Calibration uses the same dead-reckoned position as updateTracking(), so the
-// offset does not silently absorb whatever projection drift happened to exist
-// at the moment the operator pressed start.
-static bool startTracking() {
-  if (!haveBearingFix()) return false;
-  double clientLat, clientLon;
-  predictClientPos(clientLat, clientLon);
-  float bearingCal = (float)computeBearing(gps.location.lat(), gps.location.lng(),
-                                           clientLat, clientLon);
-  uint8_t headSamples = 0;
-  float headCal = 0.0f;
-  lockMountOffset(bearingCal, servoAngleDeg, headCal, headSamples);
-  trackMode = MODE_TRACKING;
-  Log.print(F("[TRACK] start: bearing="));
-  Log.print(bearingCal, 1);
-  Log.print(F(" head="));
-  Log.print(headCal, 1);
-  Log.print(F("(avg of "));
-  Log.print(headSamples);
-  Log.print(F(")"));
-  Log.print(F(" servo="));
-  Log.print(servoAngleDeg, 1);
-  Log.print(F(" -> mount_offset="));
-  Log.println(mountOffsetDeg, 1);
-  updateTracking();
-  return servoPwmReady;
+// Only the explicitly selected source is enabled. Switching closes old UART
+// input before opening a new UART session; calibration remains in RAM.
+static bool selectTrackingMode(TrackMode mode) {
+  if (!servoPwmReady || (mode != TrackMode::Gps && mode != TrackMode::Uart)) return false;
+  if (mode == TrackMode::Gps && !gpsModeAvailable()) return false;
+  if (trackMode == mode) return true;
+  enterManual();
+  trackMode = mode;
+  lastTrackingMode = mode;
+  if (mode == TrackMode::Uart) uartServoMode.enter(commandGate.epoch());
+
+  Log.print(F("[TRACK] mode -> "));
+  Log.println(trackModeStr(mode));
+  return true;
 }
 
 // One line a minute instead of one per packet: everything you would otherwise
@@ -1667,11 +1343,9 @@ static void logRxSummary() {
     return;  // nothing arrived; the idle log already covers a dead link
   }
 
-  // Sequence span gives the loss count, but a client reboot inside the window
-  // restarts seq at 0 and the unsigned span then wraps to ~65000 — which would
-  // print as "pkt=59/65478 (0%)" and read as a dead link. Only trust a span that
-  // could actually have happened in a minute at 1 Hz.
-  uint16_t expected = rxWinHaveSeq ? (uint16_t)(rxWinLastSeq - rxWinFirstSeq + 1) : 0;
+  // Count gaps only between continuously accepted DATA; exclude reboot
+  // resynchronization and the independent telemetry/diagnostic sequences.
+  uint32_t expected = rxWinData + rxWinMissing;
   if (expected < rxWinData || expected > 600) expected = 0;
   Log.print(F("[SERVER] RX 60s | pkt="));
   Log.print(rxWinData);
@@ -1723,37 +1397,26 @@ static void logRxSummary() {
   Log.print(gpsFixFresh() ? 1 : 0);
   Log.print(F(" sats="));
   Log.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
-  if (lastData.fix && gpsFixFresh()) {
+  if (haveBearingFix()) {
     Log.print(F(" | dist="));
-    Log.print((uint32_t)equirectDistanceM(gps.location.lat(), gps.location.lng(),
+    Log.print((uint32_t)equirectDistanceM(stationLatitude(), stationLongitude(),
                                           lastData.lat, lastData.lon));
     Log.print(F("m brg="));
-    Log.print((float)computeBearing(gps.location.lat(), gps.location.lng(),
+    Log.print((float)computeBearing(stationLatitude(), stationLongitude(),
                                     lastData.lat, lastData.lon), 0);
   }
-  Log.print(F(" | head="));
-  if (magOnline && magHeadingDeg >= 0) Log.print(magHeadingDeg, 1);
-  else Log.print(F("N/A"));
   Log.print(F(" servo="));
   Log.print(servoAngleDeg, 1);
   Log.print(' ');
   Log.println(trackModeStr(trackMode));
 
-  rxWinData = rxWinTelem = rxWinDrop = rxWinErr = rxWinAck = 0;
+  rxWinData = rxWinTelem = rxWinDrop = rxWinErr = rxWinAck = rxWinMissing = 0;
   rxWinHaveSeq = false;
   rxWinRssiSum = rxWinSnrSum = 0;
 }
 
-// Upper bound on the aim error the current pose carries, from the elliptical part
-// of the magnetometer calibration. For e(theta) = A sin(2theta + phi) the leak is
-// e(now) - e(cal) = 2A cos(...) sin(now - cal), so |leak| <= 2A |sin(dTheta)|:
-// zero in the calibration pose, worst 90 deg away. -1 when it cannot be known.
-static float poseAimErrorDeg(float deltaDeg) {
-  if (magCalEllipseDeg < 0.0f) return -1.0f;
-  return 2.0f * magCalEllipseDeg * fabsf(sinf(radians(deltaDeg)));
-}
-
 static void renderServerDisplay() {
+  MeasureDuration timing(oledDuration);
   // Centre label column ("V" / T/H / GPS / BAT) is framed by two vertical lines;
   // Server values sit left of it, client values right of it. The 15 px labels get
   // a 1 px gap to each line; the odd rounding pixel is biased to the right.
@@ -1765,10 +1428,7 @@ static void renderServerDisplay() {
 
   SigLevel sGps = serverGpsState();
 
-  // Right region rotates the selected whitelist client every 5 seconds.
-  size_t clientCount = clientWhitelistCount > 0 ? clientWhitelistCount : 1;
-  size_t clientIdx = (millis() / 5000UL) % clientCount;
-  uint16_t selectedId = clientWhitelistCount > 0 ? clientWhitelist[clientIdx] : 0;
+  const uint16_t selectedId = gpsClientId;
   bool selectedOnline = havePkt && (lastData.srcId == selectedId) &&
                         ((millis() - lastRxMs) <= LINK_WARN_MS);
   bool selectedTelemetry = haveTelemetry && (lastTelemetry.srcId == selectedId);
@@ -1780,11 +1440,9 @@ static void renderServerDisplay() {
   } else {
     int   csats = (lastData.satellites != 0xFF) ? (int)lastData.satellites : 0;
     float chdop = (lastData.hdop10 != 0xFF) ? lastData.hdop10 / 10.0f : 99.9f;
-    cGps = gpsSignal(lastData.fix, csats, chdop);
+    cGps = gpsSignal(clientFixFresh(), csats, chdop);
   }
 
-  // 32 而非 24：GCC 對 "Client %u/%u" 會假設 %u 最多 10 位數（-Wformat-truncation），
-  // 實際上 clientWhitelistCount 上限是 WHITELIST_MAX=16，永遠不會截斷。
   char buf[32];
   display.clearBuffer();
   display.setFont(u8g2_font_5x7_tr);
@@ -1804,12 +1462,8 @@ static void renderServerDisplay() {
   // --- Title row ---
   drawLeft(8, "Server");
   drawMid(8, "V");
-  if (clientWhitelistCount > 0) {
-    snprintf(buf, sizeof(buf), "Client %u/%u", (unsigned)(clientIdx + 1),
-             (unsigned)clientWhitelistCount);
-  } else {
-    snprintf(buf, sizeof(buf), "Client -/-");
-  }
+  if (gpsClientId != 0) snprintf(buf, sizeof(buf), "Client %04X", gpsClientId);
+  else snprintf(buf, sizeof(buf), "Unbound");
   drawRight(8, buf);
 
   // Header separator under the title row (table look).
@@ -1862,67 +1516,127 @@ static void renderServerDisplay() {
   char wifiBuf[64];
   if (WiFi.status() == WL_CONNECTED && !cachedApIp.isEmpty()) {
     snprintf(wifiBuf, sizeof(wifiBuf), "%s", cachedApIp.c_str());
-  } else if (millis() < wifiReconnectingUntilMs) {
+  } else if (wifiReconnectingUntilMs != 0 &&
+             !loop_metrics::due(millis(), wifiReconnectingUntilMs)) {
     snprintf(wifiBuf, sizeof(wifiBuf), "WiFi connecting: %s ...", WIFI_SSID);
   } else {
     uint32_t remain =
-        nextWifiRetryMs > millis() ? (nextWifiRetryMs - millis()) / 1000 + 1 : 0;
+        !loop_metrics::due(millis(), nextWifiRetryMs) ? (nextWifiRetryMs - millis()) / 1000 + 1 : 0;
     snprintf(wifiBuf, sizeof(wifiBuf), "reconnecting to %s in %lus", WIFI_SSID,
              (unsigned long)remain);
   }
   display.drawStr(64 - display.getStrWidth(wifiBuf) / 2, 63, wifiBuf);
 
-  display.sendBuffer();
+  oledNextRow=0;
 }
+static void serviceServerDisplay() {
+  if(oledNextRow>=8)return;
+  MeasureDuration timing(oledDuration);
+  display.updateDisplayArea(0,oledNextRow++,16,1);
+  if(oledNextRow==8)++oledFrames;
+}
+
 #endif
 
 #if defined(ROLE_SERVER)
-// 站體從鎖定 mount_offset 之後被轉了多少，以及那個姿態差隱含的瞄準誤差。
-// /api/track、/api/status 與現場提醒共用同一個計算，數字才不會互相矛盾。
-static bool poseErrorNow(float &deltaDeg, float &errDeg) {
-  if (!(mountCalibrated && mountCalHeadingDeg >= 0.0f && magOnline &&
-        magHeadingDeg >= 0.0f)) {
-    deltaDeg = 0.0f;
-    errDeg = -1.0f;
-    return false;
-  }
-  deltaDeg = angleDiff(magHeadingDeg, mountCalHeadingDeg);
-  errDeg = poseAimErrorDeg(deltaDeg);
+// Shared Servo status for track and status endpoints.
+static void appendCommandContext(String &js) {
+  js += F("\"control_boot_id\":"); js += String(controlBootId);
+  js += F(",\"control_epoch\":"); js += String(commandGate.epoch());
+  js += F(",\"command_seq\":"); js += String(commandGate.sequence());
+  js += F(",\"clock_ms\":"); js += String(millis());
+}
+
+static String controlReply() {
+  String js = F("{\"ok\":true,\"mode\":\""); js += trackModeStr(trackMode);
+  js += F("\",\"angle\":"); js += String(servoAngleDeg, 3);
+  js += F(",\"target\":"); js += String(servoMotion.requested(), 3); js += ',';
+  appendCommandContext(js); js += '}'; return js;
+}
+
+static String motionSettingsJson() {
+  String js=F("{\"ok\":true,\"speed\":");js+=String(servoMotion.speed(),3);
+  js+=F(",\"min_speed\":1,\"max_speed\":90,\"default_speed\":30,");
+  appendCommandContext(js);js+='}';return js;
+}
+
+static String gpsPredictionJson() {
+  String js = F("{\"ok\":true,\"enabled\":");
+  js += gpsPredictionEnabled ? F("true") : F("false");
+  js += F(",\"alpha\":"); js += gpsPredictionEnabled ? '1' : '0';
+  js += F(",\"default_enabled\":true,");
+  appendCommandContext(js); js += '}'; return js;
+}
+
+static bool saveGpsPrediction(bool enabled) {
+  const uint32_t saved = enabled ? 1 : 0;
+  if (prefs.getUInt(GPS_PREDICTION_KEY, UINT32_MAX) != saved &&
+      (prefs.putUInt(GPS_PREDICTION_KEY, saved) != sizeof(saved) ||
+       prefs.getUInt(GPS_PREDICTION_KEY, UINT32_MAX) != saved)) return false;
+  // The next GPS target tick uses this setting. Mode, calibration and the
+  // common Servo rate limiter remain intact; no direct PWM write here.
+  gpsPredictionEnabled = enabled;
   return true;
 }
 
-// servo / mag 兩個區塊原本在 /api/track 與 /api/status 各寫一份，欄位還不完全
-// 一致（前端得靠兩個端點拼一份狀態）。統一成同一份輸出，兩邊就不可能再走岔。
-static void appendServoMagJson(String &js) {
-  float poseDelta = 0.0f, poseErr = -1.0f;
-  bool posePossible = poseErrorNow(poseDelta, poseErr);
+// Persist a single value before applying it. No separate Apply/Save stages.
+static bool saveServoSpeed(double speed) {
+  if(!servo_motion::validSpeed(speed))return false;
+  const uint32_t saved=servo_motion::encodeSpeed(speed);
+  if(prefs.getUInt(servo_motion::kSpeedKey,0)!=saved &&
+      (prefs.putUInt(servo_motion::kSpeedKey,saved)!=sizeof(saved) ||
+       prefs.getUInt(servo_motion::kSpeedKey,0)!=saved))return false;
+  return servoMotion.setSpeed(saved/1000.0);
+}
 
+static bool requestTrackingMode(TrackMode mode) {
+  if(!servoPwmReady) {
+    httpServer.send(503,"application/json","{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+    return false;
+  }
+  if(mode==TrackMode::Gps && !gpsModeAvailable()) {
+    httpServer.send(409,"application/json","{\"ok\":false,\"error\":\"GPS requires fresh Good or OK signals from Server and Client\"}");
+    return false;
+  }
+  return selectTrackingMode(mode);
+}
+
+static void appendServoJson(String &js) {
   js += F("\"servo\":{\"angle\":");
   js += String(servoAngleDeg, 1);
   js += F(",\"target\":");
   js += String(servoTargetDeg, 1);
+  js += F(",\"moving\":"); js += servoMotion.moving() ? F("true") : F("false");
+  js += F(",\"speed_limit_deg_s\":"); js += String(servoMotion.speed(),3);
+  js += F(",\"prediction_enabled\":"); js += gpsPredictionEnabled ? F("true") : F("false");
+  js += F(",\"prediction_alpha\":"); js += gpsPredictionEnabled ? '1' : '0';
+  js += F(",\"velocity_deg_s\":"); js += String(servoMotion.velocity(), 3);
+  js += F(",\"motion_fault\":"); js += servoMotion.faulted() ? F("true") : F("false");
+  js += F(",\"rejected_commands\":"); js += String(rejectedMotionCommands);
+  js += F(",\"rejected_gps_sequence\":"); js += String(rejectedGpsSequence); js += ',';
+  appendCommandContext(js);
   js += F(",\"mode\":\"");
   js += trackModeStr(trackMode);
-  js += F("\",\"calibrated\":");
+  js += F("\",\"source\":\"");
+  js += trackMode == TrackMode::Manual ? "manual" : tracking_policy::sourceName(controlSource);
+  js += F("\",\"gps_available\":");
+  js += gpsModeAvailable() ? F("true") : F("false");
+  js += F(",\"gps_usable\":");
+  js += gpsTrackingUsable() ? F("true") : F("false");
+  js += F(",\"gps_ready\":");
+  js += sourceSelector.gpsReady() ? F("true") : F("false");
+  js += F(",\"calibrated\":");
   js += mountCalibrated ? F("true") : F("false");
   js += F(",\"pwm_ok\":");
   js += servoPwmReady ? F("true") : F("false");
+  js += F(",\"uart_state\":\"");
+  js += uartServoMode.stateName();
+  js += F("\",\"uart_ready\":");
+  js += uartServoMode.ready() ? F("true") : F("false");
   js += F(",\"mount_offset_deg\":");
   js += String(mountOffsetDeg, 1);
-  js += F(",\"cal_heading\":");
-  js += mountCalHeadingDeg >= 0.0f ? String(mountCalHeadingDeg, 1) : F("null");
-  js += F(",\"pose_delta_deg\":");
-  js += posePossible ? String(poseDelta, 1) : F("null");
-  js += F(",\"pose_err_deg\":");
-  js += poseErr >= 0.0f ? String(poseErr, 2) : F("null");
-  js += F("},\"mag\":{\"online\":");
-  js += magOnline ? F("true") : F("false");
-  js += F(",\"heading\":");
-  js += (magOnline && magHeadingDeg >= 0) ? String(magHeadingDeg, 1) : F("-1");
-  js += F(",\"calibrated\":");
-  js += magCalibrated ? F("true") : F("false");
-  js += F(",\"residual_deg\":");
-  js += magCalResidualDeg >= 0 ? String(magCalResidualDeg, 2) : F("null");
+  js += F(",\"north_reference\":\"magnetic\",\"declination_deg\":");
+  js += declinationReady ? String(declinationDeg, 2) : F("null");
   js += '}';
 }
 
@@ -1935,8 +1649,8 @@ static String buildTrackJson() {
   js += F("{\"linked\":");
   js += linked ? F("true") : F("false");
   js += F(",\"bearing\":");
-  if (havePkt && lastData.fix && gpsFixFresh()) {
-    js += String(computeBearing(gps.location.lat(), gps.location.lng(),
+  if (haveBearingFix()) {
+    js += String(computeBearing(stationLatitude(), stationLongitude(),
                                 lastData.lat, lastData.lon), 1);
   } else {
     js += F("-1");
@@ -1946,25 +1660,31 @@ static String buildTrackJson() {
   js += F(",\"lon\":");
   js += havePkt ? String(lastData.lon, 6) : F("0");
   js += F(",\"fix\":");
-  js += havePkt ? String(lastData.fix) : F("0");
+  js += clientFixFresh() ? F("1") : F("0");
+  js += F(",\"velocity_valid\":");
+  js += clientFixFresh() && lastData.velocityValid ? F("true") : F("false");
   js += F(",\"speed_cms\":");
-  js += havePkt ? String(lastData.speedCmS) : F("0");
+  js += havePkt && lastData.speedCmS != UINT16_MAX ? String(lastData.speedCmS) : F("null");
   js += F(",\"course_deg10\":");
-  js += havePkt ? String(lastData.courseDeg10) : F("0");
-  js += F(",\"accel_cms2\":");
-  js += havePkt ? String(lastData.accelCmS2) : F("0");
+  js += havePkt && lastData.courseDeg10 < 3600 ? String(lastData.courseDeg10) : F("null");
+  js += F(",\"satellite_class\":"); js += havePkt ? String(lastData.satelliteClass) : F("0");
   js += F(",\"satellites\":");
-  js += (havePkt && lastData.satellites != 0xFF) ? String(lastData.satellites)
-                                                 : F("-1");
+  js += haveTelemetry && lastTelemetry.satellites != 255 && millis() - lastTelemetryRxMs < 90000 ?
+      String(lastTelemetry.satellites) : F("null");
+  js += F(",\"satellites_age_ms\":");
+  js += haveTelemetry ? String(uint32_t(millis() - lastTelemetryRxMs)) : F("null");
   js += F(",\"hdop\":");
-  js += (havePkt && lastData.hdop10 != 0xFF) ? String(lastData.hdop10 / 10.0f, 1)
-                                             : F("-1");
+  js += havePkt && lastData.hdop10 != 255 ? String(lastData.hdop10 / 10.0f, 1) : F("null");
+  js += F(",\"rx_age_ms\":"); js += havePkt ? String(uint32_t(millis() - lastRxMs)) : F("null");
+  js += F(",\"source_age_ms\":"); js += havePkt && lastData.age10ms != 255 ? String(uint32_t(lastData.age10ms) * 10) : F("null");
+  js += F(",\"sample_age_ms\":"); js += clientSampleAgeMs() != UINT32_MAX ? String(clientSampleAgeMs()) : F("null");
+  js += F(",\"age_basis\":\"nmea_epoch_aligned_arrival\"");
   js += F(",\"last_rx_sec\":");
   js += (havePkt && sinceRx != UINT32_MAX) ? String(sinceRx) : F("-1");
   js += F("},\"server\":{\"lat\":");
-  js += gpsFixFresh() ? String(gps.location.lat(), 6) : F("0");
+  js += gpsFixFresh() ? String(stationLatitude(), 6) : F("0");
   js += F(",\"lon\":");
-  js += gpsFixFresh() ? String(gps.location.lng(), 6) : F("0");
+  js += gpsFixFresh() ? String(stationLongitude(), 6) : F("0");
   js += F(",\"fix\":");
   js += gpsFixFresh() ? F("1") : F("0");
   js += F(",\"satellites\":");
@@ -2000,20 +1720,22 @@ static String buildTrackJson() {
             ? String((uint32_t)((millis() - lastTelemetryRxMs) / 1000))
             : F("-1");
   js += F("},");
-  appendServoMagJson(js);
+  appendServoJson(js);
   js += '}';
   return js;
 }
 
+// Preserve the existing HTTP shape, with an explicit one-client capacity.
 static String buildWhitelistJson() {
   String js = F("{\"whitelist\":[");
-  for (size_t i = 0; i < clientWhitelistCount; i++) {
-    if (i > 0) js += ',';
+  if (gpsClientId != 0) {
     char hex[5];
-    snprintf(hex, sizeof(hex), "%04X", clientWhitelist[i]);
+    snprintf(hex, sizeof(hex), "%04X", gpsClientId);
     js += '"'; js += hex; js += '"';
   }
-  js += F("],\"count\":"); js += String(clientWhitelistCount); js += '}';
+  js += F("],\"count\":");
+  js += gpsClientId != 0 ? '1' : '0';
+  js += F(",\"capacity\":1}");
   return js;
 }
 
@@ -2050,10 +1772,10 @@ static void appendAlertsJson(String &js) {
 
   // --- 下水端：連線 -------------------------------------------------------
   int32_t sinceRx = havePkt ? (int32_t)((millis() - lastRxMs) / 1000) : -1;
-  if (!havePkt) {
+  if (trackMode == TrackMode::Gps && !havePkt) {
     add(alerts::WARN, "client_never", "還沒收到追蹤器的訊號",
-        "請確認追蹤器已經開機（長按電源鍵），而且它的 ID 已經加進白名單。");
-  } else {
+        "請確認追蹤器已經開機（長按電源鍵），而且攝影站已綁定它的 ID。");
+  } else if (trackMode == TrackMode::Gps) {
     alerts::Level l = alerts::linkLevel(sinceRx);
     if (l == alerts::ERROR) {
       add(l, "client_link", "和追蹤器失去連線",
@@ -2106,10 +1828,10 @@ static void appendAlertsJson(String &js) {
   }
 
   // --- 下水端：衛星 -------------------------------------------------------
-  if (havePkt && sinceRx >= 0 && (uint32_t)sinceRx < alerts::kLinkWarnSec) {
+  if (trackMode == TrackMode::Gps && havePkt && sinceRx >= 0 && (uint32_t)sinceRx < alerts::kLinkWarnSec) {
     int csats = (lastData.satellites != 0xFF) ? (int)lastData.satellites : 0;
     float chdop = (lastData.hdop10 != 0xFF) ? lastData.hdop10 / 10.0f : 99.9f;
-    SigLevel g = gpsSignal(lastData.fix, csats, chdop);
+    SigLevel g = gpsSignal(clientFixFresh(), csats, chdop);
     if (g == SIG_BAD || g == SIG_MISS) {
       add(alerts::WARN, "client_gps", "追蹤器收不到足夠的衛星",
           "鏡頭可能會追到錯的位置。請確認追蹤器沒有被身體、衝浪板或濕毛巾蓋住，"
@@ -2150,7 +1872,8 @@ static void appendAlertsJson(String &js) {
     }
   }
 
-  if (serverGpsState() == SIG_BAD || serverGpsState() == SIG_MISS) {
+  if (trackMode == TrackMode::Gps &&
+      (serverGpsState() == SIG_BAD || serverGpsState() == SIG_MISS)) {
     add(alerts::WARN, "srv_gps", "攝影站自己的定位不穩",
         "算出來的方位會有偏差，鏡頭容易追偏。請把攝影站移到天空開闊、沒有建築物"
         "或大樹遮住的地方。");
@@ -2161,27 +1884,18 @@ static void appendAlertsJson(String &js) {
     add(alerts::ERROR, "servo_fault", "雲台沒有反應",
         "鏡頭無法轉動。請檢查雲台的訊號線（IO21）和接地線有沒有鬆脫，然後重新開機。");
   }
-  if (!mountCalibrated) {
+  if (trackMode == TrackMode::Uart && !uartServoMode.ready()) {
+    add(alerts::WARN, "uart_wait", "等待 UART 指令",
+        "尚未收到有效指令或指令已逾時，鏡頭保持原角度。請檢查控制端程式與 UART 接線。");
+  }
+  if (servoMotion.faulted() && servoPwmReady) {
+    add(alerts::ERROR, "motion_fault", "運動控制已保持",
+        "控制器偵測到無效狀態，已停止更新角度。請重新開機；若持續發生，請保留執行紀錄。");
+  }
+  if (trackMode == TrackMode::Gps && !mountCalibrated) {
     add(alerts::WARN, "mount_uncal", "還沒設定鏡頭的方向",
-        "自動追蹤還不能用。請到「資訊」分頁，把遠處的地標對準畫面中央後做一次地標校正。");
+        "請先切到手動，再到「資訊」分頁輸入鏡頭指南針角度。");
   }
-  if (magOnline && !magCalibrated) {
-    add(alerts::WARN, "mag_uncal", "指南針還沒校正",
-        "攝影站被碰到之後，鏡頭會往錯的方向修正。請到「資訊」分頁做一次磁力計校正："
-        "原地慢慢順時針轉一圈就好。");
-  }
-  {
-    float poseDelta = 0.0f, poseErr = -1.0f;
-    if (poseErrorNow(poseDelta, poseErr) &&
-        alerts::poseLevel(poseErr) != alerts::NONE) {
-      add(alerts::WARN, "pose_moved", "攝影站被轉動過",
-          String("現在的朝向和校正時差了 ") + String(fabsf(poseDelta), 0) +
-          " 度，鏡頭可能偏掉 " + String(poseErr, 1) +
-          " 度。把攝影站轉回原本的方向，或重新做一次地標校正就會歸零。");
-    }
-  }
-
-  // 嚴重的排前面：現場的人先看到要立刻處理的那幾則。
   js += F("\"alerts\":[");
   bool first = true;
   for (int pass = alerts::ERROR; pass >= alerts::WARN; pass--) {
@@ -2203,9 +1917,68 @@ static void appendAlertsJson(String &js) {
   js += ']';
 }
 
+static void appendHttpDetailJson(String &js) {
+  // Only completed requests are exposed: a response cannot contain its own
+  // eventual write duration. pre_handler also includes accept/dispatch work.
+  const auto &stats = httpServer.timing();
+  auto duration = [&](const char *name, uint32_t us) {
+    js += F(",\""); js += name; js += F("\":"); js += String(us / 1000.0, 3);
+  };
+  auto snapshot = [&](const http_timing::Snapshot &value) {
+    js += F("{\"route\":\""); js += http_timing::routeName(value.route); js += '"';
+    duration("total_ms", value.totalUs);
+    duration("pre_handler_ms", value.preHandlerUs);
+    duration("build_ms", value.buildUs);
+    duration("write_ms", value.writeUs);
+    duration("other_ms", value.otherUs);
+    js += F(",\"bytes_written\":"); js += String(value.bytesWritten);
+    js += F(",\"short_writes\":"); js += String(value.shortWrites); js += '}';
+  };
+  js += F(",\"http_detail\":{\"requests\":"); js += String(stats.requests);
+  js += F(",\"polls_without_request\":"); js += String(stats.pollsWithoutRequest);
+  js += F(",\"slow_requests\":"); js += String(stats.slowRequests);
+  duration("max_poll_without_request_ms", stats.maxPollWithoutRequestUs);
+  js += F(",\"max\":{\"total_ms\":"); js += String(stats.maxTotalUs / 1000.0, 3);
+  duration("pre_handler_ms", stats.maxPreHandlerUs);
+  duration("build_ms", stats.maxBuildUs);
+  duration("write_ms", stats.maxWriteUs);
+  duration("other_ms", stats.maxOtherUs); js += '}';
+  js += F(",\"last\":");
+  if (stats.requests) snapshot(stats.last); else js += F("null");
+  js += F(",\"slowest\":");
+  if (stats.requests) snapshot(stats.slowest); else js += F("null");
+  js += '}';
+}
+
+static void appendTimingJson(String &js) {
+  js += F("\"timing\":{\"control_gap_max_ms\":");
+  js += String(controlGap.maxMs);
+  js += F(",\"control_gap_over_250ms\":");
+  js += String(controlGap.over250ms);
+  auto duration = [&](const char *name, const loop_metrics::Duration &value) {
+    js += F(",\""); js += name; js += F("\":{\"last_ms\":");
+    js += String(value.lastUs / 1000.0f, 2);
+    js += F(",\"max_ms\":"); js += String(value.maxUs / 1000.0f, 2);
+    js += F(",\"over_50ms\":"); js += String(value.over50ms); js += '}';
+  };
+  duration("loop", loopDuration);
+  duration("http", httpDuration);
+  duration("bme280", envDuration);
+  duration("pmu", pmuDuration);
+  duration("oled", oledDuration);
+  duration("lora", loraDuration);
+  duration("ota", otaDuration);
+  duration("motion", motionDuration);
+  js += F(",\"uart_late_polls\":"); js += String(uartServoMode.latePolls());
+  js += F(",\"uart_discarded_bytes\":"); js += String(uartServoMode.discardedBytes());
+  js += F(",\"uart_rejected_commands\":"); js += String(uartServoMode.rejectedCommands());
+  appendHttpDetailJson(js);
+  js += '}';
+}
+
 static String buildStatusJson() {
   String js;
-  js.reserve(2048);  // 含 alerts；預留不足只會多幾次 realloc，不會出錯
+  js.reserve(3072);  // 含 alerts 與 HTTP 分段計時，減少回覆組裝時 realloc
 
   // Server GPS quality
   js += F("{\"server_gps\":{\"fix\":");
@@ -2230,18 +2003,27 @@ static String buildStatusJson() {
   js += F(",\"snr_avg\":");
   js += rssiRingCount ? String(snrAvg, 1) : F("null");
   js += F(",\"pkt_rate\":");
-  js += String(cachedPktRate, 2);
-  uint32_t rxTotal = rxDataCount + rxTelemetryCount + rxDropCount;
+  js += String(havePkt && millis() - lastRxMs < 5000 ? cachedPktRate : 0.0f, 2);
+  uint32_t rxTotal = rxDataCount + rxTelemetryCount + rxDiagnosticCount + rxDropCount;
   js += F(",\"rx_data\":");
   js += String(rxDataCount);
   js += F(",\"rx_telemetry\":");
   js += String(rxTelemetryCount);
+  js += F(",\"rx_diagnostic\":"); js += String(rxDiagnosticCount);
   js += F(",\"rx_drop\":");
   js += String(rxDropCount);
   js += F(",\"drop_rate\":");
   js += rxTotal ? String((float)rxDropCount / rxTotal, 3) : F("0");
   js += F(",\"ack_tx\":");
   js += String(ackTxCount);
+  js += F(",\"ack_busy\":");
+  js += ackTransmitter.active() ? F("true") : F("false");
+  js += F(",\"ack_errors\":");
+  js += String(ackErrorCount);
+  js += F(",\"ack_skipped\":");
+  js += String(ackSkippedCount);
+  js += F(",\"ack_last_error\":");
+  js += String(lastAckError);
   js += F("},");
 
   js += F("\"env\":{\"temp_c\":");
@@ -2254,8 +2036,9 @@ static String buildStatusJson() {
   js += cachedHumidityPct != 0xFF ? String(cachedHumidityPct) : F("null");
   js += F("},");
 
-  js += F("\"health\":{\"uptime_s\":");
+  js += F("\"health\":{\"firmware_version\":\"" SHORE_SPOTTER_VERSION "\",\"uptime_s\":");
   js += String((millis() - bootMs) / 1000);
+  js += F(",\"protocol_version\":4");
   js += F(",\"heap_free\":");
   js += String(ESP.getFreeHeap());
   js += F(",\"heap_min\":");
@@ -2266,82 +2049,166 @@ static String buildStatusJson() {
   js += String(rxErrorCount);
   js += F("},");
 
-  // Servo / tracking + magnetometer state
-  appendServoMagJson(js);
+  appendTimingJson(js);
+  js += F(",");
+
+  // Servo / tracking state
+  appendServoJson(js);
   js += F(",");
   appendAlertsJson(js);
   js += '}';
   return js;
 }
 
-static String buildMagCalJson() {
-  const char *st = "idle";
-  switch (magCalState) {
-    case MAGCAL_COLLECTING: st = "collecting"; break;
-    case MAGCAL_DONE:       st = "done"; break;
-    case MAGCAL_FAILED:     st = "failed"; break;
-    default:                st = "idle"; break;
+
+
+// A fixed-size page of new events. The browser owns history across requests.
+static String buildDebugJson(const packet_diagnostics::Selection &selection) {
+  String js; js.reserve(4500);
+  const uint32_t now = millis();
+  const auto &g = gnssCollector.stats();
+  gnss_snapshot::Snapshot sample;
+  const bool sampled = gnssCollector.sample(now, sample);
+  js = F("{\"schema_version\":2,\"firmware_version\":\"" SHORE_SPOTTER_VERSION
+         "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"protocol_version\":4,\"boot_id\":");
+  js += String(controlBootId); js += F(",\"clock_ms\":"); js += String(now);
+  js += F(",\"config\":{\"rf_frequency_mhz\":"); js += String(RF_FREQUENCY, 3);
+  js += F(",\"bw_khz\":"); js += String(RF_BW, 1);
+  js += F(",\"sf\":"); js += String(RF_SF); js += F(",\"cr\":"); js += String(RF_CR);
+  js += F(",\"data_bytes\":17,\"ack_bytes\":11,\"telemetry_bytes\":11,\"diagnostic_bytes\":17");
+  js += F(",\"send_interval_ms\":"); js += String(SEND_INTERVAL_MS);
+  js += F(",\"ack_every_n\":"); js += String(ACK_EVERY_N);
+  js += F(",\"gnss_baud\":"); js += String(GPS_BAUD);
+  js += F(",\"bound_client_id\":"); js += String(gpsClientId);
+  js += F(",\"gnss_age_uncertainty_ms\":"); js += String(GPS_BACKLOG_GUARD_MS);
+  js += F(",\"data_airtime_ms\":"); js += String(dataAirtimeMs);
+  js += F(",\"ack_airtime_ms\":"); js += String(ackAirtimeMs);
+  js += F(",\"telemetry_airtime_ms\":"); js += String(telemetryAirtimeMs);
+  js += F(",\"diagnostic_airtime_ms\":"); js += String(diagnosticAirtimeMs);
+  js += F("},\"gps\":{\"age_basis\":\"nmea_epoch_aligned_arrival\",\"measurement_clock_synchronized\":false");
+  js += F(",\"scope\":\"server_local\",\"last_epoch_interval_ms\":"); js += String(g.lastEpochIntervalMs);
+  js += F(",\"source_age_ms\":"); js += sampled ? String(sample.sourceAgeMs) : F("null");
+  js += F(",\"epoch_ms_of_day\":"); js += sampled ? String(sample.epochMsOfDay) : F("null");
+  js += F(",\"fix\":"); js += gpsFixFresh() ? F("true") : F("false");
+  js += F(",\"have_rmc\":"); js += sampled && sample.haveRmc ? F("true") : F("false");
+  js += F(",\"have_gga\":"); js += sampled && sample.haveGga ? F("true") : F("false");
+  js += F(",\"epochs\":"); js += String(g.snapshots);
+  js += F(",\"rmc\":"); js += String(g.rmcSentences); js += F(",\"gga\":"); js += String(g.ggaSentences);
+  js += F(",\"checksum_errors\":"); js += String(g.checksumErrors);
+  js += F(",\"rejected_sentences\":"); js += String(g.rejectedSentences);
+  js += F(",\"ignored_sentences\":"); js += String(g.ignoredSentences);
+  js += F(",\"backwards_epochs\":"); js += String(g.backwardEpochs);
+  js += F(",\"duplicate_epochs\":"); js += String(g.duplicateEpochs);
+  js += F(",\"backlog_drops\":"); js += String(gpsBacklogDrops);
+  js += F("},\"client_diagnostic\":{\"received\":"); js += haveClientDiagnostic ? F("true") : F("false");
+  js += F(",\"rx_age_ms\":"); js += haveClientDiagnostic ? String(uint32_t(now - lastClientDiagnosticMs)) : F("null");
+  js += F(",\"fresh\":"); js += haveClientDiagnostic && now - lastClientDiagnosticMs < 90000 ? F("true") : F("false");
+  js += F(",\"epoch_interval_ms\":"); js += haveClientDiagnostic ? String(lastClientDiagnostic.epochIntervalMs) : F("null");
+  js += F(",\"backlog_drops\":"); js += haveClientDiagnostic ? String(lastClientDiagnostic.backlogDrops) : F("null");
+  js += F(",\"nmea_errors\":"); js += haveClientDiagnostic ? String(lastClientDiagnostic.nmeaErrors) : F("null");
+  js += F(",\"tx_errors\":"); js += haveClientDiagnostic ? String(lastClientDiagnostic.txErrors) : F("null");
+  js += F(",\"skipped_slots\":"); js += haveClientDiagnostic ? String(lastClientDiagnostic.skippedSlots) : F("null");
+  js += F(",\"status_bits\":"); js += haveClientDiagnostic ? String(lastClientDiagnostic.status) : F("null");
+  js += F(",\"counter_encoding\":\"uint16_saturating_since_client_boot\"}");
+  js += F(",\"counters\":{\"rx_data\":"); js += String(rxDataCount);
+  js += F(",\"rx_telemetry\":"); js += String(rxTelemetryCount);
+  js += F(",\"rx_diagnostic\":"); js += String(rxDiagnosticCount);
+  js += F(",\"radio_errors\":"); js += String(rxErrorCount);
+  js += F(",\"rejected_length\":"); js += String(rejectedLength);
+  js += F(",\"rejected_format\":"); js += String(rejectedFormat);
+  js += F(",\"rejected_binding\":"); js += String(rejectedBinding);
+  js += F(",\"rejected_sequence\":"); js += String(rejectedGpsSequence);
+  js += F(",\"sequence_gaps\":"); js += String(sequenceMissing);
+  js += F(",\"sequence_resyncs\":"); js += String(sequenceResyncs);
+  js += F(",\"invalid_fix_packets\":"); js += String(invalidFixPackets);
+  js += F(",\"invalid_velocity_packets\":"); js += String(invalidVelocityPackets);
+  js += F(",\"ack_sent\":"); js += String(ackTxCount);
+  js += F(",\"ack_errors\":"); js += String(ackErrorCount);
+  js += F(",\"ack_skipped\":"); js += String(ackSkippedCount);
+  js += F(",\"radio_recoveries\":"); js += String(radioRecoverCount);
+  js += F(",\"last_data_interval_ms\":"); js += String(lastDataIntervalMs);
+  js += F(",\"max_data_interval_ms\":"); js += String(maxDataIntervalMs);
+  js += F(",\"inferred_source_updates\":"); js += String(sourceEpochUpdates);
+  js += F(",\"inferred_source_interval_ms\":"); js += String(lastSourceEpochIntervalMs);
+  js += F("},\"events\":{\"capacity\":64,\"total\":"); js += String(packetEvents.total());
+  js += F(",\"overwritten\":"); js += String(packetEvents.overwritten());
+  js += F(",\"next_id\":"); js += String(selection.nextId);
+  js += F(",\"more\":"); js += selection.more ? F("true") : F("false");
+  js += F(",\"dropped\":"); js += selection.dropped ? F("true") : F("false");
+  js += F(",\"reset\":"); js += selection.reset ? F("true") : F("false");
+  js += F(",\"items\":[");
+  static const char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < selection.count; ++i) {
+    const auto &event = packetEvents.at(selection.start + i);
+    if (i) js += ',';
+    js += F("{\"id\":"); js += String(event.id); js += F(",\"ms\":"); js += String(event.ms);
+    js += F(",\"kind\":\""); js += packet_diagnostics::name(event.kind); js += '"';
+    js += F(",\"client_id\":"); js += String(event.clientId);
+    js += F(",\"seq\":"); js += String(event.seq);
+    js += F(",\"length\":"); js += String(event.length);
+    js += F(",\"source_age_ms\":"); js += event.sourceAgeMs != UINT16_MAX ? String(event.sourceAgeMs) : F("null");
+    js += F(",\"rssi_dbm\":"); js += event.rawLength ? String(event.rssiDbm10 / 10.0f, 1) : F("null");
+    js += F(",\"snr_db\":"); js += event.rawLength ? String(event.snrQuarterDb / 4.0f, 2) : F("null");
+    js += F(",\"code\":"); js += String(event.code); js += F(",\"flags\":"); js += String(event.flags);
+    js += F(",\"raw_hex\":\"");
+    for (uint8_t j = 0; j < event.rawLength; ++j) { js += hex[event.raw[j] >> 4]; js += hex[event.raw[j] & 15]; }
+    js += F("\"}");
   }
-  String js = F("{\"state\":\"");
-  js += st;
-  js += F("\",\"online\":");
-  js += magOnline ? F("true") : F("false");
-  js += F(",\"coverage_pct\":");
-  js += String(magCalState == MAGCAL_COLLECTING ? magCalCoveragePct() : 0);
-  js += F(",\"samples\":");
-  js += String((uint32_t)magCalCount);
-  js += F(",\"calibrated\":");
-  js += magCalibrated ? F("true") : F("false");
-  js += F(",\"residual_deg\":");
-  js += magCalResidualDeg >= 0 ? String(magCalResidualDeg, 2) : F("null");
-  js += F(",\"field_gauss\":");
-  js += magCalFieldGauss >= 0 ? String(magCalFieldGauss, 4) : F("null");
-  js += F(",\"ellipse_deg\":");
-  js += magCalEllipseDeg >= 0 ? String(magCalEllipseDeg, 2) : F("null");
-  js += F(",\"scatter_deg\":");
-  js += magCalScatterDeg >= 0 ? String(magCalScatterDeg, 2) : F("null");
-  js += F(",\"sweep_deg\":");
-  js += String(magCalSweepDeg, 0);
-  js += F(",\"axes\":\"");
-  js += magAxisName(magAxisA);
-  js += ',';
-  js += magAxisName(magAxisB);
-  js += F("\",\"offset_a\":");
-  js += String(magOffsetA, 4);
-  js += F(",\"offset_b\":");
-  js += String(magOffsetB, 4);
-  js += F(",\"heading\":");
-  js += (magOnline && magHeadingDeg >= 0) ? String(magHeadingDeg, 1) : F("-1");
-  js += F(",\"error\":\"");
-  js += magCalError;
-  js += F("\"}");
+  js += F("]},\"limitations\":[\"GNSS internal latency is unmeasured\",\"GNSS rate is independent of RF rate\",\"Client diagnostics are low-rate snapshots\",\"Servo angle is commanded, not physical feedback\"]}");
   return js;
 }
 
-// Extract the log bytes the caller has not seen yet.
-// Offsets are absolute (logTotal), so a caller can poll for deltas; if it has
-// fallen behind the 4 KB window — or we rebooted and logTotal went backwards —
-// it is snapped to the oldest byte we still hold and told data was dropped.
+// Byte cursor is independent of the packet event cursor and may wrap.
 static String buildLogText(uint32_t from, bool &dropped, uint32_t &next) {
-  uint32_t oldest = logWrapped ? (logTotal - LOG_BUF_BYTES) : 0;
-  uint32_t start;
-  dropped = false;
-  if (from > logTotal || from < oldest) {  // behind the window, or we rebooted
-    start = oldest;
-    dropped = (logTotal > 0);
-  } else {
-    start = from;
-  }
+  const uint32_t available = logWrapped ? LOG_BUF_BYTES : logTotal;
+  const uint32_t delta = logTotal - from;  // unsigned byte cursor may wrap
+  const uint32_t count = delta <= available ? delta : available;
+  dropped = delta > available && available > 0;
   next = logTotal;
 
   String out;
-  out.reserve(logTotal - start + 8);
-  for (uint32_t k = start; k < logTotal; k++) {
-    size_t idx = logWrapped ? (logHead + (size_t)(k - oldest)) % LOG_BUF_BYTES
-                            : (size_t)k;
+  out.reserve(count + 8);
+  const size_t start = (logHead + LOG_BUF_BYTES - count) % LOG_BUF_BYTES;
+  for (uint32_t k = 0; k < count; k++) {
+    const size_t idx = (start + k) % LOG_BUF_BYTES;
     out += logBuf[idx];
   }
   return out;
+}
+
+static bool parseAngleArgument(const char *name, float minimum, float maximum,
+                               float &value) {
+  if (!httpServer.hasArg(name)) return false;
+  const String text = httpServer.arg(name);
+  if (text.length() == 0 || text.length() > 16) return false;
+  bool digit = false, dot = false;
+  for (size_t i = 0; i < text.length(); ++i) {
+    const char c = text[i];
+    if (c >= '0' && c <= '9') digit = true;
+    else if (c == '.' && !dot) dot = true;
+    else return false;
+  }
+  if (!digit) return false;
+  value = text.toFloat();
+  return isfinite(value) && value >= minimum && value <= maximum;
+}
+
+static bool acceptMotionRequest() {
+  uint32_t values[3]; const char *names[] = {"epoch", "seq", "stamp"};
+  for (size_t i = 0; i < 3; ++i) {
+    const String raw = httpServer.arg(names[i]);
+    if (!command_freshness::parseUint32(raw.c_str(), raw.length(), values[i])) {
+      ++rejectedMotionCommands;
+      httpServer.send(409, "application/json", "{\"ok\":false,\"error\":\"refresh page: motion epoch, seq and stamp required\"}");
+      return false;
+    }
+  }
+  if (!commandGate.accept(values[0], values[1], values[2], millis())) {
+    ++rejectedMotionCommands;
+    httpServer.send(409, "application/json", "{\"ok\":false,\"error\":\"stale or out-of-order command; refresh status\"}");
+    return false;
+  }
+  return true;
 }
 
 static void initWebServer() {
@@ -2349,15 +2216,12 @@ static void initWebServer() {
   // heap（arduino-esp32 WebServer.cpp 裡自己的 log_e 就寫著 "Use send_P for long
   // arrays"）。send_P 分塊送出，不做這份複製。
   httpServer.on("/", HTTP_GET, []() {
-    httpServer.sendHeader("Cache-Control", "public, max-age=86400");
+    httpServer.sendHeader("Cache-Control", "no-store");
     httpServer.send_P(200, PSTR("text/html"), WEB_UI_HTML);
   });
   // Standalone log viewer. The 資訊 page opens this in a separate browser tab so
   // watching the log no longer costs you the radar view.
-  httpServer.on("/log", HTTP_GET, []() {
-    httpServer.sendHeader("Cache-Control", "public, max-age=86400");
-    httpServer.send_P(200, PSTR("text/html"), WEB_LOG_HTML);
-  });
+
   // Web app manifest -> "Add to Home screen" launches standalone (no URL bar).
   httpServer.on("/manifest.json", HTTP_GET, []() {
     httpServer.send(200, "application/manifest+json",
@@ -2371,156 +2235,78 @@ static void initWebServer() {
     // 會把它切掉。
   });
   httpServer.on("/api/track", HTTP_GET, []() {
-    httpServer.send(200, "application/json", buildTrackJson());
+    httpServer.send(200, "application/json", httpServer.measureBuild([]() { return buildTrackJson(); }));
   });
   httpServer.on("/api/whitelist", HTTP_GET, []() {
     httpServer.send(200, "application/json", buildWhitelistJson());
   });
-  // POST /api/whitelist?action=add|remove|clear&id=XXXX
+  // Legacy endpoint: set replaces the one binding; add refuses a second client.
   httpServer.on("/api/whitelist", HTTP_POST, []() {
-    String action = httpServer.arg("action");
-    String idStr  = httpServer.arg("id");
-    if (action == "add") {
-      // strtoul 解析失敗回 0，所以 id=abc 或空字串會安靜地把 0x0000 加進白名單：
-      // 佔掉一格、出現在 OLED 的 Client 輪播裡、而且永遠不會有封包配對到它。
-      char *endp = nullptr;
-      unsigned long parsed = strtoul(idStr.c_str(), &endp, 16);
-      if (idStr.length() == 0 || endp == idStr.c_str() || *endp != '\0' ||
-          parsed > 0xFFFF || parsed == 0) {
+    const String action = httpServer.arg("action");
+    uint16_t nextId = gpsClientId;
+    if (action == "clear") {
+      nextId = 0;
+    } else if (action == "set" || action == "add" || action == "remove") {
+      const String text = httpServer.arg("id");
+      uint16_t id = 0;
+      if (!client_binding::parseId(text.c_str(), text.length(), id)) {
         httpServer.send(400, "application/json",
-                        "{\"ok\":false,\"error\":\"id must be 1-4 hex digits\"}");
+                        "{\"ok\":false,\"error\":\"id must be 1-4 hex digits and not reserved\"}");
         return;
       }
-      uint16_t newId = (uint16_t)parsed;
-      bool found = false;
-      for (size_t i = 0; i < clientWhitelistCount; i++) {
-        if (clientWhitelist[i] == newId) { found = true; break; }
+      if (action == "add" && gpsClientId != 0 && id != gpsClientId) {
+        httpServer.send(409, "application/json",
+                        "{\"ok\":false,\"error\":\"one GPS client supported; use action=set to replace\"}");
+        return;
       }
-      if (!found && clientWhitelistCount < WHITELIST_MAX) {
-        clientWhitelist[clientWhitelistCount++] = newId;
-        saveWhitelistToNvs();
-      }
-    } else if (action == "remove") {
-      uint16_t rmId = (uint16_t)strtoul(idStr.c_str(), nullptr, 16);
-      for (size_t i = 0; i < clientWhitelistCount; i++) {
-        if (clientWhitelist[i] == rmId) {
-          for (size_t j = i; j < clientWhitelistCount - 1; j++) {
-            clientWhitelist[j] = clientWhitelist[j + 1];
-          }
-          clientWhitelistCount--;
-          saveWhitelistToNvs();
-          break;
-        }
-      }
-    } else if (action == "clear") {
-      clientWhitelistCount = 0;
-      saveWhitelistToNvs();
+      if (action == "remove") {
+        if (id == gpsClientId) nextId = 0;
+      } else nextId = id;
     } else {
-      httpServer.send(400, "application/json",
-                      "{\"ok\":false,\"error\":\"unknown action\"}");
+      httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"unknown action\"}");
+      return;
+    }
+    if (!setGpsClientBinding(nextId)) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"client binding could not be saved\"}");
       return;
     }
     httpServer.send(200, "application/json", buildWhitelistJson());
   });
-  // GET/POST /api/mag/calibrate — hard-iron calibration.
-  // POST starts (or ?action=cancel aborts); GET polls progress.
-  httpServer.on("/api/mag/calibrate", HTTP_GET, []() {
-    httpServer.send(200, "application/json", buildMagCalJson());
-  });
-  httpServer.on("/api/mag/calibrate", HTTP_POST, []() {
-    if (httpServer.arg("action") == "cancel") {
-      magCalState = magCalibrated ? MAGCAL_DONE : MAGCAL_IDLE;
-      httpServer.send(200, "application/json", buildMagCalJson());
-      return;
-    }
-    if (!magOnline) {
-      httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"no magnetometer\"}");
-      return;
-    }
-    startMagCalibration();
-    httpServer.send(200, "application/json", buildMagCalJson());
-  });
-
-  // POST /api/track/calibrate?lat=<deg>&lon=<deg>
-  // Lock mount_offset against a landmark of known position instead of against
-  // the surfer. Centre the landmark in the viewfinder first — at 400 mm that is
-  // a ~0.05 deg sight, an order of magnitude better than aiming at a person in
-  // the water, and it needs neither a second person nor the tracker to be
-  // present. Only the station's own GPS fix is required.
-  //
-  // This is the ONLY way to lock mount_offset. Forms that took a bearing typed in
-  // by the operator were removed: they cost 2-5 deg of hand-aiming plus the risk
-  // of a silent magnetic-vs-true blunder, which is a lot to pay for skipping a
-  // 30-second sighting that also happens to need no compass at all.
+  // The camera-mounted compass is the reference; neither GPS fix nor a
+  // landmark is needed. Hold Manual while reading the compass and submitting.
   httpServer.on("/api/track/calibrate", HTTP_POST, []() {
-    if (!httpServer.hasArg("lat") || !httpServer.hasArg("lon")) {
+    if (!acceptMotionRequest()) return;
+    float bearing = 0.0f;
+    if (!parseAngleArgument("bearing", 0.0f, 360.0f, bearing) || bearing >= 360.0f) {
       httpServer.send(400, "application/json",
-                      "{\"ok\":false,\"error\":\"missing lat/lon\"}");
+                      "{\"ok\":false,\"error\":\"bearing must be 0 <= degrees < 360\"}");
       return;
     }
-    if (!gpsFixFresh()) {
+  if (!servoPwmReady) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+      return;
+    }
+    if (trackMode == TrackMode::Gps || trackMode == TrackMode::Uart) {
       httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"need server GPS fix\"}");
+                      "{\"ok\":false,\"error\":\"select Manual before compass calibration\"}");
       return;
     }
-    double lat = httpServer.arg("lat").toDouble();
-    double lon = httpServer.arg("lon").toDouble();
-    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 ||
-        (lat == 0.0 && lon == 0.0)) {
-      httpServer.send(400, "application/json",
-                      "{\"ok\":false,\"error\":\"lat/lon out of range\"}");
+    if (servoMotion.moving()) {
+      httpServer.send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"wait for servo motion to finish before compass calibration\"}");
       return;
     }
-
-    double sLat = gps.location.lat(), sLon = gps.location.lng();
-    float bearing = (float)computeBearing(sLat, sLon, lat, lon);
-    // Equirectangular distance is plenty here; it only drives a sanity warning.
-    double distM = equirectDistanceM(sLat, sLon, lat, lon);
-
-    float headUsed = 0.0f;
-    uint8_t headSamples = 0;
-    lockMountOffset(bearing, servoAngleDeg, headUsed, headSamples);
-
-    Log.print(F("[TRACK] landmark calibration: bearing="));
-    Log.print(bearing, 2);
-    Log.print(F(" dist="));
-    Log.print(distM, 0);
-    Log.print(F("m head="));
-    Log.print(headUsed, 2);
-    Log.print(F(" (avg of "));
-    Log.print(headSamples);
-    Log.print(F(") servo="));
-    Log.print(servoAngleDeg, 1);
-    Log.print(F(" -> mount_offset="));
-    Log.println(mountOffsetDeg, 2);
-
-    String js = F("{\"ok\":true,\"method\":\"landmark\",\"bearing\":");
+    lockMountOffset(bearing, servoAngleDeg);
+    String js = F("{\"ok\":true,\"method\":\"compass\",\"bearing\":");
     js += String(bearing, 2);
-    js += F(",\"distance_m\":");
-    js += String((uint32_t)distM);
     js += F(",\"mount_offset_deg\":");
     js += String(mountOffsetDeg, 2);
     js += F(",\"servo_angle\":");
     js += String(servoAngleDeg, 1);
-    js += F(",\"heading\":");
-    js += String(headUsed, 2);
-    js += F(",\"heading_samples\":");
-    js += String(headSamples);
-    js += F(",\"mag_calibrated\":");
-    js += magCalibrated ? F("true") : F("false");
-    js += F(",\"warning\":\"");
-    if (!magCalibrated && magOnline) {
-      // Without hard-iron correction this offset is only valid near the
-      // orientation it was taken at — the very thing it is meant to outlive.
-      js += F("run the magnetometer calibration first, or this offset will not "
-              "survive being set up facing a different way");
-    } else if (distM < 300.0) {
-      // A near landmark amplifies the station's own position error into the
-      // bearing: 1 m at 100 m is 0.6 deg, at 1 km it is 0.06 deg.
-      js += F("landmark is close; 1 km or more gives a much tighter reference");
-    }
-    js += F("\"}");
+    js += '}';
+    Log.println(F("[TRACK] camera compass calibration set in RAM"));
     httpServer.send(200, "application/json", js);
   });
 
@@ -2533,7 +2319,9 @@ static void initWebServer() {
                         : 0;
     bool dropped = false;
     uint32_t next = 0;
-    String txt = buildLogText(from, dropped, next);
+    String txt = httpServer.measureBuild([&]() { return buildLogText(from, dropped, next); });
+    httpServer.sendHeader("Cache-Control", "no-store");
+    httpServer.sendHeader("X-Log-Boot", String(controlBootId));
     httpServer.sendHeader("X-Log-Next", String(next));
     httpServer.sendHeader("X-Log-Dropped", dropped ? "1" : "0");
     httpServer.send(200, "text/plain; charset=utf-8", txt);
@@ -2546,89 +2334,124 @@ static void initWebServer() {
   });
 
   httpServer.on("/api/status", HTTP_GET, []() {
-    httpServer.send(200, "application/json", buildStatusJson());
+    httpServer.send(200, "application/json", httpServer.measureBuild([]() { return buildStatusJson(); }));
   });
-  // POST /api/servo?angle=<0..180> — manual aim; blocked while auto-tracking.
-  httpServer.on("/api/servo", HTTP_POST, []() {
-    if (!httpServer.hasArg("angle")) {
-      httpServer.send(400, "application/json",
-                      "{\"ok\":false,\"error\":\"missing angle param\"}");
+  httpServer.on("/api/debug", HTTP_GET, []() {
+    httpServer.sendHeader("Cache-Control", "no-store");
+    const bool haveBoot = httpServer.hasArg("boot_id");
+    const bool haveSince = httpServer.hasArg("since");
+    uint32_t cursorBoot = 0, since = 0, limit = packet_diagnostics::kMaxEventsPerResponse;
+    auto argument = [](const char *name, uint32_t &value) {
+      const String text = httpServer.arg(name);
+      return command_freshness::parseUint32(text.c_str(), text.length(), value);
+    };
+    if (haveBoot != haveSince ||
+        (haveBoot && (!argument("boot_id", cursorBoot) || !argument("since", since))) ||
+        (httpServer.hasArg("limit") && !argument("limit", limit)) ||
+        limit == 0 || limit > packet_diagnostics::kMaxEventsPerResponse) {
+      httpServer.send(400, "application/json", "{\"error\":\"paired uint32 boot_id/since and limit 1..8 required\"}");
       return;
     }
-    if (trackMode == MODE_TRACKING) {
-      httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"pause tracking first\"}");
-      return;
-    }
-    float a = constrain(httpServer.arg("angle").toFloat(), 0.0f, 180.0f);
-    if (!setServoAngle(a)) {
-      httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
-      return;
-    }
-    servoTargetDeg = a;
-    if (trackMode == MODE_IDLE) trackMode = MODE_MANUAL;
-    Log.print(F("[SERVO] manual angle="));
-    Log.println(servoAngleDeg, 1);
-    httpServer.send(200, "application/json",
-                    "{\"ok\":true,\"angle\":" + String(servoAngleDeg, 1) + "}");
+    const auto selection = packetEvents.select(haveBoot, cursorBoot == controlBootId, since, limit);
+    httpServer.send(200, "application/json", httpServer.measureBuild([&]() { return buildDebugJson(selection); }));
   });
-  // POST /api/track/start — lock the current aim as calibration and auto-track.
-  httpServer.on("/api/track/start", HTTP_POST, []() {
-    if (!servoPwmReady) {
-      httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
-      return;
-    }
-    if (startTracking()) {
-      httpServer.send(200, "application/json",
-                      "{\"ok\":true,\"mount_offset_deg\":" +
-                          String(mountOffsetDeg, 1) + "}");
-    } else if (!servoPwmReady) {
-      httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+  // Manual stops tracking; GPS and UART are exclusive modes.
+  httpServer.on("/api/servo/mode", HTTP_POST, []() {
+    if (!acceptMotionRequest()) return;
+    String mode = httpServer.arg("mode");
+    if (mode == "jetson") mode = "uart";  // compatibility with existing callers
+    if (mode == "manual") {
+      enterManual();
+    } else if (mode == "gps" || mode == "uart") {
+      if (!requestTrackingMode(mode == "gps" ? TrackMode::Gps : TrackMode::Uart)) return;
     } else {
-      httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"need server+client GPS fix\"}");
+      httpServer.send(400, "application/json",
+                      "{\"ok\":false,\"error\":\"mode must be manual, gps or uart\"}");
+      return;
     }
+    httpServer.send(200, "application/json", controlReply());
   });
-  // POST /api/track/pause — hold servo at the current angle, stop auto updates.
-  httpServer.on("/api/track/pause", HTTP_POST, []() {
-    if (trackMode == MODE_TRACKING) trackMode = MODE_PAUSED;
-    Log.println(F("[TRACK] paused"));
-    httpServer.send(200, "application/json",
-                    "{\"ok\":true,\"mode\":\"" + String(trackModeStr(trackMode)) +
-                        "\"}");
+  httpServer.on("/api/servo", HTTP_POST, []() {
+    if (!acceptMotionRequest()) return;
+    float angle = 0.0f;
+    if (!parseAngleArgument("angle", 0.0f, 180.0f, angle)) {
+      httpServer.send(400, "application/json",
+                      "{\"ok\":false,\"error\":\"angle must be 0..180\"}");
+      return;
+    }
+    if (!servoPwmReady) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+      return;
+    }
+    if (trackMode != TrackMode::Manual) {
+      httpServer.send(409, "application/json", "{\"ok\":false,\"error\":\"select Manual before setting angle\"}");
+      return;
+    }
+    if (!servoMotion.target(angle)) {
+      httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"angle outside configured limits or motion fault\"}");
+      return;
+    }
+    servoTargetDeg = static_cast<float>(servoMotion.requested());
+    httpServer.send(200, "application/json", controlReply());
   });
-  // POST /api/track/resume — resume auto-tracking with the existing calibration.
+  httpServer.on("/api/servo/settings",HTTP_GET,[](){
+    httpServer.send(200,"application/json",motionSettingsJson());
+  });
+  httpServer.on("/api/servo/settings",HTTP_POST,[](){
+    if(!acceptMotionRequest())return;
+    for(int i=0;i<httpServer.args();++i) {
+      const String name=httpServer.argName(i);
+      if(name!="speed" && name!="epoch" && name!="seq" && name!="stamp") {
+        httpServer.send(400,"application/json","{\"ok\":false,\"error\":\"only speed can be configured\"}");return;
+      }
+    }
+    float speed=0;
+    if(!parseAngleArgument("speed",servo_motion::kMinimumSpeed,servo_motion::kMaximumSpeed,speed)) {
+      httpServer.send(400,"application/json","{\"ok\":false,\"error\":\"speed must be 1..90 degrees per second\"}");return;
+    }
+    if(!saveServoSpeed(speed)) {
+      httpServer.send(503,"application/json","{\"ok\":false,\"error\":\"speed could not be saved; current limit retained\"}");return;
+    }
+    httpServer.send(200,"application/json",motionSettingsJson());
+  });
+  httpServer.on("/api/track/prediction", HTTP_GET, []() {
+    httpServer.sendHeader("Cache-Control", "no-store");
+    httpServer.send(200, "application/json", gpsPredictionJson());
+  });
+  httpServer.on("/api/track/prediction", HTTP_POST, []() {
+    if (!acceptMotionRequest()) return;
+    bool validArgs = httpServer.args() == 4;
+    for (int i = 0; i < httpServer.args(); ++i) {
+      const String name = httpServer.argName(i);
+      if (name != "enabled" && name != "epoch" && name != "seq" && name != "stamp") validArgs = false;
+    }
+    const String enabled = httpServer.arg("enabled");
+    if (!validArgs || (enabled != "0" && enabled != "1")) {
+      httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"enabled must be 0 or 1; no other settings accepted\"}");
+      return;
+    }
+    if (!saveGpsPrediction(enabled == "1")) {
+      httpServer.send(503, "application/json", "{\"ok\":false,\"error\":\"GPS prediction could not be saved; current setting retained\"}");
+      return;
+    }
+    httpServer.send(200, "application/json", gpsPredictionJson());
+  });
+  httpServer.on("/api/track/start", HTTP_POST, []() {
+    if (!acceptMotionRequest()) return;
+    if (!requestTrackingMode(TrackMode::Gps)) return;
+    httpServer.send(200, "application/json", controlReply());
+  });
   httpServer.on("/api/track/resume", HTTP_POST, []() {
-    if (!servoPwmReady) {
-      httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
-      return;
-    }
-    if (!mountCalibrated) {
-      httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"not calibrated, use start\"}");
-      return;
-    }
-    trackMode = MODE_TRACKING;
-    updateTracking();
-    if (!servoPwmReady) {
-      httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
-      return;
-    }
-    Log.println(F("[TRACK] resumed"));
-    httpServer.send(200, "application/json",
-                    "{\"ok\":true,\"mode\":\"tracking\"}");
+    if (!acceptMotionRequest()) return;
+    if (!requestTrackingMode(lastTrackingMode)) return;
+    httpServer.send(200, "application/json", controlReply());
   });
-  // POST /api/track/stop — return to manual control (keeps calibration).
-  httpServer.on("/api/track/stop", HTTP_POST, []() {
-    trackMode = MODE_MANUAL;
-    Log.println(F("[TRACK] stopped -> manual"));
-    httpServer.send(200, "application/json",
-                    "{\"ok\":true,\"mode\":\"manual\"}");
+  httpServer.on("/api/track/pause", HTTP_POST, []() {
+    if (!acceptMotionRequest()) return;
+    enterManual();
+    trackMode = TrackMode::Paused;
+    httpServer.send(200, "application/json", controlReply());
   });
   // 分頁圖示。三個尺寸讓瀏覽器自己挑：16/32 給分頁列（1x / 2x DPI），
   // 192 給 PWA「加到主畫面」與高解析度情境。合計約 3 KB flash。
@@ -2653,6 +2476,10 @@ static void initWebServer() {
     sendIcon(ICON_192_PNG, sizeof(ICON_192_PNG));
   });
   httpServer.onNotFound([]() {
+    if (httpServer.uri().startsWith("/api/")) {
+      httpServer.send(404, "application/json", "{\"ok\":false,\"error\":\"unknown API\"}");
+      return;
+    }
     httpServer.sendHeader("Location", "/");
     httpServer.send(302);
   });
@@ -2665,8 +2492,9 @@ static void initArduinoOta() {
   ArduinoOTA.setHostname("shore-spotter-server");
   ArduinoOTA
       .onStart([]() {
-        if (trackMode == MODE_TRACKING) trackMode = MODE_PAUSED;
-        Log.println(F("[OTA] update started; tracking paused"));
+        enterManual();
+        trackMode = TrackMode::Paused;
+        Log.println(F("[OTA] update started; Servo control paused"));
       })
       .onEnd([]() { Log.println(F("[OTA] update complete; rebooting")); })
       .onError([](ota_error_t error) {
@@ -2685,6 +2513,9 @@ static void initArduinoOta() {
 // For CLIENT role the OLED bus is normally off; we power it briefly here.
 // ---------------------------------------------------------------------------
 static void showShutdownAndPowerOff() {
+#if defined(ROLE_SERVER)
+  enterManual();
+#endif
 #if defined(ROLE_CLIENT)
   if (pmuOnline) {
     pmu.setALDO1Voltage(3300);
@@ -2692,6 +2523,8 @@ static void showShutdownAndPowerOff() {
     delay(100);
   }
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
+  detectOledAddress();
   display.setI2CAddress(oledI2CAddr << 1);
   display.begin();
 #endif
@@ -2718,6 +2551,9 @@ static bool batteryCriticallyLow() {
 // Show a low-battery notice, then cut power. Used at boot and at runtime so a
 // dead battery can neither keep running nor power the board back on.
 static void showLowBatteryAndPowerOff() {
+#if defined(ROLE_SERVER)
+  enterManual();
+#endif
 #if defined(ROLE_CLIENT)
   if (pmuOnline) {
     pmu.setALDO1Voltage(3300);
@@ -2725,6 +2561,8 @@ static void showLowBatteryAndPowerOff() {
     delay(100);
   }
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
+  detectOledAddress();
   display.setI2CAddress(oledI2CAddr << 1);
   display.begin();
 #endif
@@ -2782,7 +2620,7 @@ static void drawClientInfoScreen() {
 
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
-  display.drawStr(0, 12, "SHORE SPOTTER");
+  display.drawStr(0, 12, "SHORE SPOTTER v" SHORE_SPOTTER_VERSION);
   display.drawHLine(0, 14, 128);
   display.drawStr(0, 28, line1);
   display.drawStr(0, 40, line2);
@@ -2812,6 +2650,8 @@ static bool enableClientOled() {
   pmu.enableALDO1();
   delay(100);
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
+  detectOledAddress();
   display.setI2CAddress(oledI2CAddr << 1);
   if (!display.begin()) { pmu.disableALDO1(); return false; }
   return true;
@@ -2833,7 +2673,103 @@ static void wakeClientScreen() {
   if (!enableClientOled()) return;
   clientOledAwake = true;
   clientOledOffMs = millis() + CLIENT_SCREEN_WAKE_MS;
-  nextClientOledRefreshMs = 0;  // force an immediate redraw
+  nextClientOledRefreshMs = millis();  // force an immediate redraw
+}
+#endif
+
+#if defined(ROLE_SERVER)
+// Returns true if ACK start (including its recovery path) already owns RX.
+static bool acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtMs) {
+  using packet_diagnostics::Kind;
+  PacketHeader hdr{};
+  auto reject = [&](Kind kind) {
+    ++rxDropCount; ++rxWinDrop;
+    recordPacketEvent(kind, receivedAtMs, buf, n);
+    return false;
+  };
+  if (n != DATA_PACKET_LEN && n != ACK_PACKET_LEN &&
+      n != TELEMETRY_PACKET_LEN && n != DIAGNOSTIC_PACKET_LEN) {
+    ++rejectedLength; return reject(Kind::Length);
+  }
+  if (!protocol::decodeHeader(buf, n, hdr)) {
+    ++rejectedFormat; return reject(Kind::Format);
+  }
+  if (!isClientAllowed(hdr.clientId)) { ++rejectedBinding; return reject(Kind::Binding); }
+  if (hdr.msgType == MSG_TELEMETRY) {
+    DecodedTelemetry tel{};
+    if (!parseTelemetryPacket(buf, n, tel)) { ++rejectedFormat; return reject(Kind::Format); }
+    lastTelemetry = tel; haveTelemetry = true; lastTelemetryRxMs = receivedAtMs;
+    ++rxTelemetryCount; ++rxWinTelem;
+    if (clientHumBaselinePct < 0 && tel.humidityPct != 255) clientHumBaselinePct = tel.humidityPct;
+    recordPacketEvent(Kind::Telemetry, receivedAtMs, buf, n);
+    return false;
+  }
+  if (hdr.msgType == MSG_DIAGNOSTIC) {
+    DiagnosticPayload diag{};
+    if (!protocol::decodeDiagnostic(buf, n, hdr, diag)) { ++rejectedFormat; return reject(Kind::Format); }
+    lastClientDiagnostic = diag; haveClientDiagnostic = true;
+    lastClientDiagnosticMs = receivedAtMs; ++rxDiagnosticCount;
+    recordPacketEvent(Kind::Diagnostic, receivedAtMs, buf, n);
+    return false;
+  }
+  DecodedData data{};
+  if (!parseDataPacket(buf, n, data)) { ++rejectedFormat; return reject(Kind::Format); }
+  if (!gpsSequence.accept(data.seq, receivedAtMs)) {
+    ++rejectedGpsSequence;
+    recordPacketEvent(Kind::Sequence, receivedAtMs, buf, n, &data);
+    return false;
+  }
+  if (havePkt) {
+    lastDataIntervalMs = receivedAtMs - lastRxMs;
+    if (lastDataIntervalMs > maxDataIntervalMs) maxDataIntervalMs = lastDataIntervalMs;
+    const uint16_t delta = data.seq - lastData.seq;
+    if (lastDataIntervalMs < 2500 && delta > 0 && delta < 0x8000) {
+      sequenceMissing += delta - 1; rxWinMissing += delta - 1;
+    } else ++sequenceResyncs;
+  }
+  if (data.age10ms != 255) {
+    const uint32_t estimate = receivedAtMs - dataAirtimeMs - uint32_t(data.age10ms) * 10;
+    const int32_t delta = static_cast<int32_t>(estimate - lastEstimatedSourceMs);
+    if (!haveSourceEstimate || delta > 100) {
+      if (haveSourceEstimate) lastSourceEpochIntervalMs = delta;
+      ++sourceEpochUpdates; lastEstimatedSourceMs = estimate; haveSourceEstimate = true;
+    }
+  }
+  lastData = data; lastRxMs = receivedAtMs; havePkt = true; ++rxDataCount;
+  lastRssi = receivedPacketRssi; lastSnr = receivedPacketSnr;
+  if (!data.fix) ++invalidFixPackets;
+  if (!data.velocityValid) ++invalidVelocityPackets;
+  recordPacketEvent(Kind::Data, receivedAtMs, buf, n, &data);
+  rssiRing[rssiRingIdx] = lastRssi; snrRing[rssiRingIdx] = lastSnr;
+  rssiRingIdx = (rssiRingIdx + 1) % RSSI_WINDOW;
+  if (rssiRingCount < RSSI_WINDOW) ++rssiRingCount;
+  ++pktsThisWindow;
+  const uint32_t elapsed = receivedAtMs - pktWindowStartMs;
+  if (elapsed >= 5000) {
+    cachedPktRate = pktsThisWindow * 1000.0f / elapsed;
+    pktsThisWindow = 0; pktWindowStartMs = receivedAtMs;
+  }
+  ++rxWinData;
+  if (!rxWinHaveSeq) {
+    rxWinFirstSeq = data.seq; rxWinHaveSeq = true;
+    rxWinRssiMin = rxWinRssiMax = lastRssi; rxWinSnrMin = rxWinSnrMax = lastSnr;
+  } else {
+    if (lastRssi < rxWinRssiMin) rxWinRssiMin = lastRssi;
+    if (lastRssi > rxWinRssiMax) rxWinRssiMax = lastRssi;
+    if (lastSnr < rxWinSnrMin) rxWinSnrMin = lastSnr;
+    if (lastSnr > rxWinSnrMax) rxWinSnrMax = lastSnr;
+  }
+  rxWinLastSeq = data.seq; rxWinRssiSum += lastRssi; rxWinSnrSum += lastSnr;
+  if (data.seq % ACK_EVERY_N != 0) return false;
+  if (millis() - receivedAtMs > ACK_START_MAX_AGE_MS) {
+    ++ackSkippedCount; recordPacketEvent(Kind::AckSkipped, receivedAtMs, nullptr, 0, &data);
+    return false;
+  }
+  const size_t length = buildAckPacket(ackPacketBuffer, data.srcId, data.seq, lastRssi, lastSnr);
+  serverRxReady = false;
+  handleAckResult(ackTransmitter.start(ackPacketBuffer, length, millis(),
+                                      ackAirtimeMs + TELEMETRY_SLOT_GUARD_MS));
+  return true;
 }
 #endif
 
@@ -2847,6 +2783,7 @@ void setup() {
   delay(1200);
   bootMs = millis();
   nodeId = derivedNodeId();
+  Log.println(F("[BOOT] Shore Spotter v" SHORE_SPOTTER_VERSION));
 
   if (!initRadio()) {
     while (true) {
@@ -2879,6 +2816,7 @@ void setup() {
   nextBatteryMs = millis() + BATTERY_UPDATE_MS;
   nextEnvMs = millis() + ENV_UPDATE_MS;
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
   envSensorOnline = initEnvSensor();
   sampleEnvSensor();
 
@@ -2887,7 +2825,7 @@ void setup() {
   Log.println(F("[CLIENT] mode active: send position packets"));
   Log.print(F("[CLIENT] node id (chip MAC last 2 bytes) = 0x"));
   Log.println(nodeId, HEX);
-  Log.println(F("[CLIENT] Add this id to SERVER CLIENT_WHITELIST to authorise."));
+  Log.println(F("[CLIENT] Bind this id on SERVER using /api/whitelist action=set."));
   Log.print(F("[CLIENT] GPS UART baud="));
   Log.println(GPS_BAUD);
   Log.print(F("[CLIENT] TX power="));
@@ -2899,7 +2837,7 @@ void setup() {
   // Arm non-blocking ACK reception (see onClientDio1) and start the position
   // cadence from now, so the 10 s boot screen does not count as a missed slot.
   radio.setDio1Action(onClientDio1);
-  radio.startReceive();
+  clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
   nextSendMs = millis();
 #endif
 
@@ -2919,17 +2857,17 @@ void setup() {
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
   envSensorOnline = initEnvSensor();
   sampleEnvSensor();
   nextEnvMs = millis() + ENV_UPDATE_MS;
-  magOnline = initMag();           // QMC6310 station heading (shared I2C bus 0)
-  nextMagMs = millis() + MAG_SAMPLE_MS;
-  initServo();                     // LEDC PWM on IO21, centre the camera
+  initServo();                     // restore boot centre at 90 degrees
+  detectOledAddress();
   display.setI2CAddress(oledI2CAddr << 1);
   display.begin();
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
-  display.drawStr(0, 12, "SHORE SPOTTER");
+  display.drawStr(0, 12, "SHORE SPOTTER v" SHORE_SPOTTER_VERSION);
   display.drawStr(0, 30, "SERVER booting...");
   display.sendBuffer();
 
@@ -2941,15 +2879,9 @@ void setup() {
   nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
   Log.println(F("[SERVER] mode active: receive position packets"));
   loadServerSettings();
-  Log.print(F("[SERVER] whitelist ("));
-  Log.print(clientWhitelistCount);
-  Log.print(F(" entries): "));
-  for (size_t i = 0; i < clientWhitelistCount; i++) {
-    Log.print(F("0x"));
-    Log.print(clientWhitelist[i], HEX);
-    if (i + 1 < clientWhitelistCount) Log.print(' ');
-  }
-  Log.println();
+  Log.print(F("[SERVER] GPS client: "));
+  if (gpsClientId != 0) Log.println(gpsClientId, HEX);
+  else Log.println(F("unbound"));
 
   // Connect to the phone-provided hotspot in station mode.
   // Credentials come from include/wifi_config.h (WIFI_SSID / WIFI_PASSWORD).
@@ -2957,9 +2889,7 @@ void setup() {
   WiFi.setHostname("shore-spotter-server");
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Log.print(F("[WiFi] Connecting to hotspot \""));
-  Log.print(WIFI_SSID);
-  Log.print(F("\" "));
+  Log.print(F("[WiFi] Connecting to configured hotspot "));
   uint32_t wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED &&
          millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
@@ -2970,15 +2900,12 @@ void setup() {
 
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
-  display.drawStr(0, 12, "SHORE SPOTTER");
+  display.drawStr(0, 12, "SHORE SPOTTER v" SHORE_SPOTTER_VERSION);
   display.drawHLine(0, 14, 128);
   if (WiFi.status() == WL_CONNECTED) {
     cachedApIpAddr = WiFi.localIP();
     cachedApIp = cachedApIpAddr.toString();
-    Log.print(F("[WiFi] Connected. IP: "));
-    Log.println(cachedApIp);
-    Log.print(F("[WiFi] Open browser -> http://"));
-    Log.println(cachedApIp);
+    Log.println(F("[WiFi] Connected. Open the address shown on OLED."));
     display.drawStr(0, 32, "WiFi connected");
     display.drawStr(0, 48, cachedApIp.c_str());
   } else {
@@ -2997,7 +2924,10 @@ void setup() {
 
   // Arm non-blocking, interrupt-driven reception.
   radio.setDio1Action(onLoRaDio1);
-  radio.startReceive();
+  serverRadioIrq = false;
+  serverRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+  if (!serverRxReady) nextServerRxRetryMs = millis() + 100;
+  selectTrackingMode(TrackMode::Uart);  // default source; wait for fresh UART input
 #endif
 }
 
@@ -3005,38 +2935,9 @@ void loop() {
 #if defined(ROLE_CLIENT)
   serviceGps();
 
-  // Non-blocking ACK drain (see onClientDio1). Kept ahead of the transmit slots
-  // below: those clear clientRxFlag to swallow their own TxDone pulse, and would
-  // otherwise discard an ACK that happened to land in the same millisecond.
-  if (clientRxFlag) {
-    clientRxFlag = false;
-    uint8_t ackBuf[ACK_PACKET_LEN];
-    int ackState = radio.readData(ackBuf, sizeof(ackBuf));
-    if (ackState == RADIOLIB_ERR_NONE) {
-      size_t n = radio.getPacketLength();
-      if (n > sizeof(ackBuf)) n = sizeof(ackBuf);
-      AckPayload ack{};
-      if (parseAckPacket(ackBuf, n, ack)) {
-        lastAckRxMs = millis();
-        ackRxCount++;
-        lastAckRssiDbm10 = ack.rssiDbm10;
-        lastAckSnrDb10 = ack.snrDb10;
-        Log.print(F("[CLIENT] ACK seq="));
-        Log.print(ack.ackSeq);
-        Log.print(F(" | up(srv heard us) rssi="));
-        Log.print(ack.rssiDbm10 / 10.0f, 1);
-        Log.print(F(" snr="));
-        Log.print(ack.snrDb10 / 10.0f, 1);
-        Log.print(F(" | down(we heard ack) rssi="));
-        Log.print(radio.getRSSI(), 1);
-        Log.print(F(" snr="));
-        Log.println(radio.getSNR(), 1);
-      }
-    }
-    radio.startReceive();  // re-arm for the next ACK
-  }
+  serviceClientTransmit();
 
-  if (millis() >= nextBatteryMs) {
+  if (loop_metrics::due(millis(), nextBatteryMs)) {
     nextBatteryMs = millis() + BATTERY_UPDATE_MS;
     cachedBatteryMv = readBatteryMilliVolts();
     Log.print(F("[CLIENT] Battery update mV="));
@@ -3044,91 +2945,34 @@ void loop() {
     checkLowBatteryAndMaybeShutdown();
   }
 
-  if (millis() >= nextEnvMs) {
+  if (loop_metrics::due(millis(), nextEnvMs)) {
     nextEnvMs = millis() + ENV_UPDATE_MS;
     sampleEnvSensor();
   }
 
-  if (millis() >= nextSendMs) {
-    nextSendMs = millis() + SEND_INTERVAL_MS;
-    lastSendMs = millis();
-
-    uint8_t buf[DATA_PACKET_LEN];
-    size_t len = buildDataPacket(buf);
-    int state = radio.transmit(buf, len);
-    // Re-arm RX before the (comparatively slow) serial log below: the server
-    // starts its ACK within a few ms of our TxDone.
-    clientRxFlag = false;  // swallow the TxDone pulse from our own transmission
-    radio.startReceive();
-
-    if (state == RADIOLIB_ERR_NONE) {
-      radioFailStreak = 0;
-      Log.print(F("[CLIENT] TX ok seq="));
-      Log.print((uint16_t)(txSeq - 1));
-      Log.print(F(" | GPS fix="));
-      Log.print(gpsFixFresh() ? 1 : 0);
-      Log.print(F(" sats="));
-      Log.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
-      Log.print(F(" hdop="));
-      if (gps.hdop.isValid()) Log.print(gps.hdop.hdop(), 1);
-      else Log.print(F("--"));
-      Log.print(F(" age="));
-      Log.print(gps.location.age());
-      Log.print(F("ms spd="));
-      Log.print(gps.speed.isValid() ? gps.speed.mps() : 0.0, 1);
-      Log.print(F("m/s crs="));
-      Log.print(gps.course.isValid() ? gps.course.deg() : 0.0, 0);
-      Log.print(F(" | LoRa up(srv heard us) rssi="));
-      Log.print(lastAckRssiDbm10 / 10.0f, 1);
-      Log.print(F(" snr="));
-      Log.print(lastAckSnrDb10 / 10.0f, 1);
-      Log.print(F(" txpwr="));
-      Log.print(currentTxPowerDbm);
-      Log.print(F("dBm acks="));
-      Log.print(ackRxCount);
-      Log.print(F(" miss="));
-      Log.println(ackMissCount);
-    } else {
-      Log.print(F("[CLIENT] TX failed, code="));
-      Log.println(state);
-      if (++radioFailStreak >= RADIO_TX_FAIL_LIMIT) recoverRadio();
-    }
+  serviceGps();
+  serviceClientTransmit();
+  if (clientTxCount > 5 && millis() - lastAckRxMs > ACK_STALE_MS &&
+      millis() - lastAckMissMarkMs > 5000) {
+    ++ackMissCount; lastAckMissMarkMs = millis();
   }
-
-  // Telemetry waits for the quiet slot of the position cycle (see
-  // TELEMETRY_SLOT_MIN_MS); loop() spins fast enough that the slot is never
-  // missed once the packet is due.
-  if (millis() >= nextTelemetryMs && lastSendMs != 0) {
-    uint32_t sinceSend = millis() - lastSendMs;
-    if (sinceSend >= telemetrySlotMinMs && sinceSend <= telemetrySlotMaxMs) {
-      nextTelemetryMs = millis() + TELEMETRY_INTERVAL_MS;
-      uint8_t tbuf[TELEMETRY_PACKET_LEN];
-      size_t tlen = buildTelemetryPacket(tbuf);
-      int tstate = radio.transmit(tbuf, tlen);
-      clientRxFlag = false;
-      radio.startReceive();
-      if (tstate == RADIOLIB_ERR_NONE) {
-        Log.print(F("[CLIENT] TELEMETRY TX ok batt_mV="));
-        Log.println(cachedBatteryMv);
-      } else {
-        Log.print(F("[CLIENT] TELEMETRY TX failed, code="));
-        Log.println(tstate);
-      }
-    }
+  if (!clientTransmitter.active() && !expectedAck.pending(millis())) evaluateAtpc();
+  static uint32_t nextClientSummaryMs = 0;
+  if (loop_metrics::due(millis(), nextClientSummaryMs)) {
+    nextClientSummaryMs = millis() + 10000;
+    Log.print(F("[CLIENT] tx=")); Log.print(clientTxCount);
+    Log.print(F(" errors=")); Log.print(clientTxErrors);
+    Log.print(F(" skipped=")); Log.print(dataSkippedSlots);
+    Log.print(F(" ACK=")); Log.print(ackRxCount);
+    Log.print(F(" rejected=")); Log.print(ackRejectedCount);
+    Log.print(F(" GNSS_epoch_ms=")); Log.print(gnssCollector.stats().lastEpochIntervalMs);
+    Log.print(F(" backlog_drops=")); Log.println(gpsBacklogDrops);
   }
-
-  if (txSeq > 5 && (millis() - lastAckRxMs > ACK_STALE_MS) &&
-      (millis() - lastAckMissMarkMs > 5000)) {
-    ackMissCount++;
-    lastAckMissMarkMs = millis();
-  }
-
-  evaluateAtpc();
 
   // PWR key: short-press wakes the screen 10 s, long-press shuts down.
   // Polled on a timer (see PMU_KEY_POLL_MS) — loop() no longer blocks, so every
   // pass would otherwise cost two I2C transactions on the PMU bus.
-  if (pmuOnline && millis() >= nextPmuKeyMs) {
+  if (pmuOnline && loop_metrics::due(millis(), nextPmuKeyMs)) {
     nextPmuKeyMs = millis() + PMU_KEY_POLL_MS;
     pmu.getIrqStatus();
     if (pmu.isPekeyShortPressIrq()) {
@@ -3143,10 +2987,10 @@ void loop() {
 
   // Keep the woken screen refreshed, then put the panel back to sleep.
   if (clientOledAwake) {
-    if (millis() >= clientOledOffMs) {
+    if (loop_metrics::due(millis(), clientOledOffMs)) {
       sleepClientOled();
       clientOledAwake = false;
-    } else if (millis() >= nextClientOledRefreshMs) {
+    } else if (loop_metrics::due(millis(), nextClientOledRefreshMs)) {
       nextClientOledRefreshMs = millis() + DISPLAY_REFRESH_MS;
       drawClientInfoScreen();
     }
@@ -3161,30 +3005,44 @@ void loop() {
 #endif
 
 #if defined(ROLE_SERVER)
-  if (otaReady && WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
-  httpServer.handleClient();
+  MeasureDuration loopTiming(loopDuration);
+  serviceServerRadio();
+  updateDeclination();
+  serviceControl();
+  if (otaReady && WiFi.status() == WL_CONNECTED) {
+    MeasureDuration timing(otaDuration);
+    ArduinoOTA.handle();
+  }
+  serviceControl();
+  {
+    MeasureDuration timing(httpDuration);
+    httpServer.handleClient();
+  }
+  serviceServerRadio();
+  serviceControl();
   serviceGps();  // keep the server's own GPS position fresh
+  updateDeclination();
 
-  if (millis() >= nextEnvMs) {
+  if (loop_metrics::due(millis(), nextEnvMs)) {
     nextEnvMs = millis() + ENV_UPDATE_MS;
     sampleEnvSensor();
   }
+  serviceControl();
 
-  if (millis() >= nextMagMs) {
-    nextMagMs = millis() + (magCalState == MAGCAL_COLLECTING ? MAG_CAL_SAMPLE_MS
-                                                            : MAG_SAMPLE_MS);
-    sampleMag();
-  }
-
-  if (millis() >= nextBatteryMs) {
+  if (loop_metrics::due(millis(), nextBatteryMs)) {
     nextBatteryMs = millis() + BATTERY_UPDATE_MS;
     cachedBatteryMv = readBatteryMilliVolts();
     checkLowBatteryAndMaybeShutdown();
   }
+  serviceControl();
+
+  if (wifiReconnectingUntilMs != 0 &&
+      loop_metrics::due(millis(), wifiReconnectingUntilMs)) wifiReconnectingUntilMs = 0;
 
   // WiFi watchdog: re-attempt the hotspot every WIFI_RETRY_INTERVAL_MS while
   // offline, and refresh the cached IP once (re)connected.
   if (WiFi.status() == WL_CONNECTED) {
+    nextWifiRetryMs = millis();  // keep retry deadline fresh during a long connection
     // Re-read on change, not just when empty: a DHCP renewal can hand out a
     // different address without the link ever reporting disconnected, and the
     // old code would then show a stale IP on the OLED forever. Compared as an
@@ -3194,13 +3052,13 @@ void loop() {
       cachedApIpAddr = ip;
       cachedApIp = ip.toString();
       Log.print(F("[WiFi] address is now "));
-      Log.println(cachedApIp);
+      Log.println(F("(address shown on OLED)"));
     }
     initArduinoOta();
   } else {
     cachedApIp = "";
     cachedApIpAddr = IPAddress();
-    if (millis() >= nextWifiRetryMs) {
+    if (loop_metrics::due(millis(), nextWifiRetryMs)) {
       nextWifiRetryMs = millis() + WIFI_RETRY_INTERVAL_MS;
       wifiReconnectingUntilMs = millis() + 2000;  // show "reconnecting" briefly
       WiFi.reconnect();
@@ -3208,7 +3066,8 @@ void loop() {
   }
 
   // Long-press PWR → show shutdown screen then power off
-  if (pmuOnline && millis() >= nextPmuKeyMs) {
+  if (pmuOnline && loop_metrics::due(millis(), nextPmuKeyMs)) {
+    MeasureDuration timing(pmuDuration);
     nextPmuKeyMs = millis() + PMU_KEY_POLL_MS;
     pmu.getIrqStatus();
     if (pmu.isPekeyLongPressIrq()) {
@@ -3218,142 +3077,71 @@ void loop() {
     pmu.clearIrqStatus();  // don't let unrelated latched IRQs accumulate
   }
 
-  // Interrupt-driven RX: the DIO1 ISR sets rxDoneFlag; the loop stays
-  // non-blocking so httpServer.handleClient() above replies instantly.
-  if (rxDoneFlag) {
-    rxDoneFlag = false;
-    bool ackSent = false;
-    uint8_t buf[DATA_PACKET_LEN];
-    int state = radio.readData(buf, sizeof(buf));
-
-    if (state == RADIOLIB_ERR_NONE) {
+  serviceControl();
+  // DIO1 drives RX / TX completion; HTTP and I2C calls are measured separately.
+  serviceServerRadio();
+  if (!ackTransmitter.active() && serverRxReady && serverRadioIrq) {
+    MeasureDuration timing(loraDuration);
+    const uint32_t receivedAtMs = serverRadioIrqMs;
+    serverRadioIrq = false;
+    bool ackHandledRx = false;
+    uint8_t buf[255];
+    // Preserve the real RF length. Never truncate a long frame into a valid one.
+    const size_t n = radio.getPacketLength();
+    const int state = radio.readData(buf, n <= sizeof(buf) ? n : sizeof(buf));
+    if (state == RADIOLIB_ERR_NONE && n <= sizeof(buf)) {
       radioFailStreak = 0;
-      size_t n = radio.getPacketLength();
-      if (n > sizeof(buf)) {
-        n = sizeof(buf);
-      }
-
-    DecodedData d{};
-    if (parseDataPacket(buf, n, d)) {
-      lastData = d;
-      lastRssi = radio.getRSSI();
-      lastSnr = radio.getSNR();
-      lastRxMs = millis();
-      havePkt = true;
-      rxDataCount++;
-      // Update LoRa rolling stats
-      rssiRing[rssiRingIdx] = lastRssi;
-      snrRing[rssiRingIdx]  = lastSnr;
-      rssiRingIdx = (rssiRingIdx + 1) % RSSI_WINDOW;
-      if (rssiRingCount < RSSI_WINDOW) rssiRingCount++;
-      pktsThisWindow++;
-      if (pktWindowStartMs == 0) pktWindowStartMs = millis();
-      if (millis() - pktWindowStartMs >= 60000) {
-        cachedPktRate = pktsThisWindow / 60.0f;
-        pktsThisWindow = 0;
-        pktWindowStartMs = millis();
-      }
-      // Servo steering is NOT driven from here — it runs on the TRACK_UPDATE_MS
-      // tick in loop() so the pan keeps going between (and through missing)
-      // packets. This handler only refreshes the data it feeds on.
-
-      // Acknowledge only every ACK_EVERY_N-th sequence number (see ACK_EVERY_N).
-      // Keyed on the client's seq, so packet loss cannot slide the schedule.
-      if (d.seq % ACK_EVERY_N == 0) {
-        uint8_t ackBuf[ACK_PACKET_LEN];
-        size_t ackLen = buildAckPacket(ackBuf, d.srcId, d.seq, lastRssi, lastSnr);
-        ackSent = true;  // TxDone pulses on DIO1 whether or not the TX succeeded
-        if (radio.transmit(ackBuf, ackLen) == RADIOLIB_ERR_NONE) {
-          ackTxCount++;
-          rxWinAck++;
-        }
-      }
-
-      // Folded into the once-a-minute summary (see logRxSummary) rather than
-      // logged here. Sequence numbers give the loss count for free: the client
-      // increments seq every send, so expected = last - first + 1.
-      rxWinData++;
-      if (!rxWinHaveSeq) {
-        rxWinFirstSeq = d.seq;
-        rxWinHaveSeq = true;
-        rxWinRssiMin = rxWinRssiMax = lastRssi;
-        rxWinSnrMin = rxWinSnrMax = lastSnr;
-      } else {
-        if (lastRssi < rxWinRssiMin) rxWinRssiMin = lastRssi;
-        if (lastRssi > rxWinRssiMax) rxWinRssiMax = lastRssi;
-        if (lastSnr < rxWinSnrMin) rxWinSnrMin = lastSnr;
-        if (lastSnr > rxWinSnrMax) rxWinSnrMax = lastSnr;
-      }
-      rxWinLastSeq = d.seq;
-      rxWinRssiSum += lastRssi;
-      rxWinSnrSum += lastSnr;
+      receivedPacketRssi = radio.getRSSI(); receivedPacketSnr = radio.getSNR();
+      ackHandledRx = acceptRadioPacket(buf, n, receivedAtMs);
     } else {
-      DecodedTelemetry t{};
-      if (parseTelemetryPacket(buf, n, t)) {
-        lastTelemetry = t;
-        // 下水前的第一筆當基準；之後濕度相對它爬升就是滲水的徵兆。
-        if (clientHumBaselinePct < 0 && t.humidityPct != 0xFF) {
-          clientHumBaselinePct = (int)t.humidityPct;
-        }
-        haveTelemetry = true;
-        lastTelemetryRxMs = millis();
-        rxTelemetryCount++;
-        rxWinTelem++;
-      } else {
-        rxDropCount++;
-        rxWinDrop++;
+      ++rxErrorCount; ++rxWinErr; rxWinLastErr = state;
+      recordPacketEvent(packet_diagnostics::Kind::RadioError, receivedAtMs, nullptr, n, nullptr, state);
+      if (++radioFailStreak >= RADIO_RX_ERR_LIMIT && recoverRadio()) {
+        ackHandledRx = true; serverRxReady = true;
       }
     }
-    } else {
-      rxErrorCount++;
-      rxWinErr++;
-      rxWinLastErr = state;  // reported once in the summary, with its RadioLib code
-      // CRC 錯誤在距離極限本來就會出現，所以門檻設得比 client 高很多：
-      // 這裡要抓的是「無線電卡住之後每次都回同一個錯」，不是偶發的壞封包。
-      if (++radioFailStreak >= RADIO_RX_ERR_LIMIT) recoverRadio();
+    if (!ackHandledRx) {
+      // Do not clear the software IRQ after restarting RX: preserve a new packet.
+      serverRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+      if (!serverRxReady) nextServerRxRetryMs = millis() + 100;
     }
-    // Only swallow the DIO1 pulse when we actually transmitted — on the cycles
-    // that skip the ACK the flag can only mean a genuine packet arrived while
-    // this handler was running, and clearing it would drop that packet.
-    if (ackSent) rxDoneFlag = false;
-    radio.startReceive();     // re-arm for the next packet
   }
 
-  // Camera tracking tick: 20 Hz, independent of the 1 Hz packet arrival.
-  if (millis() >= nextTrackMs) {
-    nextTrackMs = millis() + TRACK_UPDATE_MS;
-    updateTracking();
-  }
+  serviceServerRadio();
 
-  if (millis() >= nextRxSummaryMs) {
+  serviceControl();
+
+  if (loop_metrics::due(millis(), nextRxSummaryMs)) {
     nextRxSummaryMs = millis() + RX_SUMMARY_MS;
     logRxSummary();
   }
 
-  // Periodic idle log when no packet has arrived for a while.
-  if (millis() >= nextServerIdleLogMs &&
-      (!havePkt || millis() - lastRxMs > 2500)) {
+  // Advance even while the link is healthy, so this deadline never lies dormant
+  // for longer than half the millis range before the next disconnection.
+  if (loop_metrics::due(millis(), nextServerIdleLogMs)) {
     nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
-    Log.print(F("[SERVER] idle | mode="));
-    Log.print(trackModeStr(trackMode));
-    Log.print(F(" SRV-GPS fix="));
-    Log.print(gpsFixFresh() ? 1 : 0);
-    Log.print(F(" sats="));
-    Log.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
-    Log.print(F(" hdop="));
-    if (gps.hdop.isValid()) Log.print(gps.hdop.hdop(), 1);
-    else Log.print(F("--"));
-    Log.print(F(" head="));
-    if (magOnline && magHeadingDeg >= 0) Log.print(magHeadingDeg, 1);
-    else Log.print(F("N/A"));
-    Log.print(F(" servo="));
-    Log.print(servoAngleDeg, 1);
-    Log.println(F(" (waiting for client packets)"));
+    if (!havePkt || millis() - lastRxMs > 2500) {
+      Log.print(F("[SERVER] idle | mode="));
+      Log.print(trackModeStr(trackMode));
+      Log.print(F(" SRV-GPS fix="));
+      Log.print(gpsFixFresh() ? 1 : 0);
+      Log.print(F(" sats="));
+      Log.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+      Log.print(F(" hdop="));
+      if (gps.hdop.isValid()) Log.print(gps.hdop.hdop(), 1);
+      else Log.print(F("--"));
+      Log.print(F(" servo="));
+      Log.print(servoAngleDeg, 1);
+      Log.println(F(" (waiting for client packets)"));
+    }
   }
 
-  if (millis() >= nextDisplayMs) {
+  if (oledNextRow>=8 && loop_metrics::due(millis(), nextDisplayMs)) {
     nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
     renderServerDisplay();
   }
+  serviceControl();
+  serviceServerDisplay();
+  serviceControl();
 #endif
 }

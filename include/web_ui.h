@@ -7,26 +7,20 @@
 // the phone also has mobile data; offline it falls back to tracks + scale bar.
 //
 // Operator flow:
-//   One-time, on the 資訊 page: magnetometer hard-iron calibration (turn the rig
-//   through one clockwise circle — which also tells the firmware which way the
-//   board is mounted), then landmark calibration (centre a distant landmark in
-//   the viewfinder and paste its coordinates — the only way to lock the aim, and
-//   the only one that needs no compass). Both are solo, and together they
-//   make mount_offset a constant that survives being packed up and set down at
-//   another spot — so later sessions need no aiming at all.
-//   手動 (Manual): drag the overlaid slider to aim the camera manually.
-//   自動 (Auto):   locks the current manual aim as "facing the surfer" and
-//                  auto-follows; pressing it again re-locks from the latest aim.
-// Layout: full-height, no-scroll, two top tabs — 雷達 (radar/map canvas with the
-//   雷達/地圖 + 手動/自動 toggles and the slider overlaid at the bottom) and
-//   資訊 (live telemetry grid). The canvas auto-sizes to its container, and the
+// Calibration: type the heading read from the compass attached to the camera.
+// North=0, East=90; automatic start/resume preserves the saved reference.
+// GPS and UART are exclusive modes; a missing input holds the current angle.
+// Manual stops tracking and allows direct slider adjustment.
+// Layout: full-height, three top tabs — 雷達 (radar/map canvas with the
+//   雷達/地圖 + 手動/GPS/UART controls and the slider overlaid at the bottom) and
+//   資訊 (shared speed limit, GPS prediction, compass calibration and telemetry).
+//   除錯 records read-only browser snapshots and exports a diagnostic JSON file.
+//   The canvas auto-sizes to its container, and the
 //   surfer marker carries a GPS-status tag (衛星 少/普通/好, 預期精度 ±N m,
 //   Good/OK/Bad).
 // GPS is reported in operator terms, not receiver terms: the satellite count
 //   becomes 少/普通/好 and HDOP becomes 預期精度 in metres (see accM() below).
-// The rolling firmware log is no longer a tab here — the 資訊 page has a button
-//   that opens WEB_LOG_HTML (served at /log) in a separate browser tab, so it
-//   can be watched next to the radar instead of replacing it.
+// UART is the boot default; GPS is selectable only with fresh Good/OK signals.
 static const char WEB_UI_HTML[] = R"rawlit(
 <!DOCTYPE html>
 <html lang="zh-Hant">
@@ -61,7 +55,11 @@ body{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
 main{flex:1;position:relative;overflow:hidden}
 .page{position:absolute;inset:0;display:none;flex-direction:column;padding:10px;gap:10px}
 .page.on{display:flex}
-#pgInfo{overflow:auto}
+#pgInfo,#pgDebug{overflow:auto}
+#debugNote{width:100%;min-height:70px;resize:vertical;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}
+#debugSummary,#debugLog{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,monospace;margin:8px 0 0}
+#debugLog{max-height:45vh;overflow:auto}
+#pgDebug .card{flex:none}#debugRecordState{font-size:13px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
 .radarHead{display:flex;align-items:center;gap:10px;flex:none;
   font-size:13px;color:var(--mut);font-weight:600}
@@ -74,7 +72,8 @@ main{flex:1;position:relative;overflow:hidden}
   width:calc(100% - 16px);max-width:800px;z-index:2;
   display:flex;align-items:center;gap:12px;padding:8px 12px;
   background:rgba(13,17,23,.74);border:1px solid var(--line);border-radius:10px}
-.sliderOverlay input[type=range]{flex:1;accent-color:var(--acc)}
+.sliderTrack{flex:1;min-width:0}.rangeEnds{display:flex;justify-content:space-between;font-size:10px;color:var(--mut)}
+.sliderOverlay input[type=range]{width:100%;direction:ltr;accent-color:var(--acc)}
 .sliderOverlay input[type=range]:disabled{opacity:.45}
 input[type=range]{flex:1;accent-color:var(--acc)}
 input[type=range]:disabled{opacity:.4}
@@ -96,7 +95,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .seg{padding:4px 12px;border:1px solid var(--line);background:#21262d;color:var(--mut);
   font-size:12px;font-weight:600;cursor:pointer;flex:none;min-width:0}
 .seg:first-child{border-radius:6px 0 0 6px}
-.seg:last-child{border-radius:0 6px 6px 0;border-left:0}
+.seg:last-child{border-radius:0 6px 6px 0}
+.seg+.seg{border-left:0}
 .seg.on{background:var(--acc);border-color:var(--acc);color:#fff}
 .infoCols{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .col{overflow:visible}
@@ -110,6 +110,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .calRow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
 .calRow input[type=text]{flex:1;min-width:170px;padding:10px;border-radius:8px;
   border:1px solid var(--line);background:#0d1117;color:var(--fg);font-size:13px}
+#cfgSpeed{width:130px;padding:8px;border:1px solid var(--line);border-radius:6px;background:#0d1117;color:var(--fg)}
+#cfgPrediction{width:20px;height:20px;accent-color:var(--acc)}
+#radarWrap{min-height:180px}#pgRadar{overflow:auto}
 .hint3{display:block;margin-top:6px;font-size:11px;color:var(--mut);line-height:1.45}
 .bar{height:6px;border-radius:3px;background:#21262d;overflow:hidden;margin-top:8px}
 .bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
@@ -149,6 +152,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 <nav class="tabs">
   <button id="tabRadar" class="on" type="button">雷達</button>
   <button id="tabInfo" type="button">資訊</button>
+  <button id="tabDebug" type="button">除錯</button>
 </nav>
 
 <main>
@@ -162,15 +166,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
     </div>
     <div class="radarHead">
       <span class="segwrap">
-        <button id="mManual" class="seg on" type="button">手動</button>
-        <button id="mAuto" class="seg" type="button">自動</button>
+        <button id="mGps" class="seg" type="button" disabled>GPS</button>
+        <button id="mUart" class="seg on" type="button">UART</button>
+        <button id="mManual" class="seg" type="button">手動</button>
       </span>
-      <span class="hint2">自動＝以目前手動角度當「正對 Surfer」並跟隨</span>
+      <span id="controlState" class="hint2">UART・等待指令</span>
     </div>
     <div id="radarWrap">
       <canvas id="radar"></canvas>
       <div class="sliderOverlay">
-        <input id="sld" type="range" min="0" max="180" step="1" value="90">
+        <div class="sliderTrack"><input id="sld" aria-label="Servo 目標角度，放開生效" type="range" min="0" max="180" step="1" value="90" disabled><div class="rangeEnds"><span>0°</span><span>180°</span></div></div>
         <div class="ang"><span id="angTxt">90</span><small>&deg;</small></div>
       </div>
     </div>
@@ -188,6 +193,20 @@ button:disabled{opacity:.4;cursor:not-allowed}
   </section>
 
   <section id="pgInfo" class="page">
+    <div id="servoSpeedSettings" class="card calCard" style="flex:none">
+      <h3>Servo 最高速度</h3>
+      <div class="calRow">
+        <input id="cfgSpeed" type="number" inputmode="decimal" min="1" max="90" step="0.1" value="30" disabled aria-label="Servo 最高速度，每秒度數">
+        <span>°／秒</span>
+      </div>
+      <span class="hint3">手動、GPS、UART 共用。可調 1–90°／秒，修改後自動儲存，重開機保留。</span>
+      <span id="speedSaveState" class="hint3">讀取速度中</span>
+    </div>
+    <div id="gpsPredictionSettings" class="card calCard" style="flex:none">
+      <label class="calRow" for="cfgPrediction"><input id="cfgPrediction" type="checkbox" disabled aria-describedby="predictionHelp predictionSaveState"> GPS 位置預測（α）</label>
+      <span id="predictionHelp" class="hint3">僅影響 GPS 模式。開啟（α＝1）：用速度與方向推估目前位置。關閉（α＝0）：追蹤最近收到的位置。切換可能改變追蹤目標，共用最高速度維持不變。修改後自動儲存，重開機保留。</span>
+      <span id="predictionSaveState" class="hint3" role="status" aria-live="polite">讀取預測設定中</span>
+    </div>
     <div class="card" style="flex:none">
       <table class="cmp">
         <thead><tr><th></th><th>站 Server</th><th>Surfer Client</th></tr></thead>
@@ -209,7 +228,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
         <div class="r"><span>SNR</span><b id="sSnr">--</b></div>
         <div class="r"><span>丟包率</span><b id="sDrop">--</b></div>
         <div class="sub">其他</div>
-        <div class="r"><span>羅盤</span><b id="sHdg">--</b></div>
+        <div class="r"><span>韌體版本</span><b id="sVersion">--</b></div>
         <div class="r"><span>Uptime</span><b id="sUp">--</b></div>
       </div>
       <div class="col card">
@@ -223,45 +242,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
       </div>
     </div>
     <div class="card calCard" style="flex:none">
-      <h3>校正（各做一次即可）</h3>
-
-      <div class="sub">1 · 磁力計 hard-iron</div>
-      <div class="r"><span>狀態</span><b id="mcState">--</b></div>
-      <div class="r"><span>擬合殘差（總）</span><b id="mcRes">--</b></div>
-      <div class="r"><span>├ 橢圓（soft iron／不正交）</span><b id="mcEll">--</b></div>
-      <div class="r"><span>└ 散射（晃動／雜訊）</span><b id="mcSct">--</b></div>
-      <div class="r"><span>磁場強度</span><b id="mcFld">--</b></div>
-      <div class="r"><span>上次轉過角度</span><b id="mcSwp">--</b></div>
-      <div class="r"><span>水平面軸</span><b id="mcAxes">--</b></div>
-      <div class="bar"><i id="mcBar"></i></div>
-      <div class="calRow"><button id="btnMagCal" type="button">開始磁力計校正</button></div>
-      <span class="hint3">按下後把整台機器放腳架上，<b>順時針（從上往下看）水平轉一整圈</b>。
-        <b>不必剛好 360°</b>——進度條是 10° 分格的覆蓋率，滿 34/36 格（≈340°）就會自己完成，
-        多轉、來回修、中途停手都沒關係。<b>速度也不必平滑</b>，忽快忽慢、停一下都行，只要淨方向一致。
-        唯一的下限是別快到 <b>2 秒一圈</b>（取樣 20 Hz，快過 200°/s 才會跳格）；
-        建議 10~30 秒。
-        真正會傷品質的是<b>轉的時候板子跟著晃</b>——要在腳架雲台上轉，不要手捧著轉。
-        板子<b>平放或立起來都可以</b>，這一圈同時判斷哪兩軸是水平面（見「水平面軸」）；
-        但<b>方向要對</b>，反了 heading 的正負會相反。
-        殘差看下面兩項哪個大：<b>橢圓</b>大 = soft iron（servo 鋼齒輪）或板子沒擺正交，
-        轉得再漂亮也不會變好，要移動板子；<b>散射</b>大 = 轉的時候在晃或吃到 servo 電流。</span>
-
-      <div class="sub" style="margin-top:16px">2 · 地標校正（鎖定 mount_offset，做一次就永久有效）</div>
-      <div class="r"><span>目前 mount_offset</span><b id="mcOff">--</b></div>
-      <div class="r"><span>與校正姿勢的方位差</span><b id="mcPose">--</b></div>
-      <div class="r"><span>└ 該姿勢差造成的指向誤差</span><b id="mcPoseErr">--</b></div>
-
+      <h3>鏡頭指南針校正</h3>
       <div class="calRow">
-        <input id="lmCoord" type="text" placeholder="25.033611, 121.565000">
-        <button id="btnLmCal" type="button">用目前鏡頭指向校正</button>
+        <input id="compassBearing" type="number" inputmode="decimal" min="0" max="359.9" step="0.1" placeholder="指南針角度 0–359.9°" aria-label="鏡頭指南針角度">
+        <button id="btnCompassCal" type="button">校正</button>
       </div>
-      <span class="hint3">servo 設 90°，從<b>觀景窗</b>把 1 km 以外的地標對到畫面正中央，
-        貼上該地標座標（Google Maps 右鍵可複製）再按鈕。需要攝影站有 GPS fix，
-        但不需要追蹤器在場、不需要第二個人，也<b>完全不涉及羅盤與磁偏角</b>
-        （座標算出來的就是真方位），照準精度 0.1° 級。
-        <b>盡量選跟浪區同方向的地標</b>（外海的燈塔、防波堤端、離岸礁、遠處岬角）：
-        校正姿勢與拍攝姿勢的方位差越小，上面那個「姿勢差造成的指向誤差」就越接近 0，
-        因為磁力計的橢圓誤差會自己抵銷掉。先做完步驟 1。</span>
+      <span class="hint3">切到手動、等鏡頭停穩，輸入鏡頭上磁針指南針的讀數。北 0°、東 90°、南 180°、西 270°。
+        校正不需要 GPS；台灣磁偏角會依攝影站 GPS 位置與日期自動換算。完成後選「GPS」。
+        腳架轉動、重開機、重新架設或移動指南針後請重新校正。UART 模式不需要此校正。</span>
+      <div class="r"><span>校正偏移</span><b id="mcOff">--</b></div>
+      <div class="r"><span>磁偏角補償</span><b id="mcDeclination">--</b></div>
 
     </div>
     <div class="card" style="flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -269,10 +259,19 @@ button:disabled{opacity:.4;cursor:not-allowed}
       <button id="btnExport" type="button">匯出 GPX（可上傳 Strava）</button>
       <span id="exportHint" class="hint2" style="margin-left:0">網頁最多保留過去 2 小時軌跡，雷達／地圖仍只顯示最近 5 分鐘；匯出後會自動清空。GPX 檔請自行到 Strava 網頁上傳</span>
     </div>
-    <div class="card" style="flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <button id="btnLog" type="button">開啟執行紀錄（新分頁）</button>
-      <span class="hint2" style="margin-left:0">韌體的滾動 log（4 KB 環形緩衝）。開在另一個分頁，雷達畫面就不用讓位；那個分頁切到背景時會自動停止輪詢，避免和這裡搶 ESP32 的單一連線</span>
+  </section>
+  <section id="pgDebug" class="page">
+    <div class="card">
+      <h3>測試紀錄</h3>
+      <div class="calRow"><button id="btnDebugStart" type="button">開始新紀錄</button><button id="btnDebugStop" type="button" disabled>停止紀錄</button><button id="btnDebugExport" type="button">匯出 JSON</button></div>
+      <p id="debugRecordState" role="status" aria-live="polite">尚未錄製</p>
+      <label for="debugNote">測試備註</label><textarea id="debugNote" maxlength="2000" placeholder="例如：距離、直線／折返、鏡頭落後或抖動的時間"></textarea>
+      <span class="hint3">每秒最多取樣一次，最長 10 分鐘、1200 筆或 5 MiB，達上限自動停止。切換分頁仍繼續錄製；手機鎖屏可能漏採，重整網頁會遺失。匯出包含定位、設定與紀錄，方便交給 AI 分析。</span>
+      <span class="hint3">發送排程不代表 GPS 有同樣頻率的新定位。角度與速度是軟體命令，未量測機構實際動作。</span>
+      <span class="hint3">Client DIAG 約每 30 秒回報一次，只代表回報當時的狀態；過期資料仍保留供比對。</span>
     </div>
+    <div class="card"><h3>即時狀態</h3><span id="debugPollState" class="hint3" role="status">進入此頁後開始讀取</span><pre id="debugSummary">尚無資料</pre></div>
+    <div class="card"><h3>Server 文字紀錄</h3><span class="hint3">僅讀取，匯出不會清除 Server 或瀏覽器紀錄。畫面最多保留最近 64 KiB 文字。</span><pre id="debugLog">尚無紀錄</pre></div>
   </section>
 </main>
 
@@ -283,14 +282,18 @@ var $=function(id){return document.getElementById(id);};
 var last={track:null,status:null,alerts:[]};
 var dragging=false;
 var servoPendingAngle=null;
+var servoPendingIntent=null;
 var servoSendTimer=0;
+var servoLastSendMs=-Infinity;
 var servoSending=false;
+var servoRequest=Promise.resolve();
+var controlChanging=false;
 var servoDragEnded=false;
-var SERVO_SEND_INTERVAL_MS=75;
+var servoGestureCancelled=false;
 var viewMode='radar';
 var page='radar';
 var hist=[];               // client-accumulated path (server no longer stores it)
-var HIST_RETAIN_MS=2*60*60*1000; // keep up to 2h in memory (for CSV export)
+var HIST_RETAIN_MS=2*60*60*1000; // prune older points on append (for GPX export)
 var RADAR_WINDOW_MS=5*60*1000;   // 雷達／地圖畫面固定只顯示最近 5 分鐘
 var radarZoom=1;           // multiplicative zoom for radar view
 var mapZoomDelta=0;        // additive zoom delta (in zoom levels) for map view
@@ -302,26 +305,152 @@ var activePointers={};
 function toast(m){var t=$('toast');t.textContent=m;t.classList.add('show');
   clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove('show');},2600);}
 
-function post(url){
-  return fetch(url,{method:'POST'}).then(function(r){
-    return r.json().catch(function(){return{};}).then(function(j){
-      if(!r.ok||j.ok===false){toast(j.error||('HTTP '+r.status));throw j;}
-      return j;});
-  });
+var motionContext=null;
+// One entry per observed board reboot during this page's lifetime. A delayed
+// reply from a retired boot must never become the current command context again.
+var retiredControlBoots=[];
+function servoUiAngle(raw){return 180-Number(raw);}
+function servoRawAngle(ui){return 180-Number(ui);}
+var speedLoaded=false,speedSaving=false,lastSavedSpeed=30;
+var predictionLoaded=false,predictionSaving=false,lastSavedPrediction=null,pendingPrediction=null;
+var predictionContext=null;
+// Keep a delayed poll/load from reverting a setting already confirmed by POST.
+function showPredictionSetting(j,confirmed){
+  var enabled=j.enabled;
+  if(typeof enabled!=='boolean'||j.alpha!==(enabled?1:0))return false;
+  if(!syncMotionContext(j))return false;
+  if(predictionSaving&&!confirmed)return false;
+  if(predictionContext&&j.control_boot_id===predictionContext.control_boot_id){
+    var elapsed=(j.clock_ms-predictionContext.clock_ms)|0;
+    if(elapsed<0)return false;
+    if(j.control_epoch===predictionContext.control_epoch&&
+       ((j.command_seq-predictionContext.command_seq)|0)<0)return false;
+    if(elapsed===0&&((j.control_epoch-predictionContext.control_epoch)|0)<0)return false;
+  }
+  var changed=!predictionLoaded||enabled!==lastSavedPrediction;
+  predictionContext={control_boot_id:j.control_boot_id,control_epoch:j.control_epoch,
+    command_seq:j.command_seq>>>0,clock_ms:j.clock_ms>>>0};
+  lastSavedPrediction=enabled;predictionLoaded=true;
+  $('cfgPrediction').checked=enabled;$('cfgPrediction').indeterminate=false;
+  $('cfgPrediction').disabled=controlChanging||predictionSaving;
+  if(changed||confirmed)$('predictionSaveState').textContent=enabled?'已記住：開啟（α＝1）':'已記住：關閉（α＝0）';
+  return true;
+}
+function syncMotionContext(j){
+  if(retiredControlBoots.indexOf(j.control_boot_id)>=0)return false;
+  if(j.control_epoch==null||j.clock_ms==null)return true;
+  if(!motionContext||j.control_boot_id!==motionContext.control_boot_id){
+    if(motionContext&&motionContext.control_boot_id!=null)retiredControlBoots.push(motionContext.control_boot_id);
+    motionContext={control_boot_id:j.control_boot_id,control_epoch:j.control_epoch,
+      command_seq:j.command_seq>>>0,clock_ms:j.clock_ms>>>0};return true;
+  }
+  if(((j.clock_ms-motionContext.clock_ms)|0)<0)return false;
+  if(j.clock_ms===motionContext.clock_ms&&((j.control_epoch-motionContext.control_epoch)|0)<0)return false;
+  if(j.control_epoch!==motionContext.control_epoch){
+    motionContext.control_epoch=j.control_epoch;motionContext.command_seq=j.command_seq>>>0;
+  }else if(((j.command_seq-motionContext.command_seq)|0)>0){
+    motionContext.command_seq=j.command_seq>>>0;
+  }
+  motionContext.clock_ms=j.clock_ms>>>0;
+  return true;
+}
+function motionUrl(url){
+  if(!motionContext)throw new Error('等待控制狀態更新，請稍後再試');
+  motionContext.command_seq=(motionContext.command_seq+1)>>>0;
+  return url+(url.indexOf('?')<0?'?':'&')+'epoch='+motionContext.control_epoch+
+    '&seq='+motionContext.command_seq+'&stamp='+motionContext.clock_ms;
+}
+function isMotionUrl(url){return /^\/api\/(servo(?:[/?]|$)|track\/(start|resume|pause|calibrate|prediction)(?:[/?]|$))/.test(url);}
+// One transport slot covers fetch AND the complete response body. Background
+// callers share a pending job by key; priority is reconsidered between reads.
+var httpQueue=[],httpActive=null,httpByKey={},httpOrder=0,httpContextAt=-Infinity;
+var HTTP_TIMEOUT_MS=2000;
+// Capture when the user commits, before either the slider queue or HTTP queue.
+function controlIntent(){return {deadline:performance.now()+HTTP_TIMEOUT_MS,
+  context:motionContext?{boot:motionContext.control_boot_id,epoch:motionContext.control_epoch}:null};}
+function httpError(message,name){var e=new Error(message);e.name=name||'Error';return e;}
+function httpReject(job,error){if(!job.done){job.done=true;job.reject(error);}}
+function httpReceiveContext(data){
+  var context=data&&data.servo||data;
+  if(context&&context.control_epoch!=null&&context.clock_ms!=null&&syncMotionContext(context))httpContextAt=performance.now();
+}
+function httpJsonBody(response){return response.json();}
+function httpExchange(job,url,method,read){
+  if(job.cancelled)return Promise.reject(httpError('指令或讀取已逾時，請重試','TimeoutError'));
+  var ac=typeof AbortController!=='undefined'?new AbortController():null,expired=false;
+  job.abort=ac;
+  var timer=setTimeout(function(){
+    expired=true;job.cancelled=true;if(ac)ac.abort();
+    httpReject(job,httpError('讀取逾時；若未恢復請重新整理','TimeoutError'));
+  },HTTP_TIMEOUT_MS);
+  var options={cache:'no-store'};if(method)options.method=method;if(ac)options.signal=ac.signal;
+  // Do not release httpActive on the timeout alone: unsupported/ineffective
+  // abort must not let a second fetch overlap a still-running body read.
+  return Promise.resolve().then(function(){
+    if(job.cancelled)throw httpError('指令或讀取已逾時，請重試','TimeoutError');
+    return fetch(url,options);
+  }).then(function(response){
+    return read(response).then(function(data){
+      if(expired||job.cancelled)throw httpError('讀取已逾時，忽略延遲回覆','TimeoutError');
+      if(!response.ok||data&&data.ok===false){
+        var error=httpError(data&&data.error||'HTTP '+response.status);error.status=response.status;throw error;
+      }
+      httpReceiveContext(data);return data;
+    });
+  }).finally(function(){clearTimeout(timer);job.abort=null;});
+}
+function httpPump(){
+  if(httpActive||!httpQueue.length)return;
+  httpQueue.sort(function(a,b){return a.priority-b.priority||a.order-b.order;});
+  var job=httpQueue.shift();httpActive=job;
+  // Non-control requests have a queue timeout and a separate wire timeout.
+  // A control's original 2 s intent deadline also covers a context refresh.
+  if(!job.motion)clearTimeout(job.timer);
+  var run=Promise.resolve();
+  if(job.motion){
+    run=run.then(function(){
+      if(!motionContext||performance.now()-httpContextAt>1000)
+        return httpExchange(job,'/api/track',null,httpJsonBody).then(function(state){
+          var context=state&&state.servo;
+          if(!context||context.control_boot_id==null||context.control_epoch==null||context.clock_ms==null||!syncMotionContext(context))
+            throw httpError('控制狀態未更新，請重試');
+        });
+    }).then(function(){
+      if(job.cancelled||performance.now()>=job.deadline)throw httpError('控制指令等待逾時，請重試','TimeoutError');
+      if(job.context&&(!motionContext||job.context.boot!==motionContext.control_boot_id||job.context.epoch!==motionContext.control_epoch))
+        throw httpError('設備或控制模式已更新，請重試');
+      return httpExchange(job,motionUrl(job.url),job.method,job.read);
+    });
+  }else run=run.then(function(){return httpExchange(job,typeof job.url==='function'?job.url():job.url,job.method,job.read);});
+  run.then(function(data){if(!job.done){job.done=true;job.resolve(data);}},function(error){httpReject(job,error);})
+    .finally(function(){
+      clearTimeout(job.timer);if(job.key)delete httpByKey[job.key];httpActive=null;
+      Promise.resolve().then(httpPump);
+    });
+}
+function httpRequest(url,priority,key,read,method,intent){
+  if(key&&httpByKey[key])return httpByKey[key].promise;
+  var motion=method==='POST'&&isMotionUrl(url);
+  if(motion){intent=intent||controlIntent();if(performance.now()>=intent.deadline)
+    return Promise.reject(httpError('控制指令等待逾時，請重試','TimeoutError'));}
+  var job={url:url,priority:priority,key:key,read:read||httpJsonBody,method:method,
+    motion:motion,order:++httpOrder,deadline:motion?intent.deadline:performance.now()+HTTP_TIMEOUT_MS,
+    context:motion?intent.context:null};
+  job.promise=new Promise(function(resolve,reject){job.resolve=resolve;job.reject=reject;});
+  job.timer=setTimeout(function(){
+    job.cancelled=true;if(job.abort)job.abort.abort();
+    httpReject(job,httpError(job.motion?'控制指令等待逾時，請重試':'讀取排隊逾時','TimeoutError'));
+    if(httpActive!==job){httpQueue=httpQueue.filter(function(x){return x!==job;});if(key)delete httpByKey[key];}
+  },Math.max(0,job.deadline-performance.now()));
+  if(key)httpByKey[key]=job;httpQueue.push(job);httpPump();return job.promise;
+}
+function post(url,intent){
+  return httpRequest(url,0,null,null,'POST',intent).catch(function(e){toast(e.message);throw e;});
 }
 
 // ---- controls ----
-// Send at most one request at a time and collapse rapid slider events to the
-// newest angle. This keeps motion responsive without flooding the ESP32.
-//
-// The timeout matters more than it looks. The ESP's web server serves one client
-// at a time and closes the connection per request, so an aim POST can be left
-// hanging while /api/track or /api/log holds the socket. Without a timeout that
-// single hung fetch leaves servoSending stuck true for good: every later drag is
-// dropped in silence, the slider and the angle readout still move, and the
-// camera never does. Only a page reload brings it back — which is exactly what
-// "manual mode stopped working" looks like from the beach.
-var SERVO_SEND_TIMEOUT_MS=2000;
+// Drag previews locally; only a committed release submits a target.
+// Keep one request in flight and only the newest committed pending target.
 var lastServoWarn='',lastServoWarnMs=0;
 // Aim failures used to be swallowed whole, so a firmware 409 ("pause tracking
 // first") or 503 ("servo PWM unavailable") was indistinguishable from a dead
@@ -332,62 +461,49 @@ function servoWarn(m){
   lastServoWarn=m;lastServoWarnMs=t;toast(m);
 }
 // Always settles, never rejects, so the queue below cannot deadlock.
-function postServoAngle(v){
-  var ac=(typeof AbortController!=='undefined')?new AbortController():null;
-  var timer=setTimeout(function(){if(ac)ac.abort();},SERVO_SEND_TIMEOUT_MS);
-  return fetch('/api/servo?angle='+encodeURIComponent(v),
-               ac?{method:'POST',signal:ac.signal}:{method:'POST'})
-    .then(function(r){
-      return r.json().catch(function(){return{};}).then(function(j){
-        if(!r.ok||j.ok===false)servoWarn(j.error||('HTTP '+r.status));
-      });
-    })
-    .catch(function(e){
-      servoWarn(e&&e.name==='AbortError'?'角度指令逾時，岸上端沒回應'
-                                        :'角度指令送不出去，檢查 WiFi');
-    })
-    .then(function(){clearTimeout(timer);});
+function postServoAngle(v,intent){
+  return httpRequest('/api/servo?angle='+encodeURIComponent(v),0,null,null,'POST',intent)
+    .catch(function(e){servoWarn(e.message||'角度指令送不出去，檢查 WiFi');});
 }
 function sendPendingServoAngle(){
-  servoSendTimer=0;
-  if(servoSending||servoPendingAngle===null)return;
-  var v=servoPendingAngle;
-  servoPendingAngle=null;
-  servoSending=true;
-  postServoAngle(v).then(function(){
+  if(controlChanging||servoSending||servoPendingAngle===null)return;
+  var v=servoPendingAngle,intent=servoPendingIntent;servoPendingAngle=null;servoPendingIntent=null;servoSending=true;
+  servoRequest=postServoAngle(v,intent).then(function(){
     servoSending=false;
-    if(servoPendingAngle!==null){
-      if(servoDragEnded)sendPendingServoAngle();
-      else servoSendTimer=setTimeout(sendPendingServoAngle,SERVO_SEND_INTERVAL_MS);
-    }else if(servoDragEnded){
-      servoDragEnded=false;
-      dragging=false;
-    }
+    if(servoPendingAngle!==null)sendPendingServoAngle();
+    else if(servoDragEnded){servoDragEnded=false;dragging=false;}
   });
 }
 function queueServoAngle(v,isFinal){
-  servoPendingAngle=v;
-  if(isFinal)servoDragEnded=true;
-  if(servoSending)return;
-  if(servoSendTimer)clearTimeout(servoSendTimer);
-  servoSendTimer=isFinal?0:setTimeout(sendPendingServoAngle,SERVO_SEND_INTERVAL_MS);
-  if(isFinal)sendPendingServoAngle();
+  if(controlChanging||!isFinal)return;
+  servoPendingAngle=servoRawAngle(v);servoPendingIntent=controlIntent();servoDragEnded=true;
+  sendPendingServoAngle();
 }
+$('sld').addEventListener('pointerdown',function(){servoGestureCancelled=false;});
+$('sld').addEventListener('keydown',function(){servoGestureCancelled=false;});
+$('sld').addEventListener('pointercancel',function(){servoGestureCancelled=true;dragging=false;servoDragEnded=false;});
 $('sld').addEventListener('input',function(){
-  dragging=true;
-  servoDragEnded=false;
-  $('angTxt').textContent=this.value;
-  queueServoAngle(this.value,false);
+  dragging=true;servoDragEnded=false;$('angTxt').textContent=this.value;
 });
 $('sld').addEventListener('change',function(){
-  queueServoAngle(this.value,true);
+  if(!servoGestureCancelled)queueServoAngle(this.value,true);
 });
-// 手動 = move servo live with the slider; 自動 = lock the current aim as "facing the
-// surfer" and auto-track (re-locks every time, so no separate calibrate step).
-$('mManual').onclick=function(){
-  if(last.track&&last.track.servo.mode==='tracking')post('/api/track/pause').then(refresh);
-};
-$('mAuto').onclick=function(){post('/api/track/start').then(refresh).catch(function(){});};
+// Cancel unsent slider values and let the in-flight manual write finish first.
+// Otherwise an old slider request can arrive after Auto and take control back.
+function controlAction(url){
+  if(controlChanging)return Promise.resolve();
+  var intent=controlIntent();
+  controlChanging=true;
+  clearTimeout(servoSendTimer);servoSendTimer=0;servoPendingAngle=null;servoPendingIntent=null;
+  servoDragEnded=false;dragging=false;
+  $('sld').disabled=true;
+  return servoRequest.then(function(){return post(url,intent);})
+    .catch(function(){})
+    .then(function(){controlChanging=false;return refresh();});
+}
+$('mGps').onclick=function(){controlAction('/api/servo/mode?mode=gps');};
+$('mUart').onclick=function(){controlAction('/api/servo/mode?mode=uart');};
+$('mManual').onclick=function(){controlAction('/api/servo/mode?mode=manual');};
 
 $('vRadar').onclick=function(){setView('radar');};
 $('vMap').onclick=function(){setView('map');};
@@ -406,15 +522,16 @@ function showPage(p){
   page=p;
   $('tabRadar').classList.toggle('on',p==='radar');
   $('tabInfo').classList.toggle('on',p==='info');
+  $('tabDebug').classList.toggle('on',p==='debug');
   $('pgRadar').classList.toggle('on',p==='radar');
   $('pgInfo').classList.toggle('on',p==='info');
+  $('pgDebug').classList.toggle('on',p==='debug');
   if(p==='radar')redraw();
+  if(p==='debug')pollDebug();
 }
 $('tabRadar').onclick=function(){showPage('radar');};
 $('tabInfo').onclick=function(){showPage('info');};
-// The log lives on its own page (/log) in a separate browser tab, so watching it
-// no longer means giving up the radar.
-$('btnLog').onclick=function(){window.open('/log','_blank');};
+$('tabDebug').onclick=function(){showPage('debug');};
 function fitCanvas(){
   var c=$('radar'),w=Math.round(c.clientWidth),h=Math.round(c.clientHeight);
   if(w>0&&h>0&&(c.width!==w||c.height!==h)){c.width=w;c.height=h;}
@@ -491,13 +608,117 @@ radarCanvas.addEventListener('pointerup',endPointer);
 radarCanvas.addEventListener('pointercancel',endPointer);
 radarCanvas.addEventListener('pointerleave',endPointer);
 
+function showSpeedSetting(j){
+  if(!Number.isFinite(j.speed)||!syncMotionContext(j))return;
+  lastSavedSpeed=j.speed;speedLoaded=true;
+  $('cfgSpeed').value=j.speed;
+  $('cfgSpeed').disabled=false;
+  $('speedSaveState').textContent='已記住 '+j.speed+'°／秒';
+}
+function loadSpeedSetting(){
+  return httpRequest('/api/servo/settings',1,'speed')
+    .then(showSpeedSetting).catch(function(e){$('speedSaveState').textContent=e.message;});
+}
+function saveSpeedLimit(){
+  if(controlChanging||speedSaving||!speedLoaded)return;
+  var raw=$('cfgSpeed').value.trim(),speed=Number(raw);
+  if(raw===''||!Number.isFinite(speed)||speed<1||speed>90){
+    $('cfgSpeed').value=lastSavedSpeed;toast('最高速度請填 1–90°／秒');return;
+  }
+  var intent=controlIntent();
+  speedSaving=true;controlChanging=true;$('cfgSpeed').disabled=true;
+  $('speedSaveState').textContent='儲存中…';
+  if(last.track)applyMode(last.track.servo);
+  return servoRequest.then(function(){return post('/api/servo/settings?speed='+encodeURIComponent(speed),intent);})
+    .then(showSpeedSetting).catch(function(e){
+      $('cfgSpeed').value=lastSavedSpeed;
+      $('speedSaveState').textContent='儲存未完成，請重試';
+      toast(e.message||e.error||'速度未儲存');
+    }).finally(function(){
+      speedSaving=false;controlChanging=false;$('cfgSpeed').disabled=!speedLoaded;
+      sendPendingServoAngle();return refresh();
+    });
+}
+$('cfgSpeed').onchange=saveSpeedLimit;
+$('cfgSpeed').onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();this.blur();}};
+
+function loadPredictionSetting(){
+  return httpRequest('/api/track/prediction',1,'prediction').then(function(j){
+    if(j.ok!==true||typeof j.enabled!=='boolean'||j.alpha!==(j.enabled?1:0))throw new Error('預測設定讀取失敗');
+    showPredictionSetting(j,false);
+  }).catch(function(e){
+    if(!predictionLoaded){
+      $('cfgPrediction').disabled=true;$('cfgPrediction').indeterminate=true;
+      $('predictionSaveState').textContent=e.status===404?'目前韌體不支援預測開關':'預測設定讀取失敗：'+(e.message||'');
+    }
+  });
+}
+function savePredictionSetting(){
+  if(controlChanging||predictionSaving||!predictionLoaded){
+    $('cfgPrediction').checked=predictionSaving?pendingPrediction:lastSavedPrediction===true;
+    $('cfgPrediction').indeterminate=!predictionLoaded;return;
+  }
+  var enabled=$('cfgPrediction').checked;
+  if(enabled===lastSavedPrediction)return;
+  var intent=controlIntent();
+  pendingPrediction=enabled;predictionSaving=true;controlChanging=true;
+  $('cfgPrediction').disabled=true;$('predictionSaveState').textContent='儲存中…';
+  if(last.track)applyMode(last.track.servo);
+  return servoRequest.then(function(){return post('/api/track/prediction?enabled='+(enabled?1:0),intent);})
+    .then(function(j){
+      if(j.ok!==true||typeof j.enabled!=='boolean'||j.alpha!==(j.enabled?1:0))throw new Error('預測設定回覆無效');
+      if(!showPredictionSetting(j,true))throw new Error('設定狀態已更新，請重試');
+    }).catch(function(e){
+      $('cfgPrediction').checked=lastSavedPrediction;
+      $('predictionSaveState').textContent='儲存未完成，請重試';
+      toast(e.message||e.error||'預測設定未儲存');
+    }).finally(function(){
+      predictionSaving=false;pendingPrediction=null;controlChanging=false;
+      $('cfgPrediction').disabled=!predictionLoaded;
+      sendPendingServoAngle();return refresh();
+    });
+}
+$('cfgPrediction').indeterminate=true;
+$('cfgPrediction').onchange=savePredictionSetting;
+
 function applyMode(sv){
-  var auto=(sv.mode==='tracking');
-  $('mManual').classList.toggle('on',!auto);
-  $('mAuto').classList.toggle('on',auto);
-  $('sld').disabled=auto;
+  if(!syncMotionContext(sv))return;
+  var gps=sv.mode==='gps',uart=(sv.mode==='uart'||sv.mode==='jetson'),tracking=gps||uart;
+  $('mGps').classList.toggle('on',gps);
+  $('mUart').classList.toggle('on',uart);
+  $('mManual').classList.toggle('on',!tracking);
+  $('mGps').disabled=controlChanging||!sv.gps_available;
+  $('mGps').title=sv.gps_available?'':'Server 與 Client 的 GPS 都需為 Good 或 OK';
+  $('mUart').disabled=$('mManual').disabled=controlChanging;
+  var moving=!!sv.moving;
+  $('sld').disabled=controlChanging||tracking;
+  $('btnCompassCal').disabled=controlChanging||tracking||moving||!!sv.motion_fault;
+  if(!speedSaving && document.activeElement!==$('cfgSpeed') && Number.isFinite(sv.speed_limit_deg_s)) {
+    lastSavedSpeed=sv.speed_limit_deg_s;speedLoaded=true;
+    $('cfgSpeed').value=lastSavedSpeed;
+  }
+  $('cfgSpeed').disabled=controlChanging||speedSaving||!speedLoaded;
+  showPredictionSetting({enabled:sv.prediction_enabled,alpha:sv.prediction_alpha,
+    control_boot_id:sv.control_boot_id,control_epoch:sv.control_epoch,
+    command_seq:sv.command_seq,clock_ms:sv.clock_ms},false);
+  $('cfgPrediction').disabled=controlChanging||predictionSaving||!predictionLoaded;
+  var label=sv.mode==='paused'?'已暫停':gps?'GPS':uart?'UART':'手動';
+  if(gps){
+    label+='・'+(sv.source==='gps'?'追蹤中':
+      !sv.calibrated?'保持・待指南針校正':
+      sv.declination_deg==null?'保持・待 GPS 位置／日期':
+      sv.gps_usable?'保持・GPS 穩定中':'保持・等待有效 GPS');
+  }else if(uart){
+    label+='・'+(sv.source==='uart'?'追蹤中':'保持・等待 SET');
+  }else if(moving){
+    label+='・移動中 '+Math.round(servoUiAngle(sv.angle))+'° → '+Math.round(servoUiAngle(sv.target))+'°';
+  }
+  if(sv.motion_fault)label='運動控制異常・已保持，請重開機';
+  $('controlState').textContent=label;
+  $('controlState').style.color=tracking&&sv.source==='hold'?'var(--bad)':'var(--ok)';
   if(!dragging&&document.activeElement!==$('sld')){
-    $('sld').value=Math.round(sv.angle);$('angTxt').textContent=Math.round(sv.angle);
+    var shown=sv.mode==='manual'&&sv.target!=null?sv.target:sv.angle;
+    $('sld').value=Math.round(servoUiAngle(shown));$('angTxt').textContent=Math.round(servoUiAngle(shown));
   }
 }
 
@@ -507,7 +728,7 @@ function applyMode(sv){
 // The wire format still carries HDOP (protocol.h unchanged) — this is display
 // only, so the number stays comparable with any other GPS tool.
 var UERE_M=2.5;
-function accM(hdop){return hdop>=0?hdop*UERE_M:null;}
+function accM(hdop){return Number.isFinite(hdop)&&hdop>=0?hdop*UERE_M:null;}
 // Whole metres only: UERE is a rule of thumb, so a decimal would claim accuracy
 // the estimate does not have.
 function fmtAcc(hdop){var a=accM(hdop);
@@ -515,25 +736,35 @@ function fmtAcc(hdop){var a=accM(hdop);
 // Satellite count as words for the same reason: 8 vs 11 changes no decision,
 // "夠不夠" does. Thresholds match gpsGrade() below so the two never disagree.
 function satWord(sats){
-  if(sats<0)return '--';
+  if(!Number.isFinite(sats)||sats<0)return '--';
   if(sats>=8)return '好';
   if(sats>=6)return '普通';
   return '少';
 }
+function satelliteClassWord(cls){return cls===3?'≥8 顆':cls===2?'6–7 顆':cls===1?'≤5 顆':'未知';}
+function clientSatelliteWord(client){
+  if(Number.isFinite(client.satellite_class))return satelliteClassWord(client.satellite_class);
+  return satWord(client.satellites);
+}
+function clientSatelliteGradeCount(client){
+  // Class comes with each position; an exact telemetry count can be 30 s old.
+  if(Number.isFinite(client.satellite_class))return [null,1,6,8][client.satellite_class];
+  return client.satellites;
+}
 // GPS quality grade (same thresholds as the firmware, shared by both ends).
 function gpsGrade(sats,hdop){
-  if(sats<0||hdop<0||sats<=0)return 'miss';
+  if(!Number.isFinite(sats)||!Number.isFinite(hdop)||sats<0||hdop<0||sats<=0)return 'miss';
   if(sats<4)return 'bad';
   if(hdop<=1.5&&sats>=8)return 'good';
   if(hdop<=3&&sats>=6)return 'ok';
   return 'bad';
 }
 // Leader line + small info card placed next to a marker (px,py) on the canvas.
-function drawGpsTag(x,px,py,W,H,title,sats,hdop){
+function drawGpsTag(x,px,py,W,H,title,sats,hdop,satLabel){
   var g=gpsGrade(sats,hdop);
   var col=g==='good'?'#3fb950':g==='ok'?'#d29922':g==='bad'?'#f85149':'#8b949e';
   var l1=title;
-  var l2='衛星 '+satWord(sats)+'   '+fmtAcc(hdop);
+  var l2='衛星 '+(satLabel||satWord(sats))+'   '+fmtAcc(hdop);
   var l3=g==='good'?'GPS Good':g==='ok'?'GPS OK':g==='bad'?'GPS Bad':'GPS Miss';
   x.font='11px system-ui';x.textBaseline='alphabetic';
   var bw=Math.max(x.measureText(l1).width,x.measureText(l2).width,
@@ -555,10 +786,10 @@ function drawGpsTag(x,px,py,W,H,title,sats,hdop){
 }
 
 // /api/track is now small (no history); the browser accumulates the path itself.
-function fetchTrack(){return fetch('/api/track').then(function(r){return r.json();});}
+function fetchTrack(){return httpRequest('/api/track',1,'track');}
 
 // Append the current sample to the local path (skip stale/duplicate points).
-// Full buffer keeps up to HIST_RETAIN_MS (2h) for CSV export; drawing only
+// Full buffer prunes on append at HIST_RETAIN_MS (2h) for GPX export; drawing only
 // ever looks at the most recent RADAR_WINDOW_MS (5 min) slice via recentHist().
 function pushHist(d){
   if(!d.linked||!d.client.fix)return;
@@ -621,6 +852,7 @@ function refresh(){
   refreshing=true;
   return fetchTrack().then(function(d){
     last.track=d;
+    last.track_received_at=new Date().toISOString();
     pushHist(d);
     applyMode(d.servo);
     var dist=geoDist(d.server,d.client);
@@ -632,15 +864,12 @@ function refresh(){
       (d.server.charging?' \u26a1':'');
     $('sTemp').textContent=d.server.temp_c==null?'--':d.server.temp_c+'°C';
     $('sHum').textContent=d.server.humidity_pct==null?'--':d.server.humidity_pct+'%';
-    $('sHdg').textContent=d.mag.online&&d.mag.heading>=0?d.mag.heading.toFixed(0)+'°':'--';
     $('mcOff').textContent=d.servo.calibrated?d.servo.mount_offset_deg.toFixed(1)+'°':'未校正';
-    $('mcPose').textContent=d.servo.pose_delta_deg==null?'--':
-      (d.servo.pose_delta_deg>0?'+':'')+d.servo.pose_delta_deg.toFixed(0)+'°';
-    $('mcPoseErr').textContent=d.servo.pose_err_deg==null?'--':
-      '\u2264'+d.servo.pose_err_deg.toFixed(2)+'°';
+    $('mcDeclination').textContent=d.servo.declination_deg==null?'等待有效 GPS 位置／日期':
+      d.servo.declination_deg.toFixed(1)+'°（自動）';
     // --- Client block ---
     $('cFix').textContent=d.client.fix?'有':'無';
-    $('cSat').textContent=satWord(d.client.satellites);
+    $('cSat').textContent=clientSatelliteWord(d.client);
     $('cAcc').textContent=fmtAcc(d.client.hdop);
     $('cDist').textContent=(d.server.fix&&d.client.fix&&dist!=null)?dist.toFixed(0)+' m':'--';
     $('cBrg').textContent=d.bearing>=0?d.bearing.toFixed(0)+'°':'--';
@@ -688,16 +917,216 @@ function renderAlerts(list){
 }
 
 function refreshStatus(){
-  fetch('/api/status').then(function(r){return r.json();}).then(function(s){
+  return httpRequest('/api/status',2,'status').then(function(s){
     last.status=s;
+    last.status_received_at=new Date().toISOString();
+    if(s.servo)showPredictionSetting({enabled:s.servo.prediction_enabled,alpha:s.servo.prediction_alpha,
+      control_boot_id:s.servo.control_boot_id,control_epoch:s.servo.control_epoch,
+      command_seq:s.servo.command_seq,clock_ms:s.servo.clock_ms},false);
     last.alerts=s.alerts||[];
     renderAlerts(last.alerts);
     $('sRssi').textContent=s.lora.rssi?s.lora.rssi.toFixed(0)+' dBm':'--';
     $('sSnr').textContent=s.lora.snr!=null?s.lora.snr.toFixed(1)+' dB':'--';
     $('sDrop').textContent=(s.lora.drop_rate*100).toFixed(1)+'%';
     $('sUp').textContent=fmtUptime(s.health.uptime_s);
+    $('sVersion').textContent=s.health.firmware_version?'v'+s.health.firmware_version:'未標版';
   }).catch(function(){});
 }
+
+// Read-only diagnostic capture. Each bounded poll uses the shared HTTP queue.
+var DEBUG_INTERVAL_MS=1000,DEBUG_MAX_MS=600000;
+var DEBUG_MAX_SAMPLES=1200,DEBUG_MAX_BYTES=5*1024*1024,DEBUG_LOG_CHARS=32768;
+var debugBusy=false,debugLastPoll=-Infinity,debugLatest=null,debugLatestAt=null;
+var debugLogCursor=0,debugLogBoot=null,debugLogText='',debugLogTrimmed=0;
+var debugRecording=false,debugStartedAt=null,debugStartedMono=0,debugStoppedAt=null,debugStopReason='';
+var debugSamples=[],debugBytes=0,debugGapCount=0,debugErrorCount=0,debugLogDrops=0,debugReboots=0;
+var debugPreviousSample=null,debugLastErrors=[],debugLastWarnings=[],debugRecordingId=0;
+var debugEventBoot=null,debugEventNext=null,debugEventCurrent=[],debugEventRetired=[];
+function debugWanted(){return debugRecording||(page==='debug'&&!document.hidden);}
+function debugClone(value){return value==null?null:JSON.parse(JSON.stringify(value));}
+function debugNumber(value,suffix){return Number.isFinite(value)?value+(suffix||''):'未知';}
+function debugInterval(value){return Number.isFinite(value)&&value>0?value+' ms':'未知';}
+function debugClientId(value){return Number.isInteger(value)&&value>0&&value<65535?'0x'+('0000'+value.toString(16).toUpperCase()).slice(-4):'未知';}
+function renderDebug(){
+  var d=debugLatest||{},cfg=d.config||{},g=d.gps||{},counts=d.counters||{},diag=d.client_diagnostic||{};
+  var client=last.track&&last.track.client||{},servo=last.track&&last.track.servo||{};
+  var http=last.status&&last.status.timing&&last.status.timing.http_detail,slow=http&&http.slowest;
+  var diagReceived=diag.received===true,diagState=!diagReceived?'尚未收到':diag.fresh===true?'仍在有效期，非即時':
+    diag.fresh===false?'已過期，僅供歷史參考':'有效期未知';
+  var rejected=debugEventCurrent.filter(function(e){return e.kind==='binding';}).slice(-1)[0];
+  var diagFlags=Number.isInteger(diag.status_bits)?diag.status_bits:null;
+  var lines=[
+    '韌體 '+(d.firmware_version||'未知')+' ／ LoRa 協定 '+debugNumber(d.protocol_version),
+    '發送排程 '+(cfg.send_interval_ms?Number(1000/cfg.send_interval_ms).toFixed(2)+' Hz':'未知'),
+    'Server 本機 GNSS 新定位間隔 '+debugInterval(g.last_epoch_interval_ms)+
+      '；來源年齡 '+debugNumber(g.source_age_ms,' ms'),
+    'Client GNSS 低頻 DIAG：'+diagState+'；接收後 '+debugNumber(diagReceived?diag.rx_age_ms:null,' ms')+
+      '；該次新定位間隔 '+debugInterval(diagReceived?diag.epoch_interval_ms:null),
+    'Server 由封包推估 Client 更新間隔 '+debugInterval(counts.inferred_source_interval_ms)+'（推估，非 Client 實測）',
+    'LoRa '+debugNumber(cfg.rf_frequency_mhz,' MHz')+' ／ SF '+debugNumber(cfg.sf)+' ／ 頻寬 '+debugNumber(cfg.bw_khz,' kHz'),
+    '綁定 Client：'+(cfg.bound_client_id===0?'未綁定（不接受 Client 定位）':debugClientId(cfg.bound_client_id))+
+      (rejected?'；最近因綁定不符拒收 '+debugClientId(rejected.client_id):''),
+    'Client 衛星 '+clientSatelliteWord(client)+'；遙測精確數 '+debugNumber(client.satellites,' 顆')+'（低頻更新）',
+    '位置年齡：來源 '+debugNumber(client.source_age_ms,' ms')+' ／ 接收後 '+debugNumber(client.rx_age_ms,' ms')+
+      ' ／ 合計估計 '+debugNumber(client.sample_age_ms,' ms'),
+    '年齡依據 '+(client.age_basis||g.age_basis||'未知')+'；時鐘同步 '+(g.measurement_clock_synchronized===true?'是':'未證實'),
+    'Servo '+(servo.mode||'未知')+' ／ '+(servo.source||'未知')+'；預測 '+
+      (typeof servo.prediction_enabled==='boolean'?(servo.prediction_enabled?'開':'關'):'未知'),
+    'Client 該次 DIAG 計數：UART 積壓丟棄 '+debugNumber(diagReceived?diag.backlog_drops:null)+
+      ' ／ NMEA 錯誤 '+debugNumber(diagReceived?diag.nmea_errors:null)+' ／ 發送錯誤 '+debugNumber(diagReceived?diag.tx_errors:null)+
+      ' ／ 跳過排程 '+debugNumber(diagReceived?diag.skipped_slots:null)+'（自 Client 開機累計，最大 65535）',
+    'Client 該次 DIAG 狀態：'+(!diagReceived||diagFlags===null?'未知':
+      '樣本 '+((diagFlags&1)?'有':'無')+' ／ 定位 '+((diagFlags&2)?'有效':'無效')+' ／ 速度 '+((diagFlags&4)?'有效':'無效')+
+      ' ／ GGA '+((diagFlags&8)?'有':'無')+' ／ RMC '+((diagFlags&16)?'有':'無')),
+    '事件環形紀錄覆寫 '+debugNumber(d.events&&d.events.overwritten)+'；文字遺失警示 '+debugLogDrops+'；重開機 '+debugReboots,
+    '最慢 HTTP：'+(slow?(slow.route||'未知')+' ／ 全程 '+debugNumber(slow.total_ms,' ms')+
+      ' ／ 解析／派送 '+debugNumber(slow.pre_handler_ms,' ms')+' ／ 建立回覆 '+debugNumber(slow.build_ms,' ms')+
+      ' ／ 同步寫入 '+debugNumber(slow.write_ms,' ms')+' ／ 其他 '+debugNumber(slow.other_ms,' ms')+'（寫入時間非網路 RTT）':'尚無資料'),
+    '計數器 '+JSON.stringify(counts)
+  ];
+  $('debugSummary').textContent=lines.join('\n');
+  $('debugLog').textContent=debugLogText||'尚無紀錄';
+  var elapsed=debugStartedAt?Math.round((debugRecording?performance.now()-debugStartedMono:
+    new Date(debugStoppedAt).getTime()-new Date(debugStartedAt).getTime())/1000):0;
+  $('debugRecordState').textContent=(debugRecording?'錄製中':debugStartedAt?'已停止'+(debugStopReason?'（'+debugStopReason+'）':''):'尚未錄製')+
+    ' · '+debugSamples.length+' 筆 · '+Math.max(0,elapsed)+' 秒 · '+(debugBytes/1024).toFixed(0)+' KiB'+
+    ' · 漏採／中斷 '+debugGapCount+' 次 · 讀取失敗 '+debugErrorCount+' 次'+
+    (debugLogTrimmed?' · 畫面文字已截短':'');
+  $('btnDebugStart').disabled=debugRecording;$('btnDebugStop').disabled=!debugRecording;
+  var warningNames={event_ring_gap:'事件紀錄有缺口',event_boot_reset:'事件紀錄已換至新開機',event_backlog:'歷史事件分批讀取中',server_reboot:'Server 已重開機',log_boot_unknown:'文字紀錄缺少開機識別',
+    server_log_dropped:'Server 文字紀錄有遺失',snapshot_boot_mismatch:'狀態與文字來自不同次開機'};
+  $('debugPollState').textContent=debugBusy?'讀取中…':
+    (debugLastErrors.length?'讀取未完成：'+debugLastErrors.join('；'):debugLatestAt?'最近讀取 '+debugLatestAt:'尚無資料')+
+    (debugLastWarnings.length?'；'+debugLastWarnings.map(function(w){return warningNames[w]||w;}).join('；'):'');
+}
+function stopDebugRecording(reason){
+  if(!debugRecording)return;
+  debugRecording=false;debugStoppedAt=new Date().toISOString();debugStopReason=reason||'手動停止';renderDebug();
+}
+function startDebugRecording(){
+  if(debugRecording)return;
+  debugSamples=[];debugBytes=0;debugGapCount=0;debugErrorCount=0;debugPreviousSample=null;
+  ++debugRecordingId;
+  debugStartedAt=new Date().toISOString();debugStartedMono=performance.now();debugStoppedAt=null;debugStopReason='';
+  debugRecording=true;renderDebug();return pollDebug();
+}
+function debugRead(url,read){
+  return httpRequest(url,3,typeof url==='string'&&url.indexOf('/api/log')===0?'log':'debug',read);
+}
+function debugEventUrl(){
+  return '/api/debug?limit=8'+(debugEventBoot===null?'':'&boot_id='+debugEventBoot+'&since='+debugEventNext);
+}
+function acceptDebugEvents(d,warnings){
+  var e=d&&d.events;
+  if(!d||d.schema_version!==2||!Number.isInteger(d.boot_id)||!e||!Array.isArray(e.items)||e.items.length>8||
+      !Number.isInteger(e.next_id)||e.next_id<0||e.next_id>4294967295||
+      typeof e.more!=='boolean'||typeof e.dropped!=='boolean'||typeof e.reset!=='boolean')throw new Error('不支援或無效的增量除錯格式');
+  if(debugEventRetired.indexOf(d.boot_id)>=0)throw new Error('忽略舊開機的事件回覆');
+  var switched=debugEventBoot!==null&&debugEventBoot!==d.boot_id;
+  var previous=switched?null:debugEventNext,current=switched?[]:debugEventCurrent,delta=[];
+  if(previous!==null&&((e.next_id-previous)|0)<0)throw new Error('忽略倒退的事件游標');
+  e.items.forEach(function(item){
+    if(!item||!Number.isInteger(item.id)||item.id<0||item.id>4294967295)throw new Error('無效事件識別碼');
+    if(previous!==null&&((item.id-previous)|0)<=0)return;
+    if(current.some(function(old){return old.id===item.id;})||delta.some(function(old){return old.id===item.id;}))return;
+    if(((e.next_id-item.id)|0)<0)throw new Error('事件超出回覆游標');
+    delta.push(item);
+  });
+  if(switched){debugEventRetired.push(debugEventBoot);warnings.push('event_boot_reset');}
+  if(e.dropped)warnings.push('event_ring_gap');
+  if(e.more)warnings.push('event_backlog');
+  debugEventBoot=d.boot_id;debugEventNext=e.next_id;
+  debugEventCurrent=current.concat(delta).slice(-64);
+  return {boot_id:d.boot_id,next_id:e.next_id,more:e.more,dropped:e.dropped,reset:e.reset,items:delta};
+}
+function appendDebugSample(sample){
+  if(!debugRecording||sample.recording_id!==debugRecordingId)return;
+  if(debugPreviousSample!==null&&sample.client_monotonic_ms-debugPreviousSample>2500){
+    sample.gap_since_previous_ms=sample.client_monotonic_ms-debugPreviousSample;++debugGapCount;
+  }
+  debugPreviousSample=sample.client_monotonic_ms;
+  debugErrorCount+=sample.errors.length;
+  debugGapCount+=sample.warnings.filter(function(w){return w!=='event_backlog';}).length;
+  var saved=JSON.stringify(sample),bytes=new Blob([saved]).size;
+  if(debugSamples.length>=DEBUG_MAX_SAMPLES||debugBytes+bytes>DEBUG_MAX_BYTES){
+    stopDebugRecording('容量上限，最後一次取樣未保存');return;
+  }
+  debugSamples.push(JSON.parse(saved));debugBytes+=bytes;
+  if(debugSamples.length>=DEBUG_MAX_SAMPLES)stopDebugRecording('已達取樣上限');
+  if(performance.now()-debugStartedMono>=DEBUG_MAX_MS)stopDebugRecording('已達 10 分鐘');
+}
+function pollDebug(){
+  var now=performance.now();
+  if(!debugWanted()||debugBusy||controlChanging||now-debugLastPoll<DEBUG_INTERVAL_MS)return Promise.resolve();
+  if(debugRecording&&now-debugStartedMono>=DEBUG_MAX_MS){stopDebugRecording('已達 10 分鐘');if(!debugWanted())return Promise.resolve();}
+  debugBusy=true;debugLastPoll=now;
+  var sample={observed_at:new Date().toISOString(),client_time_ms:Date.now(),client_monotonic_ms:now,
+    recording_id:debugRecordingId,errors:[],warnings:[],debug:null,events:null,log:null};
+  renderDebug();
+  return debugRead(debugEventUrl,function(r){return r.json();}).then(function(d){
+    sample.events=acceptDebugEvents(d,sample.warnings);
+    // State snapshots contain ring metadata; raw events are recorded only as
+    // deltas. The current display owns a separate bounded, deduplicated ring.
+    var state=debugClone(d);delete state.events.items;
+    debugLatest=state;debugLatestAt=new Date().toISOString();sample.debug=state;sample.debug_received_at=debugLatestAt;
+  }).catch(function(e){sample.errors.push('狀態 '+(e.message||String(e)));}).then(function(){
+    var from=debugLogCursor;
+    return debugRead('/api/log?from='+from,function(r){
+      var next=r.headers.get('X-Log-Next'),boot=r.headers.get('X-Log-Boot'),dropped=r.headers.get('X-Log-Dropped')==='1';
+      return r.text().then(function(text){return {from:from,next:next===null?null:Number(next),boot_id:boot===null?null:Number(boot),dropped:dropped,text:text};});
+    }).then(function(log){
+      sample.log=log;sample.log_received_at=new Date().toISOString();
+      if(log.boot_id!==null&&debugLogBoot!==null&&log.boot_id!==debugLogBoot){
+        ++debugReboots;sample.warnings.push('server_reboot');debugLogText+='\n--- Server 重開機 ---\n';
+      }
+      if(log.boot_id===null)sample.warnings.push('log_boot_unknown');
+      else debugLogBoot=log.boot_id;
+      if(log.dropped){++debugLogDrops;sample.warnings.push('server_log_dropped');debugLogText+='\n--- Server 文字紀錄有遺失 ---\n';}
+      if(log.boot_id!==null&&sample.debug&&log.boot_id!==sample.debug.boot_id)sample.warnings.push('snapshot_boot_mismatch');
+      if(Number.isInteger(log.next)&&log.next>=0)debugLogCursor=log.next;
+      else sample.errors.push('文字紀錄游標缺失');
+      debugLogText+=log.text;
+      if(debugLogText.length>DEBUG_LOG_CHARS){debugLogTrimmed+=debugLogText.length-DEBUG_LOG_CHARS;debugLogText=debugLogText.slice(-DEBUG_LOG_CHARS);}
+    }).catch(function(e){sample.errors.push('文字 '+(e.message||String(e)));});
+  }).then(function(){
+    sample.track=debugClone(last.track);sample.status=debugClone(last.status);
+    sample.track_received_at=last.track_received_at||null;sample.status_received_at=last.status_received_at||null;
+    sample.completed_at=new Date().toISOString();
+    debugLastErrors=sample.errors;debugLastWarnings=sample.warnings;appendDebugSample(sample);
+  }).finally(function(){debugBusy=false;renderDebug();});
+}
+function buildDebugBundle(){
+  var d=debugLatest||{};
+  return {schema_version:2,kind:'shore_spotter_diagnostics',exported_at:new Date().toISOString(),
+    event_identity:['boot_id','id'],
+    firmware_version:d.firmware_version||null,protocol_version:d.protocol_version||null,
+    notes:$('debugNote').value.slice(0,2000),config:debugClone(d.config),
+    evidence_limits:['Browser sampling may have gaps, especially in background or with a locked screen.',
+      'Radio send cadence is not proof of new GNSS epochs at the same rate.',
+      'Servo angles and speed are commands; physical mechanism motion was not measured.',
+      'GNSS source ages are estimates; receiver and server measurement clocks are not synchronized.'],
+    recording:{active:debugRecording,started_at:debugStartedAt,stopped_at:debugStoppedAt,stop_reason:debugStopReason||null,
+      sample_count:debugSamples.length,approx_bytes:debugBytes,gap_count:debugGapCount,error_count:debugErrorCount,
+      max_duration_ms:DEBUG_MAX_MS,max_samples:DEBUG_MAX_SAMPLES,max_bytes:DEBUG_MAX_BYTES,
+      log_counters_scope:'page_lifetime',server_log_drop_notices:debugLogDrops,server_reboots_observed:debugReboots,display_log_trimmed_chars:debugLogTrimmed},
+    current:{track:debugClone(last.track),track_received_at:last.track_received_at||null,
+      status:debugClone(last.status),status_received_at:last.status_received_at||null,
+      debug:debugClone(debugLatest),debug_received_at:debugLatestAt,text_log:debugLogText,
+      events:{boot_id:debugEventBoot,next_id:debugEventNext,items:debugClone(debugEventCurrent)},
+      log_next:debugLogCursor,log_boot_id:debugLogBoot,errors:debugLastErrors.slice(),warnings:debugLastWarnings.slice()},samples:debugClone(debugSamples)};
+}
+function exportDebugBundle(){
+  try{
+    var blob=new Blob([JSON.stringify(buildDebugBundle(),null,2)],{type:'application/json'}),url=URL.createObjectURL(blob);
+    var a=document.createElement('a');a.href=url;a.download='shorespotter_debug_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(function(){URL.revokeObjectURL(url);},1000);toast('已產生 JSON，請確認下載完成');
+  }catch(e){toast('匯出失敗：'+(e.message||String(e)));}
+}
+$('btnDebugStart').onclick=startDebugRecording;
+$('btnDebugStop').onclick=function(){stopDebugRecording('手動停止');};
+$('btnDebugExport').onclick=exportDebugBundle;
+setInterval(pollDebug,DEBUG_INTERVAL_MS);
 
 function fmtUptime(s){var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
   return h>0?(h+'h'+m+'m'):(m+'m'+(s%60)+'s');}
@@ -761,17 +1190,16 @@ function drawRadar(d,dist){
     }
   }
   // servo aim lines (angle increases CCW; compass bearing increases CW)
-  var hdg=(d.mag.online&&d.mag.heading>=0)?d.mag.heading:0;
-  var off=d.servo.mount_offset_deg||0;
+  var off=(d.servo.mount_offset_deg||0)+(d.servo.declination_deg||0);
   function aim(angle,col,w){
-    var brg=((hdg-angle+off)%360+360)%360,r=brg*Math.PI/180;
+    var brg=((off-angle)%360+360)%360,r=brg*Math.PI/180;
     x.strokeStyle=col;x.lineWidth=w;x.beginPath();x.moveTo(cx,cy);
     x.lineTo(cx+Math.sin(r)*R,cy-Math.cos(r)*R);x.stroke();
   }
   // Servo 目前：畫成一個 5 度扇形雷達波束（半徑方向漸層 + 發光邊緣），
   // 比單一細線更有「雷達掃描」的感覺；halfWidthDeg 可調整扇形寬度。
   function aimSector(angle,rgb,halfWidthDeg){
-    var brg=((hdg-angle+off)%360+360)%360;
+    var brg=((off-angle)%360+360)%360;
     var a0=(brg-halfWidthDeg-90)*Math.PI/180,a1=(brg+halfWidthDeg-90)*Math.PI/180;
     var grad=x.createRadialGradient(cx,cy,0,cx,cy,R);
     grad.addColorStop(0,'rgba('+rgb+',0.04)');
@@ -785,7 +1213,7 @@ function drawRadar(d,dist){
     x.strokeStyle='rgba('+rgb+',0.95)';x.lineWidth=1.5;
     x.beginPath();x.arc(cx,cy,R,a0,a1);x.stroke();
   }
-  if(d.servo.calibrated){
+  if(d.servo.calibrated&&d.servo.declination_deg!=null){
     aim(d.servo.target,'rgba(34,211,238,.55)',2);
     aimSector(d.servo.angle,'249,115,22',2.5);   // 5° 扇形 (±2.5°)
   }
@@ -796,7 +1224,7 @@ function drawRadar(d,dist){
     x.strokeStyle='#fff';x.lineWidth=1.5;x.stroke();
     drawGpsTag(x,p[0],p[1],W,H,
       'Surfer'+(dist!=null?(' '+dist.toFixed(0)+'m'):''),
-      d.client.satellites,d.client.hdop);
+      clientSatelliteGradeCount(d.client),d.client.hdop,clientSatelliteWord(d.client));
   }
   // station centre
   x.fillStyle='#3b82f6';x.beginPath();x.arc(cx,cy,5,0,7);x.fill();
@@ -919,7 +1347,7 @@ function drawMap(d,dist){
   if(cli.length&&d.client.fix){var lp=plot(cli[cli.length-1]);
     drawGpsTag(x,lp[0],lp[1],W,H,
       'Surfer'+(d.server.fix&&dist!=null?(' '+dist.toFixed(0)+'m'):''),
-      d.client.satellites,d.client.hdop);}
+      clientSatelliteGradeCount(d.client),d.client.hdop,clientSatelliteWord(d.client));}
   // scale bar (metres-per-pixel at this latitude & zoom)
   var mpp=156543.03392*Math.cos(midLat*Math.PI/180)/Math.pow(2,zf);
   var step=niceStep(mpp*90),px2=step/mpp,bx=W-14-px2,by=H-18;
@@ -940,154 +1368,22 @@ function drawMap(d,dist){
 
 showPage('radar');
 refresh();refreshStatus();
-// ---- calibration ----
-var magPollTimer=0;
-function renderMagCal(m){
-  var st={idle:'未校正',collecting:'量測中…',done:'已校正',failed:'失敗'}[m.state]||m.state;
-  if(!m.online)st='無磁力計';
-  else if(m.state==='failed'&&m.error)st='失敗：'+m.error;
-  $('mcState').textContent=st;
-  $('mcRes').textContent=m.residual_deg==null?'--':m.residual_deg.toFixed(2)+'°';
-  $('mcEll').textContent=m.ellipse_deg==null?'--':m.ellipse_deg.toFixed(2)+'°';
-  $('mcSct').textContent=m.scatter_deg==null?'--':m.scatter_deg.toFixed(2)+'°';
-  $('mcSwp').textContent=m.sweep_deg?Math.round(m.sweep_deg)+'°':'--';
-  $('mcFld').textContent=m.field_gauss==null?'--':m.field_gauss.toFixed(3)+' G';
-  $('mcAxes').textContent=m.calibrated?(m.axes||'--'):'未判定（預設 X,Y）';
-  var pct=m.state==='collecting'?m.coverage_pct:(m.calibrated?100:0);
-  $('mcBar').style.width=pct+'%';
-  $('btnMagCal').textContent=m.state==='collecting'
-    ?('轉圈中… '+m.coverage_pct+'%（點此取消）'):'開始磁力計校正';
-}
-function pollMagCal(){
-  fetch('/api/mag/calibrate').then(function(r){return r.json();}).then(function(m){
-    renderMagCal(m);
-    if(m.state==='collecting'){magPollTimer=setTimeout(pollMagCal,300);}
-    else{
-      magPollTimer=0;
-      if(m.state==='done'){
-        toast('校正完成：殘差 '+m.residual_deg.toFixed(2)+'°（橢圓 '+
-          m.ellipse_deg.toFixed(2)+'° + 散射 '+m.scatter_deg.toFixed(2)+
-          '°），轉過 '+Math.round(m.sweep_deg)+'°，水平面軸 '+m.axes);
-        if(m.ellipse_deg>1&&m.ellipse_deg>2*m.scatter_deg)
-          setTimeout(function(){toast('橢圓為主：soft iron 或板子沒擺正交，轉得再順也沒用，要移動板子');},2800);
-        else if(m.scatter_deg>1&&m.scatter_deg>2*m.ellipse_deg)
-          setTimeout(function(){toast('散射為主：轉的時候板子在晃，改在腳架雲台上轉並保持水平');},2800);
-      }
-      else if(m.state==='failed')toast('校正失敗：'+(m.error||'未知'));
-    }
-  }).catch(function(){magPollTimer=0;});
-}
-$('btnMagCal').onclick=function(){
-  var busy=magPollTimer!==0;
-  post('/api/mag/calibrate'+(busy?'?action=cancel':'')).then(function(m){
-    renderMagCal(m);
-    if(magPollTimer){clearTimeout(magPollTimer);magPollTimer=0;}
-    if(m.state==='collecting'){toast('開始轉圈：慢慢順時針水平轉一整圈');pollMagCal();}
-  }).catch(function(){});
-};
-// Accepts "25.033611, 121.565000" — the exact format Google Maps copies.
-$('btnLmCal').onclick=function(){
-  var m=/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/.exec($('lmCoord').value||'');
-  if(!m){toast('座標格式看不懂，例如 25.033611, 121.565000');return;}
-  post('/api/track/calibrate?lat='+m[1]+'&lon='+m[2]).then(function(j){
-    $('mcOff').textContent=j.mount_offset_deg.toFixed(1)+'°';
-    toast('已鎖定 mount_offset '+j.mount_offset_deg.toFixed(1)+'°（地標方位 '+
-      j.bearing.toFixed(1)+'°、距離 '+j.distance_m+' m）');
-    if(j.warning)setTimeout(function(){toast(j.warning);},2800);
-    refresh();
-  }).catch(function(){});
+// ---- camera compass calibration ----
+$('btnCompassCal').onclick=function(){
+  var text=$('compassBearing').value.trim();
+  var bearing=Number(text);
+  if(!text||!Number.isFinite(bearing)||bearing<0||bearing>=360){
+    toast('請輸入 0 到未滿 360 度，北 0°、東 90°');return;
+  }
+  controlAction('/api/track/calibrate?bearing='+encodeURIComponent(text));
 };
 
 refreshStatus();          // 提醒不要等到第一個 3 秒週期才出現
 setInterval(refresh,1000);
 setInterval(refreshStatus,3000);
-fetch('/api/mag/calibrate').then(function(r){return r.json();})
-  .then(renderMagCal).catch(function(){});
+loadSpeedSetting();
+loadPredictionSetting();
 </script>
 </body>
 </html>
 )rawlit";
-
-// Standalone log viewer served at /log, opened from the 資訊 page in its own
-// browser tab. It used to be a third tab inside WEB_UI_HTML, which meant reading
-// the log cost you the radar; a separate tab can sit next to it instead.
-//
-// The firmware keeps a 4 KB ring buffer and hands back only what this page has
-// not seen yet, keyed on an absolute byte offset, so polling stays cheap.
-// It polls only while the tab is actually on screen: the ESP32's WebServer
-// serves one connection at a time, so a forgotten background log tab would keep
-// stealing turns from the radar tab's 1 Hz /api/track.
-static const char WEB_LOG_HTML[] = R"loglit(
-<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0d1117">
-<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
-<link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png">
-<title>Shore Spotter · 紀錄</title>
-<style>
-:root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#3b82f6}
-*{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
-  font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif}
-body{height:100dvh;display:flex;flex-direction:column;overflow:hidden;padding:10px;gap:10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
-.head{flex:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.head button{padding:9px 14px;border-radius:8px;border:1px solid var(--line);
-  background:#21262d;color:var(--fg);font-size:13px;font-weight:600;cursor:pointer;
-  font-family:inherit}
-.head button:hover{border-color:var(--acc)}
-.head label{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:5px}
-.head #stat{font-size:11px;color:var(--mut);margin-left:auto}
-#box{flex:1;min-height:0;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-all;
-  font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--fg)}
-</style>
-</head>
-<body>
-<div class="card head">
-  <button id="btnClear" type="button">清除</button>
-  <label><input id="follow" type="checkbox" checked> 自動捲到最新</label>
-  <span id="stat">--</span>
-</div>
-<pre id="box" class="card"></pre>
-
-<script>
-var $=function(id){return document.getElementById(id);};
-var next=0, timer=0, busy=false;
-function pump(){
-  if(busy)return;
-  busy=true;
-  fetch('/api/log?from='+next).then(function(r){
-    var n=parseInt(r.headers.get('X-Log-Next')||'0',10);
-    var dropped=r.headers.get('X-Log-Dropped')==='1';
-    return r.text().then(function(t){return{t:t,n:n,d:dropped};});
-  }).then(function(o){
-    var box=$('box');
-    // Follow only if already pinned to the bottom, so reading scrollback is not
-    // yanked away every 2 s.
-    var atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
-    if(o.d&&next!==0)box.textContent+='\n--- 略過部分紀錄（緩衝已滿或裝置重開）---\n';
-    if(o.t)box.textContent+=o.t;
-    if(box.textContent.length>60000)box.textContent=box.textContent.slice(-40000);
-    next=o.n;
-    $('stat').textContent=o.n+' bytes';
-    if($('follow').checked&&atEnd)box.scrollTop=box.scrollHeight;
-  }).catch(function(){}).then(function(){busy=false;});
-}
-function start(){if(!timer){pump();timer=setInterval(pump,2000);}}
-function stop(){if(timer){clearInterval(timer);timer=0;}}
-document.addEventListener('visibilitychange',function(){
-  if(document.hidden)stop();else start();
-});
-$('btnClear').onclick=function(){
-  fetch('/api/log',{method:'POST'})
-    .then(function(){$('box').textContent='';next=0;pump();})
-    .catch(function(){});
-};
-start();
-</script>
-</body>
-</html>
-)loglit";

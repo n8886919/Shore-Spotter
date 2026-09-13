@@ -1,11 +1,16 @@
 # 韌體功能說明（Features）
 
+目前原始碼版本 **0.6-dev（未發行）**，唯一來源 `include/firmware_version.h`。Client／Server 的開機
+OLED 與序列紀錄皆顯示版本；Server 網頁資訊頁及 `health.firmware_version` 顯示
+實際運行版本。LoRa 沒有傳送 Client 韌體版本，不能從 Server 版本推定 Client 已更新。
+本文件描述原始碼行為；建置、部署與現場驗證狀態另見 [CHANGELOG](../CHANGELOG.md)。
+
 本文件描述 Shore Spotter 韌體的「行為與流程」，分為以下面向：
 
 1. **整體架構** — 角色切分與 build flag
-2. **LoRa 無線通訊** — 傳送節奏與群組隔離
-3. **Client（下水端）** — 定位/遵測發送與 ATPC
-4. **Server（岸上攝影站）** — 接收、方位計算、軟跡、白名單
+2. **LoRa 無線通訊** — v4 封包、傳送節奏與單一 Client 配對
+3. **Client（下水端）** — 定位／遙測／診斷發送與 ATPC
+4. **Server（岸上攝影站）** — 接收、方位計算、軌跡、單一 Client 綁定
 5. **WiFi / Web 監控** — 熱點連線與監控頁
 6. **OLED 顯示** — 各畫面模擬
 7. **設定持久化（NVS）** — 重啟後保留的設定
@@ -20,37 +25,63 @@
 
 # 1. 整體架構
 
-- 單一 `src/main.cpp`，用 build flag 分兩種角色：`ROLE_CLIENT`（下水端）、`ROLE_SERVER`（岸上攝影站）。
+- `src/main.cpp` 用 build flag 分兩種角色：`ROLE_CLIENT`（下水端）、`ROLE_SERVER`（岸上攝影站）；UART 控制端點位於 `src/uart_servo_mode.cpp`。
 - 共用 LoRa 封包協定抽在 [../include/protocol.h](../include/protocol.h)；硬體腳位與 RF 參數在 `main.cpp` 上方常數區；手機熱點帳密在 [../include/wifi_config.h](../include/wifi_config.h)。
 - 角色由編譯期 `env:tbeam-client` / `env:tbeam-server`決定，未選或同時選兩個角色都會編譯失敗。
 
 # 2. LoRa 無線通訊
 
 - RF 參數、封包格式、msgType、欄位定義詳見 [interface.md](interface.md)。
-- 傳送節奏：位置封包每 1 秒、遙測每 30 秒；Server 每收到 4 包 DATA 回一次 ACK。
-- 兩層群組隔離：PHY 層 Sync Word + 應用層 `NETWORK_ID`，允許同頻段多群組共存。
-- 節點 ID：開機由晶片 MAC 末 2 bytes 衍生（與 SERVER_ID 衝突時自動 XOR 避開）。
-- **時槽配置**：SF9/BW125/CR4-5 下，位置封包空中時間 246 ms、ACK 185 ms，
-  ACK 每 4 包回一次 → 平均通道佔用約 292 ms/s（29%）。因此：
-  - Client 兩端收送皆為**非阻塞**（DIO1 中斷 + flag），loop 不會停等封包。
-  - ACK 每 4 包回一次（依 client `seq` 挑選，掉包不會讓排程滑掉）；Client 的斷線
-    與 ATPC 門檻由 `ACK_EVERY_N` 推導，改 N 不必手動改門檻。
-  - 遙測（30 s）不能單純「到期就送」——30 s 是 1 s 的整數倍，會固定壓在位置封包
-    與其 ACK 上，兩邊同時發射導致雙雙遺失。遙測改為只在位置週期的**靜默時槽**才起送，
-    時槽上下界開機時用 `radio.getTimeOnAir()` 推導（見 interface.md），不是寫死常數。
-  - **改 SF / BW / 頻率 / Sync Word 必須兩塊板一起燒**；**CR 則不必**——
-    explicit header 會帶著 payload 的 CR，接收端自動解，混用 CR 可正常通訊。
+- **LoRa 協定 v4**：共用標頭 6 bytes，包含識別碼、合併的版本／類型、16-bit `clientId`
+  與 16-bit 序號。上下行只使用同一個 `clientId`；不傳群組、獨立來源／目的 ID、
+  `payloadLen` 或空白驗證尾碼。保留 RF CRC，依類型嚴格檢查長度與欄位；不接受 v3 封包。
+- Client ID 由晶片 MAC 末 2 bytes 衍生，遇 0、廣播或舊保留 ID 時重新映射。
+  16-bit ID 並非全球唯一，兩套若撞號仍需處理；不同 ID／白名單不會消除同頻碰撞。
+
+| 類型 | 大小 | 發送節奏與用途 |
+|---|---:|---|
+| DATA | **17 bytes** | 每 500 ms 排程一次；座標、速度／方向、衛星級距、有效旗標、HDOP、來源年齡 |
+| ACK | **11 bytes** | DATA `seq % 8 == 0` 時回覆，名義上每 4 秒一次；確認序號、RSSI／SNR |
+| TELEMETRY（TEL） | **11 bytes** | 約每 30 秒一次；電池、溫濕度、精確衛星數 |
+| DIAGNOSTIC（DIAG） | **17 bytes** | 約每 30 秒一次；Client GNSS 間隔、UART 積壓、NMEA／TX 錯誤、跳過排程與狀態 |
+
+- **2 Hz 是 RF 發送排程，不代表每秒兩筆新 GNSS 定位**。韌體維持 GPS UART 9600，
+  沒有強制模組改成 2 Hz；同一筆位置再次送出時，來源年齡會增加，不會被重新當作新定位。
+- DATA、TEL、DIAG 各自使用序號；TEL／DIAG 不消耗 DATA 序號或 ACK 位置。
+  Client 只接受自己 ID、預期 DATA 序號、仍在回覆期限內且尚未消耗的 ACK。
+- **非阻塞發射／接收**：Client DATA／TEL／DIAG 發射與 Server ACK 均由 DIO1
+  TxDone／timeout 推進，完成後恢復 RX；等待 RF 發送期間繼續服務 GNSS 與控制。
+- **時槽配置**：空中時間由 `radio.getTimeOnAir()` 計算；目前 SF9／BW125／CR4/5
+  的 DATA／DIAG 約 165 ms、ACK／TEL 約 145 ms。TEL／DIAG 只在**不回 ACK**的
+  DATA 週期、DATA 已成功完成後起送，前後保留 80 ms，必須能在下一個 DATA deadline 前完成。
+  兩者同時到期時先送 TEL，DIAG 延後；沒有時槽就延後，不硬塞。
+- DATA 排程逾時只處理當前一格，跳過錯失時槽並計數，不連續補發。
+  若當前週期容不下 DATA、必要的 ACK 與保護間隔，也直接跳過。
+  SF／BW／頻率／Sync Word 改動須同步兩端；調整 RF 參數後需重新檢查時槽預算。
+  這是單套的排程協調，沒有多套系統之間的時槽同步或自動換頻。
 
 # 3. Client（下水端）
 
-- 持續讀 GPS（UART 9600），每秒送一筆位置封包。
-- **`fix` 是「現在有沒有定位」，不是「曾經定位過」**：TinyGPSPlus 的 `isValid()`
-  一旦為真就永遠為真（失去定位後 `lat/lon/speed/course` 全部凍結在最後一筆，只有
-  `age()` 會漲），所以韌體另外檢查 `age() < GPS_FIX_MAX_AGE_MS`（3 秒，約 3 筆 NMEA）。
-  沒有這道檢查，天線入水或走進死角時 Server 會拿著一個凍結的舊座標繼續自信地追蹤，
-  而且不會有任何徵兆。同一個判定也用在 Server 自己的 GPS 上。
-- 速度/加速度：由 GPS 速度計算，加速度做指數平滑（0.8 舊 + 0.2 新）。
-- 遙測：每 30 秒送一次電量 + 溫濕度（BME280，沒感測器則回報 N/A）。
+- 持續讀取 GPS UART 9600；[GNSS 快照收集器](../include/gnss_snapshot.h) 依 NMEA UTC
+  epoch 對齊 RMC／GGA，驗證 checksum、定位狀態與數值。位置、品質與速度不借用其他 epoch
+  的欄位；只有新 GGA 時可回報位置／品質，但不沿用舊 RMC 的速度。
+  等待新 RMC 對應的 GGA 期間，可保留上一筆完整快照及其**原始年齡**；明確無效定位優先撤銷。
+- **`fix` 代表現在可用的定位**。兩端皆以 coherent 快照、來源年齡與額外 200 ms
+  UART 服務不確定量檢查 `< 2000 ms`；不再以 TinyGPSPlus 曾經有效的旗標判斷。
+  若超過 200 ms 未服務 GPS，先丟棄排隊 bytes 並使快照失效，等待更新的 epoch；
+  UART 緩衝設為 1024 bytes，不能把排隊的舊 NMEA 當新定位。
+- 來源年齡以 NMEA 到達時間回推 UART 序列傳輸時間作為基準，再依 UTC epoch 差值對齊；
+  不是 GNSS 與 MCU 時鐘同步，也未量測模組內部定位延遲。DATA 年齡以 10 ms 向上取整，
+  未知／超範圍以不可用值編碼；200 ms 不確定量另用於過期判定，不灌進外推位移。
+- 座標使用固定原點 24°N／121°E 的兩個 signed 24-bit 差值，共 6 bytes、約 0.1 m
+  編碼解析度；**每包獨立解碼**，不是相對前一包。超出協定座標範圍就撤銷 fix。
+- 保留同 epoch 的速度／方向與獨立 `velocity_valid`；速度以 0.1 m/s 編碼，低於 0.3 m/s、
+  缺欄位或超出可表示範圍時不外推。加速度計算與 `accel_cms2` 欄位已移除。
+- DATA 傳衛星級距：未知、≤5、6–7、≥8；保留 HDOP（向上取整至 0.1）。
+  精確衛星數改放約每 30 秒的 TEL，僅供診斷；追蹤資格不能拿舊 TEL 數值代替 DATA 級距。
+- TEL 另傳電量、溫濕度（BME280，沒感測器則回報未知）；DIAG 記錄 Client 真正量到的
+  GNSS epoch 間隔與錯誤／積壓／跳格計數。計數自 Client 開機累計、16-bit 飽和至 65535；
+  DIAG 是低頻快照，不是逐筆即時紀錄。
 - 電量讀取：透過 AXP2101 PMU，每 5 秒更新。
 - **ATPC 自動發射功率控制**（每 15 秒評估）：
   - 收不到 ACK 超過 20 秒 → 功率 +1。（此門檻是 `5 × ACK_EVERY_N × 發送間隔` 推導值，
@@ -58,7 +89,7 @@
   - 鏈路強（RSSI > −70 dBm 且 SNR > 8）→ 功率 −1（省電）。
   - 鏈路弱（RSSI < −98 dBm 或 SNR < 2）→ 功率 +1。
   - 結果存 NVS，下次開機沿用。
-- ACK 追蹤：記錄最後 ACK 序號/時間、RSSI/SNR、漏 ACK 次數。
+- ACK 追蹤：預期序號與回覆期限由 DATA 排程建立；記錄 ACK 接收／拒絕次數、最後接收時間與 RSSI／SNR。
 - OLED 平時進入睡眠省電；**短按 PWR 鍵**喚醒螢幕顯示狀態 10 秒後自動睡回去（非阻塞，不影響定位/發送）。
   - 睡眠是 `u8g2.setPowerSave(1)`（關顯示與升壓電路），不是只清畫面 —— 只清畫面的話
     像素熄了但控制器還在跑，是毫安等級的常態消耗。
@@ -68,98 +99,117 @@
 
 # 4. Server（岸上攝影站）
 
-- 接收並驗證封包（magic/version/networkId/dstId/payloadLen/白名單）；不符靜默丟棄並計數。
-- 收到 DATA → 更新 RSSI/SNR 滾動統計（近 20 筆）、封包率（60 秒平均）；`seq % 4 == 0` 時回 ACK。
+- 接收時保留實際 RF 長度，驗證 magic、v4、類型、固定長度、`clientId` 白名單與數值／保留位元。
+  格式、長度、綁定、序號與 RF 錯誤分別計數，並寫入 64 筆結構化事件環形紀錄。
+- 收到 DATA → 更新 RSSI/SNR 滾動統計（近 20 筆）、**約 5 秒視窗的 DATA 封包率**；
+  距最後 DATA 超過 5 秒，`pkt_rate` 回報 0。此值是 RF 接收率，不是新 GNSS 定位率。
+  DATA `seq % 8 == 0` 時回 ACK。
+  ACK 非阻塞，TxDone／timeout 才恢復 RX，空中傳送時持續服務 Servo／UART。
+  自 RxDone 超過 50 ms 才處理的 ACK 直接略過；失敗／逾時會計數且嘗試恢復 RX。
 - 自己也讀 GPS，計算「攝影站 → Surfer」方位角（bearing）供雲台追蹤。
-- 軌跡緩衝：每 1 秒記一點，循環 buffer 共 300 點（過去 5 分鐘）。
-- **白名單**：最多 16 筆，開機從 NVS 載入（無資料用 `DEFAULT_WHITELIST`），可經 API 動態 add/remove/clear 並寫回 NVS。
-- **磁力計航向**：板上 QMC6310（I2C bus0）每 200 ms 讀一次 heading，被用來補償攝影站身體旋轉；離線時 heading 視為 0（假設站體固定）。
-- **雲台追蹤狀態機**：`manual`（手動拖 slider 對準 surfer）→ `tracking`（按 start）→ `paused`（可 pause/resume）。
+- Server 不保存軌跡；瀏覽器每秒嘗試累積有效且不同的位置，加入新點時移除兩小時前
+  的資料供 GPX 匯出，雷達／地圖只畫最近 5 分鐘。重整頁面會清空瀏覽器軌跡。
+- DATA 拒絕重複／倒退序號，支援 uint16 回繞；超過 2.5 秒未接受 DATA 可重同步。
+  `sequence_gaps` 只由 DATA 的前進序號推估缺包，TEL／DIAG 不影響此計數；重同步另計。
+- **單一 Client**：只接受綁定 ID 的 DATA／TEL／DIAG，NVS 保存 `gpsclient`。
+  新裝預設 **0 = 未綁定**，不接受任何 Client 定位；有效舊綁定會保留。
+  舊 `wl` 只遷移第一個有效 ID；刻意清空不恢復預設。API 的 add 不覆寫不同 client，
+  set 可明確替換；成功變更時撤銷自動控制並清空舊 client 的資料、濕度基準與滾動統計。
+  v4 線上封包只帶一個 `clientId`，上行表示發送者，下行表示 ACK 對象；現階段容量固定為 1。
+- **雲台控制**：`manual / gps / uart / paused`。開機 Servo 90°、預設 UART 等待新指令。
+  GPS／UART 互斥；只有 UART 模式開啟 UART 接收控制。切換清除舊目標與 UART session。
+  GPS 按鈕與 API 要求兩端新鮮 Good／OK（衛星 ≥6、HDOP ≤3；Client 使用即時衛星級距）；追蹤另需校正與
+  連續可用 2 秒，失效保持，不自動切換來源。
+  UART 接受 SET／SET2，250 ms 無有效指令保持；新 SET 可恢復，不要求 GPS／校正。
+  Manual／pause／OTA／關機撤銷自動控制；start／resume 不修改校正。
+  舊 HTTP `mode=jetson` 接受為 UART 別名，回應統一為 `uart`。
   - Servo（IO21，內建 LEDC 333 Hz / 14-bit PWM，500–2500 µs = 0–180°）。
-  - 從上方看，Servo 角度增加為逆時針、羅盤 bearing 增加為順時針；start 時鎖定 `mount_offset = bearing − heading + servo_angle`（寫 NVS），之後 `servo_angle = heading + mount_offset − bearing`（clamp 0–180°）。
-  - **追蹤迴圈為 20 Hz（每 50 ms），與封包到達脫鉤**：不是「收到封包才動一次」，
-    因此掉一包也不會整整一秒不動。
-  - **位置外推（dead reckoning）**：封包 1 Hz，拿到時已經過期最多 1 秒。改用
-    payload 既有的 `speed_cms` / `course_deg10` 沿速度向量外推目前位置（等速模型，
-    不含加速度——`accel_cms2` 是 GPS 速度的高度平滑微分，平方項會在起乘瞬間嚴重過衝）。
-    速度低於 0.3 m/s 不外推（此時 GPS 航向是雜訊）；外推最多 2 秒，超過就凍結，
-    避免斷線後鏡頭一路飄走。
-  - **轉速限制 120°/s**：單筆 GPS 跳點或從遠處 resume 時，不會用 servo 全速
-    （約 400°/s）甩鏡頭。因此 `servo.angle`（實際）會略微落後 `servo.target`（目標）。
-  - 註：servo 瞄準的是**外推後**的位置，而 `/api/track` 的 `client.lat/lon` 與
+  - 從上方看，Servo 角度增加為逆時針、羅盤 bearing 增加為順時針；指南針校正時鎖定 `mount_offset = compass_bearing + servo_angle`（只存 RAM），之後 `servo_angle = mount_offset + declination − true_bearing`（clamp 0–180°）。
+  - **GPS 目標重算為 20 Hz（每 50 ms），與封包到達脫鉤**：α 開啟時，可在有效封包之間外推。
+  - **位置外推（dead reckoning）**：DATA 排程每 500 ms，使用同一快照且有效的速度／方向
+    做等速預測，不含加速度；API 將 wire 的 0.1 m/s 速度還原為 `speed_cms`，方向為 `course_deg10`。
+    缺少有效速度向量、速度低於 0.3 m/s 或定位過期時不外推。
+    外推時間為 **來源年齡＋DATA airtime＋自 RxDone 經過時間**，最多 2 秒，仍須通過新鮮度門檻。
+  - **年齡與 freshness**：`source_age_ms` 是 Client 發送前估計，`rx_age_ms` 是自 RF 收到後
+    經過的時間；`sample_age_ms` 為兩者再加 airtime 的合計。Client 資料須滿足
+    `sample_age_ms + 200 < 2000`，Server 自身 GNSS 也採來源年齡＋200 ms 的 `< 2000` 門檻。
+    額外 200 ms 只降低過期判定的容忍度，不增加預測位移；內部 GNSS 延遲仍未量測。
+    API `fix`／`velocity_valid` 依目前年齡重新判斷，不會因持續收到同一筆舊座標而永久有效。
+    速度／方向數值本身可保留最後值，使用者仍須檢查 `velocity_valid`。
+  - **GPS 位置預測 α 開關**：資訊頁勾選為 α=1（預設），取消為 α=0，
+    使用最後收到座標；切換自動保存至 NVS，重開機沿用。關閉後 Servo 仍按共用速限追目標，
+    不會暫停追蹤；手動／UART 不受此設定影響。這是位置預測開關，不是 PID 或馬達速限比例。
+  - **所有模式只共用最高速度**：預設 30°/s，資訊頁可調 1–90°/s，修改自動寫入
+    NVS 單一速度值，之後開機沿用；舊多參數設定不帶入。移動中也可改速，不換模式或目標。
+    按微秒實際時間限制每次位移，Servo 無固定輸出頻率；GPS 目標另每 50 ms 重算。
+    保留小數微秒精度到 14-bit duty，只有數值變化才寫入。加速度／jerk／死區規劃已移除。
+    命令範圍固定 0–180°；長停頓最多採計 50 ms，不補送歷史目標。來源失效立即保持。
+    API 無機械回饋，首次回 90° 無法保證物理限速；命令移動時禁止指南針校正。
+    詳見 [共用控制器](motion-control.md)。
+  - 註：α 開啟時 servo 瞄準的是**外推後**的位置，而 `/api/track` 的 `client.lat/lon` 與
     `bearing` 仍是**原始收到值**，兩者在高速時可能差幾公尺（雷達圖上約數 %）。
-  - **追蹤期間 heading 凍結**：進入追蹤時快照一次 heading 後就固定使用，磁力計的
-    即時雜訊（servo 電流、震動、濾波漣漪）不會進入控制迴路。只有當即時值偏離快照
-    超過 2°（死區）才視為「腳架真的被轉動」並重新快照——重新快照會把誤差歸零、
-    自然落在死區內，等於免費得到遲滯，不會在門檻上抖動。
-    GPS 提升到 ~1 m 後磁力計才是指向誤差的主要來源，所以這件事有感。
-- 長按 PWR 鍵 → 關機畫面後斷電。
-- **OLED 位址依板子版本自動判定**：T-Beam Supreme 有 QMC6310U（磁力計 0x1C → 螢幕 0x3C）
-  與 QMC6310N（磁力計 0x3C → 螢幕 **0x3D**）兩種版本。`initMag()` 先探測 0x1C，探到哪個
-  位址就回推螢幕位址。寫死 0x3C 在 N 版板子上會讓 u8g2 把畫面資料寫進磁力計的暫存器 ——
-  螢幕全黑而且沒有任何錯誤訊息。開機 log 會印出實際使用的兩個位址。
+- 長按 PWR／低電量關機先切手動、撤銷控制，再顯示畫面與要求 PMU 斷電。
+- OLED 位址獨立偵測：優先檢查 0x3D，否則使用 0x3C；不再依賴磁力計初始化。
+  保留兩種板子版本的螢幕支援。
 
-## 4.1 校正（各做一次即可，一個人就能完成）
+## 4.1 鏡頭指南針校正
 
-兩個校正互相獨立，但要一起做才有意義：
+1. 切到手動，固定腳架並等鏡頭停穩。
+2. 輸入鏡頭普通磁針指南針讀數：北 0°、東 90°、南 180°、西 270°。
+3. 選「GPS」。UART 模式不需要此校正。
 
-**磁力計 hard-iron**（`POST /api/mag/calibrate`，網頁資訊頁有按鈕）\
-把整台機器**順時針**慢慢水平轉一整圈，韌體對水平面兩軸做最小平方圓擬合，圓心存 NVS。
-不用對準任何東西、不需要 GPS fix。校正值跟著板子走，換浪點不用重做。
-回報**擬合殘差**（<1° = 安裝乾淨）與**磁場強度**（台灣應接近 0.37 G）當品質指標。
+`POST /api/track/calibrate?bearing=<0..359.999>` 只保存 RAM 參考，校正本身不需 GPS／地標。
+板上磁力計初始化、取樣、旋轉補償、hard-iron 校正頁與 API 已移除。
+不再讀寫 mount*／mag* NVS。腳架轉動、重新架設、移動指南針或重開機都需要重校。
 
-這一圈同時判斷**板子怎麼擺**：三軸中轉一圈幾乎不變的那一軸就是垂直軸，另兩軸即水平面
-（結果顯示在「水平面軸」）。所以板子平放、立起、側立都可以，不必再遷就水平放置；
-代價是**換擺法後必須重做校正**，而且**旋轉方向決定 heading 的正負**（轉反了 heading 會
-反向，log 會用磁傾角交叉檢查並警告）。
-
-**地標校正**（`POST /api/track/calibrate?lat&lon`）\
-servo 設 90°，從觀景窗把 1 km 外的地標對到畫面正中央，貼上座標。400mm 下是 ±0.05°
-的照準。不需要追蹤器在場、不需要第二個人。
-
-這是**唯一**鎖定 `mount_offset` 的方式。曾經做過的「朝向法」「方位角法」（操作者手動
-輸入方位）已移除：手工對方位是 2~5° 誤差，還多一個磁北／真北搞錯就靜靜偏 4~5° 的風險，
-只為了省 30 秒照準。副作用是校正**需要 GPS fix 與看得見的地標**，室內做不了。
-
-精度 ~0.1°（1 km 地標 + 觀景窗照準），而且整個流程不涉及羅盤與磁偏角。
-鎖定時 heading 取**最近 5 秒的向量平均**（25 筆 @ 5 Hz），避免把某一瞬間的雜訊寫成永久
-常數——但平均只對零均值雜訊有效，hard-iron、servo 鋼齒輪、傾斜這些是確定性誤差，
-平均多久都不會消失。「靜置一段時間」也不能取代這一步：靜置只降雜訊，不會提供任何
-「鏡頭指向哪裡」的資訊，而那正是 `mount_offset` 需要的。
-
-**選跟浪區同方向的地標。** 磁力計軌跡的橢圓誤差是方位的 sin2θ 函數，`mount_offset` 只
-吸收了校正姿勢那一點，洩漏到指向的是兩個姿勢的差：上限 `2 × ellipse_deg × |sin(Δθ)|`。
-Δθ=0 時完全抵銷，90° 時最壞。`/api/track` 的 `pose_delta_deg` / `pose_err_deg` 會即時
-報這個值。
-
-> **為什麼這樣就不用每次校正**：`mount_offset` 本來就存在 NVS 且跨重開機有效
-> （`/api/track/resume` 用的就是舊值）。它之所以看起來每次都得重做，是因為未校正的
-> heading 是被扭曲的——換個方位架設誤差就跑掉幾十度。修好 hard-iron，`mount_offset`
-> 才真的是常數，之後每次下水只要 resume。
+磁針輸入為磁北，GPS 與雷達加入 WMM2025 磁偏角（東正西負）；依攝影站 GPS 位置與
+UTC 日期自動查表，適用北緯 18–28°、東經 116–124°、2025–2029 年。
+GPS 位置／日期無效或超出範圍時，GPS 模式保持，UART 模式不受影響。
+磁偏角補償不能消除指南針附近金屬／馬達的局部磁場干擾。
 
 # 5. WiFi / Web 監控（Server）
 
 - STA 模式連手機熱點（帳密在 `wifi_config.h`），逾時 20 秒；連不上仍跑 LoRa，背景自動重連。
-- 內嵌單頁 Web UI（Servo 控制 + Canvas 極座標雷達圖，無外部 CDN），前端每 1 秒輪詢 `/api/track`、每 3 秒輪詢 `/api/status`。
+- 內嵌單頁 Web UI 分為**雷達／資訊／除錯**，無外部 CDN；前端每 1 秒輪詢 `/api/track`、
+  每 3 秒輪詢 `/api/status`。所有 API 共用單一請求排程，含回應 body 讀取；待送控制優先，
+  背景同類請求合併，忙碌時輪詢可延後。網頁輪詢頻率不等於 RF 或 GNSS 更新頻率。
+- 手動滑桿拖動只預覽，放開才送出；UI 0–180° 對應內部 180–0°。在途請求最多一筆，
+  待送只保留最新已放開目標；模式切換清除待送並等待在途完成。pointercancel 不送出。
+  10 個案例由 `node tools/test_servo_slider.js` 驗證。
+- OLED 運行畫面仍分 8 段傳輸、段間服務控制，固定正常刷新；不提供 OLED 刷新開關。
 - Server 支援 PlatformIO `espota` Wi-Fi 韌體更新；OTA 開始時暫停追蹤，完成後自動重開。OTA 本身未設密碼，以手機熱點的存取控制作為網路邊界。
 - API endpoint 與 JSON 欄位詳見 [interface.md](interface.md)。
-- **執行紀錄**：所有 log 同時輸出到 USB 序列埠與一個 4 KB 環形緩衝，`http://<站IP>/log`
-  可即時檢視（每 2 秒抓增量，僅在瀏覽器分頁在前景時輪詢）。到了海邊不必接筆電就能除錯；
-  espota 本身只上傳韌體，不提供 log。紀錄是**獨立網址**而非 Web UI 的分頁——由「資訊」
-  頁的按鈕另開分頁，看 log 就不必放掉雷達畫面。
-- **RX 每分鐘一筆統計**：收包不再一包一行。一包一行會在約 16 秒內把 4 KB 環形緩衝洗完，
-  等於你打開紀錄想看的 `[SERVO]` / `[MAGCAL]` / `[TRACK]` 一定已經被沖掉。改成累積後
-  每 60 秒印一行：收到/應收（用 seq 差算掉包率）、ACK、drop/err（含最後的錯誤碼）、
-  RSSI 與 SNR 的 min/avg/max、雙方 GPS、距離/方位、heading、servo 角度與模式。
-  這樣同一個 4 KB 大約能留 30 分鐘以上的歷史。
+- **除錯與匯出**：除錯頁在前景、或已開始瀏覽器錄製時，最多每秒串行讀取
+  `/api/debug` 與 `/api/log`，與全頁其他 API 排程共用；沒有錄製時離開除錯頁便停止這兩項輪詢。
+  錄製最長 10 分鐘／1200 筆／5 MiB，任一上限即停止；漏採、Server 重開機、事件／文字覆寫
+  與讀取失敗皆有標記。開始／停止錄製只操作瀏覽器，不切換追蹤模式或清除 Server log。
+- JSON 匯出包含備註、每次取樣時間與各端點接收時間、版本／RF 設定、track／status、
+  GNSS／Client DIAG、封包事件與文字增量。除錯 API／匯出 schema 為 2；每次最多 8 個
+  新事件，首次歷史分批補齊，畫面在瀏覽器合併近期 64 筆。游標覆寫／重啟都有提示，
+  匯出不停止錄製、不清除現存紀錄。
+  手機鎖屏／背景執行可能漏採，重整頁面會遺失；詳見 [除錯匯出](debug-export.md)。
+- 除錯頁將 **Server 本機 GNSS**、**Client 約每 30 秒的 DIAG**、**Server 依封包年齡推估的
+  Client 更新間隔**分開顯示。DIAG 90 秒內標示仍在有效期但非即時，超過則只供歷史參考；
+  原始欄位會隨 JSON 保留。另顯示綁定 ID／未綁定，以及最近因綁定不符拒收的 ID。
+- **執行紀錄**：USB 序列埠與 4 KB 環形緩衝保留；`/api/log?from=<offset>` 回傳文字增量，
+  `X-Log-Next`／`X-Log-Dropped`／`X-Log-Boot` 提供游標、遺失與開機識別。
+  瀏覽器文字畫面最多保留最近 32768 UTF-16 字元（約 64 KiB），截短會提示。
+- **RX 每分鐘一筆統計**：收包不逐包印文字，避免快速洗掉 4 KB 環形緩衝中的控制事件；
+  累積後每 60 秒印一行：收到位置數／seq 範圍、ACK、drop/err（含最後的錯誤碼）、
+  RSSI 與 SNR 的 min/avg/max、雙方 GPS、距離/方位、servo 角度與模式。
+  百分比使用收到的 DATA 加上 DATA 序號推估缺包作分母；TEL／DIAG 使用獨立序號，
+  不再灌入 DATA 分母。序號缺口仍不能區分 RF 遺失、發射失敗與重啟等原因，需搭配
+  Client DIAG、Server 錯誤計數與事件紀錄判讀；API `drop_rate` 是拒收計數比例，並非空中丟包率。
+  4 KB 能保留多久取決於各類 log 的頻率，追蹤期間還會產生每 3 秒一筆的追蹤紀錄。
 - IP 快取在 DHCP 換位址時會更新（比對 `IPAddress` 而非只在空值時寫入），
   避免 WiFi 未斷線但續約換 IP 時 OLED 一直顯示舊位址。
-- Web UI 頂部狀態列：Link / RX 秒數 / GPS 衛星 / 羅盤 heading / RSSI / Batt / Uptime。
-- **GPS 品質用操作者看得懂的說法**：Web UI 不再顯示 HDOP 與衛星數字。HDOP 換算成
-  **預期精度（公尺）**＝`HDOP × 2.5 m`（2.5 m 是 ATGM336H 這類單頻消費級模組常用的
-  1σ UERE），衛星數改成 **少／普通／好** 三段（≥8 好、≥6 普通、其餘少，門檻與
-  Good/OK/Bad 判定一致）。封包欄位仍是 HDOP 與衛星數（`protocol.h` 沒動），只有顯示改寫。
+- 雷達頁顯示模式／追蹤或保持狀態，資訊頁顯示連線、接收年齡、GPS 品質、RSSI／SNR、電量及 uptime。
+- **GPS 品質顯示**：一般操作頁將 HDOP 換算成 `HDOP × 2.5 m` 的粗略「預期精度」，
+  並非模組實測誤差。Server 衛星顯示少／普通／好；Client 顯示 DATA 的**未知／≤5／6–7／≥8 顆**。
+  Client 精確顆數僅由 TEL 低頻更新，API `satellites` 在未知或 TEL 超過 90 秒時為 `null`，
+  另提供 `satellites_age_ms`。UI 不將級距下界冒充精確數字，GPS 品質／追蹤門檻也不使用舊 TEL 顆數。
 - 雷達圖：以攝影站為中心的 east/north 座標，自動縮放、畫出 surfer 過去 5 分鐘軌跡與 servo 當前/目標指向。
+- 地圖使用瀏覽器載入的 OpenStreetMap 圖磚，需要網路；韌體內的操作頁與雷達可本地使用。
 
 # 6. OLED 顯示內容
 
@@ -171,7 +221,7 @@ SH1106 128×64。以下為模擬畫面（`<...>` 為動態數值）。
 
 ```
 +--------------------+
-| SHORE SPOTTER      |
+| SHORE SPOTTER v<version> |
 |--------------------|
 | ID: <MAC末2碼>      |
 | Batt: <%>%      ⚡ |   ⚡ = 接著 USB/充電中
@@ -185,21 +235,21 @@ SH1106 128×64。以下為模擬畫面（`<...>` 為動態數值）。
 ```
   開機中                WiFi 結果（顯示 2 秒）
 +--------------------+   +--------------------+
-| SHORE SPOTTER      |   | SHORE SPOTTER      |
+| SHORE SPOTTER v<version> |   | SHORE SPOTTER v<version> |
 | SERVER booting...  |   |--------------------|
 |                    |   | WiFi connected     |   失敗 -> WiFi FAILED
 |                    |   | <手機分配的 IP>     |   失敗 -> see wifi_config.h
 +--------------------+   +--------------------+
 ```
 
-## Server 運行畫面（每5秒刷新並輪下個白名單資訊）
+## Server 運行畫面（正常排程每 500 ms 刷新單一綁定 Client）
 
 左半 = Server 面板\
 右半 = Client 面板
 
 ```
 +------------------+------------------+
-|      Server    | V |  Client-n/N    |
+|      Server    | V |  Client XXXX    |
 |----------------+---+----------------|
 |   26.9C / 41%  |T/H|  26.9C / 41%   |
 |      Good      |GPS|    OK          |
@@ -209,7 +259,7 @@ SH1106 128×64。以下為模擬畫面（`<...>` 為動態數值）。
 +------------------+------------------+
 ```
 
-+ `Client-n/N` 中 n 代表白名單編號（1 起算）、N 代表白名單總數；無白名單時顯示 `Client -/-`。
++ `Client XXXX` 顯示綁定的十六進位 ID；未綁定時顯示 `Unbound`。
 + `LoRa` & `GPS` 狀態為四級：`Good` / `OK` / `Bad` / `Miss`（`Miss` = 沒訊號/沒連線/無衛星）\
   GPS
   + Good = fix 且 HDOP≤1.5 且 sats≥8
@@ -238,9 +288,12 @@ SH1106 128×64。以下為模擬畫面（`<...>` 為動態數值）。
 
 # 7. 設定持久化（NVS）
 
-- Server（namespace `shorespotter`）：白名單 `wl`、雲台安裝偏移 `mountoff`、校正旗標 `mountcal`、
-  磁力計水平面軸 `magaxa`/`magaxb`、hard-iron 偏移 `magoa`/`magob`、旗標 `magcal`、
-  品質 `magres`/`magfld`、版本 `magver`（現為 2；舊的 `magx`/`magy` 為 v1，升版後自動失效）。
+- Server（namespace `shorespotter`）：單一 client `gpsclient`（UShort，0 = 未綁定；舊 wl 僅首次遷移）。
+- 唯一速限以 `shorespotter/servospd` 單一 uint32 保存（毫度／秒）；資訊頁修改即寫入並回讀確認，
+  相同值不重寫，重啟沿用；舊 motioncfg 不讀取。
+- GPS 預測開關以 `shorespotter/gpspredict` 保存，0 = α 關、1 = α 開；未設定預設開啟，
+  保存失敗不修改執行中的設定。
+- 鏡頭校正只存 RAM，板上校正停用。舊 mount*／mag* 鍵忽略，不清除整個 NVS 區域。
 - Client（namespace `shorespt_client`）：發射功率 `txpwr`、ATPC 開關 `atpc`。
 
 # 8. 健康 / 告警門檻
@@ -301,3 +354,11 @@ BME280 讀數。
     都重建一次。
 - **GPS 過期判定**：見第 3 節的 `GPS_FIX_MAX_AGE_MS`。
 - **WiFi**：斷線後每 5 秒自動重連，LoRa 追蹤不受影響（本來就不依賴 WiFi）。
+
+## 執行時間診斷
+
+`/api/status.timing` 保存控制最大服務間隔，以及 loop、HTTP、BME280、PMU、OLED、LoRa、
+OTA 的 last/max 耗時與 ≥50 ms 次數，另有 UART 晚服務／丟棄 bytes／拒絕指令數。
+不逐次寫 log。Wire 與 PMUWire 單筆交易 timeout 為 10 ms；整段操作可含多筆交易。
+同步 WebServer 仍可能阻塞，這批提供實機定位依據，並不宣稱 250 ms 期限已獲保證。
+週期 deadline 使用差值比較處理 millis 溢位，控制在同步 I/O 工作之間被服務。
