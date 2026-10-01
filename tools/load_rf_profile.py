@@ -73,6 +73,9 @@ def apply_profile(env) -> None:
             raise ValueError("SHORE_DEVICE environment does not match selected PlatformIO environment")
         group_name = device["rf_group"]
         if device["role"] == "station":
+            if _has_define(env.get("CPPDEFINES", []), "SHORE_STATION_HOSTNAME"):
+                raise ValueError("SHORE_STATION_HOSTNAME is already defined; use the device manifest")
+            env.Append(CPPDEFINES=[("SHORE_STATION_HOSTNAME", '\\"' + device["hostname"] + '\\"')])
             client = devices[device["client"]]
             if "radio_id" in client:
                 env.Append(CPPDEFINES=[("SHORE_DEFAULT_CLIENT_ID", str(client["radio_id"]))])

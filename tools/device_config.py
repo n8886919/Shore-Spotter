@@ -9,6 +9,7 @@ import argparse
 import json
 import sys
 import shlex
+import re
 from pathlib import Path
 
 
@@ -53,10 +54,11 @@ def load_devices(path: Path, groups: dict[str, dict]) -> dict[str, dict]:
         raise ConfigError("devices 設定必須是 schema_version 1 且有 devices 陣列")
     devices: dict[str, dict] = {}
     serials: dict[str, str] = {}
+    hostnames: set[str] = set()
     required = {"name", "board", "role", "environment", "usb_serial", "rf_group"}
     for device in data["devices"]:
-        if not isinstance(device, dict) or not required.issubset(device) or set(device) - (required | {"client", "radio_id"}):
-            raise ConfigError("每個 device 必須只使用 name/board/role/environment/usb_serial/rf_group/client/radio_id 欄位")
+        if not isinstance(device, dict) or not required.issubset(device) or set(device) - (required | {"client", "radio_id", "hostname"}):
+            raise ConfigError("每個 device 必須只使用 name/board/role/environment/usb_serial/rf_group/client/radio_id/hostname 欄位")
         name = device["name"]
         if not isinstance(name, str) or not name or name in devices:
             raise ConfigError(f"device name 重複或無效：{name!r}")
@@ -75,6 +77,15 @@ def load_devices(path: Path, groups: dict[str, dict]) -> dict[str, dict]:
         serials[key] = name
         if role == "station" and not isinstance(device.get("client"), str):
             raise ConfigError(f"{name}: Station 必須以 client 指向配對 Client device name")
+        if role == "station":
+            hostname = device.get("hostname")
+            if not isinstance(hostname, str) or not re.fullmatch(r"[a-z](?:[a-z0-9-]{0,29}[a-z0-9])?", hostname):
+                raise ConfigError(f"{name}: hostname 必須是 1..31 字元小寫 DNS 名稱，不含 .local、空格或底線")
+            if hostname in hostnames:
+                raise ConfigError(f"hostname 重複：{hostname}")
+            hostnames.add(hostname)
+        elif "hostname" in device:
+            raise ConfigError(f"{name}: hostname 只適用 Station")
         if role == "client" and "client" in device:
             raise ConfigError(f"{name}: Client 不可再有 client 綁定欄位")
         if "radio_id" in device and (type(device["radio_id"]) is not int or not 1 <= device["radio_id"] < 65535):
@@ -104,6 +115,8 @@ def summary(device: dict, groups: dict[str, dict]) -> dict:
         "environment": device["environment"], "usb_serial": device["usb_serial"],
         "rf_group": group["name"], "rf_group_id": group["id"], "frequency_mhz": group["frequency_mhz"],
         "paired_client": device.get("client"),
+        "hostname": device.get("hostname"),
+        "local_url": f"http://{device['hostname']}.local/" if "hostname" in device else None,
     }
 
 
@@ -111,6 +124,8 @@ def print_device(item: dict) -> None:
     pairing = f"；配對 Client {item['paired_client']}" if item["paired_client"] else ""
     print(f"{item['device_id']}: {item['role']} / {item['board']} / env {item['environment']} / USB {item['usb_serial']}")
     print(f"  RF {item['rf_group']} (id {item['rf_group_id']}, {item['frequency_mhz']:.1f} MHz){pairing}")
+    if item["local_url"]:
+        print(f"  固定區網網址：{item['local_url']}")
 
 
 def main(argv: list[str] | None = None) -> int:

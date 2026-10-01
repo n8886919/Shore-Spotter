@@ -49,6 +49,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include <cJSON.h>
 #include <esp_heap_caps.h>
 #include "axiom_log.h"
@@ -209,6 +210,18 @@ uint8_t cachedHumidityPct = 0xFF;
 String cachedApIp = "";
 #if defined(ROLE_STATION)
 IPAddress cachedApIpAddr;  // last address seen, to detect DHCP changes
+static char stationHostname[64] = {};
+static void initStationHostname() {
+#ifdef SHORE_STATION_HOSTNAME
+  snprintf(stationHostname, sizeof(stationHostname), "%s", SHORE_STATION_HOSTNAME);
+#else
+  // Generic builds remain unique per board without a local device manifest.
+  uint8_t mac[6] = {};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(stationHostname, sizeof(stationHostname), "shore-%02x%02x%02x%02x%02x%02x",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#endif
+}
 #endif
 
 // Shared OLED object — client enables it only during boot-info and shutdown screens.
@@ -2131,6 +2144,7 @@ static String buildTrackJson() {
   String js;
   js.reserve(900);
   js += F("{\"board\":\""); js += station_board::deviceBoard();
+  js += F("\",\"hostname\":\""); js += stationHostname;
   js += F("\",\"rf_group\":"); js += String(radio_profile::group);
   js += F(",\"frequency_mhz\":"); js += String(RF_FREQUENCY, 1);
   js += F(",\"linked\":");
@@ -3158,7 +3172,7 @@ static void initWebServer() {
 static void initArduinoOta() {
   if (otaReady || WiFi.status() != WL_CONNECTED) return;
 
-  ArduinoOTA.setHostname("shore-spotter-station");
+  ArduinoOTA.setHostname(stationHostname);
   ArduinoOTA
       .onStart([]() {
         sd_log::stop(); // asynchronous drain; user can restart recording after an OTA error
@@ -3174,8 +3188,9 @@ static void initArduinoOta() {
         Log.println((unsigned int)error);
       });
   ArduinoOTA.begin();
+  MDNS.addService("http", "tcp", 80);
   otaReady = true;
-  Log.print(F("[OTA] ready: shore-spotter-station.local / "));
+  Log.print(F("[OTA] ready: ")); Log.print(stationHostname); Log.print(F(".local / "));
   Log.println(WiFi.localIP());
 }
 #endif
@@ -3801,8 +3816,9 @@ void setup() {
 
   // Connect to the phone-provided hotspot in station mode.
   // Credentials come from include/wifi_config.h (WIFI_SSID / WIFI_PASSWORD).
+  initStationHostname();
+  WiFi.setHostname(stationHostname);
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname("shore-spotter-station");
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Log.print(F("[WiFi] Connecting to configured hotspot "));

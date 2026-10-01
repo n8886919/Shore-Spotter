@@ -327,6 +327,9 @@ timeout 會嘗試取消傳輸；若瀏覽器未能結束 fetch／內容讀取，
 
 ## `GET /api/track`
 
+頂層 `hostname` 是當前 Station 固定名稱，區網入口為 `http://<hostname>.local/`；
+mDNS 可用性仍取決於操作手機所在網路，現有 IP 入口仍可用。
+
 即時狀態，前端每 1 秒輪詢一次（輕量，不含軌跡）。過去 5 分鐘軌跡改由前端自行累積這些即時點，攝影站不再儲存。
 
 **Response**

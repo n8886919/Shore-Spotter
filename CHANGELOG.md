@@ -9,6 +9,14 @@
 
 ## 未發行
 
+- **2026-10-02 每台 Station 固定名稱（V4 USB 已部署）**：device manifest 新增必填 `hostname`，
+  檢查 DNS 格式與唯一性；`SHORE_DEVICE` 將名稱帶入 Wi-Fi／mDNS／OTA，並宣告 HTTP service。
+  通用 Station build 改採完整 MAC 後綴，避免多板使用同一名稱。`/api/track.hostname` 與 `plan`
+  可查名稱；本機 V4 設為 `shore-b`，RF group／頻率與 Client 排程不變。
+  config 6 項與既有 debug／packet 回歸通過，V4／T-Beam Station build 通過。V4 app-only 燒錄 hash 校驗通過，
+  API 回報 `shore-b` 且保持 F035／923.8 MHz，電腦瀏覽器實際以 `http://shore-b.local/` 開啟控制頁成功；
+  手機熱點端與桌面捷徑尚待實機驗收，T096 2 Hz 移植缺口仍待修正。
+
 - **2026-10-02 多板 Station、T096 Client 與固定 A/B（Heltec USB 桌上部署）**：
   共用 Station 邏輯新增 Heltec LoRa32 V4 R2 profile／FEM 偵測與 SD/GNSS 能力區分，
   保留 LilyGO；T096 採 nRF52840 + SX1262/FEM 與真 GNSS source，RF 測試另用 probe 不偽造座標。

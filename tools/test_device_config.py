@@ -60,6 +60,7 @@ class DeviceConfigTest(unittest.TestCase):
             listed = subprocess.run(command + ["list"], text=True, capture_output=True, check=True)
             self.assertIn("station-v4", listed.stdout)
             self.assertIn("RF B (id 1, 923.8 MHz)", listed.stdout)
+            self.assertIn("http://shore-b.local/", listed.stdout)
             planned = subprocess.run(command + ["plan", "station-v4"], text=True, capture_output=True, check=True)
             self.assertIn("配對 Client t096-client", planned.stdout)
             self.assertIn("SHORE_DEVICE=station-v4 pio run -e heltec-v4-station", planned.stdout)
@@ -87,6 +88,24 @@ class DeviceConfigTest(unittest.TestCase):
             group_path, device_path = self.write(Path(tmp), devices={"schema_version": 1, "devices": devices}, groups=groups)
             return device_config.load_devices(device_path, device_config.load_groups(group_path))
 
+    def test_station_hostnames_are_required_valid_and_unique(self):
+        for value in [None, "", "Shore-b", "shore_b", "shore-b.local", "-shore", "shore-", "x" * 32, 'x";bad']:
+            with self.subTest(hostname=value):
+                devices = copy.deepcopy(DEVICES["devices"])
+                devices[0]["hostname"] = value
+                with self.assertRaisesRegex(device_config.ConfigError, "hostname"):
+                    self._load_data(devices, GROUPS)
+        devices = copy.deepcopy(DEVICES["devices"])
+        devices.append(dict(devices[0], name="station-other", usb_serial="OTHER"))
+        with self.assertRaisesRegex(device_config.ConfigError, "hostname 重複"):
+            self._load_data(devices, GROUPS)
+        devices[2].update(hostname="a" * 31, client="client-other", rf_group="A")
+        devices.append(dict(devices[1], name="client-other", usb_serial="CLIENTOTHER", rf_group="A"))
+        self.assertEqual(len(self._load_data(devices, GROUPS)), 4)
+        devices[1]["hostname"] = "client-host"
+        with self.assertRaisesRegex(device_config.ConfigError, "hostname 只適用 Station"):
+            self._load_data(devices, GROUPS)
+
     def test_additional_fixed_group_uses_config_only(self):
         groups = copy.deepcopy(GROUPS)
         c = dict(groups["groups"][0], name="C", id=2, frequency_mhz=924.4)
@@ -111,6 +130,9 @@ class DeviceConfigTest(unittest.TestCase):
                 load_rf_profile.apply_profile(env)
                 self.assertIn(("SHORE_RF_GROUP", "1"), env["CPPDEFINES"])
                 self.assertIn(("SHORE_DEFAULT_CLIENT_ID", "4660"), env["CPPDEFINES"])
+                self.assertIn(("SHORE_STATION_HOSTNAME", '\\"shore-b\\"'), env["CPPDEFINES"])
+                with self.assertRaisesRegex(ValueError, "SHORE_STATION_HOSTNAME is already defined"):
+                    load_rf_profile.apply_profile(FakeEnv("B", [("SHORE_STATION_HOSTNAME", "duplicate")]))
                 env.subst = lambda key: "tbeam-station"
                 with self.assertRaisesRegex(ValueError, "environment"):
                     load_rf_profile.apply_profile(env)
