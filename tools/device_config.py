@@ -81,9 +81,10 @@ def load_devices(path: Path, groups: dict[str, dict]) -> dict[str, dict]:
             hostname = device.get("hostname")
             if not isinstance(hostname, str) or not re.fullmatch(r"[a-z](?:[a-z0-9-]{0,29}[a-z0-9])?", hostname):
                 raise ConfigError(f"{name}: hostname 必須是 1..31 字元小寫 DNS 名稱，不含 .local、空格或底線")
-            if hostname in hostnames:
+            if hostname != "auto" and hostname in hostnames:
                 raise ConfigError(f"hostname 重複：{hostname}")
-            hostnames.add(hostname)
+            if hostname != "auto":
+                hostnames.add(hostname)
         elif "hostname" in device:
             raise ConfigError(f"{name}: hostname 只適用 Station")
         if role == "client" and "client" in device:
@@ -116,7 +117,7 @@ def summary(device: dict, groups: dict[str, dict]) -> dict:
         "rf_group": group["name"], "rf_group_id": group["id"], "frequency_mhz": group["frequency_mhz"],
         "paired_client": device.get("client"),
         "hostname": device.get("hostname"),
-        "local_url": f"http://{device['hostname']}.local/" if "hostname" in device else None,
+        "local_url": f"http://{device['hostname']}.local/" if device.get("hostname") not in (None, "auto") else None,
     }
 
 
@@ -126,6 +127,8 @@ def print_device(item: dict) -> None:
     print(f"  RF {item['rf_group']} (id {item['rf_group_id']}, {item['frequency_mhz']:.1f} MHz){pairing}")
     if item["local_url"]:
         print(f"  固定區網網址：{item['local_url']}")
+    elif item["hostname"] == "auto":
+        print("  固定區網網址：http://shore-<完整 Wi-Fi MAC>.local/（開機後由 /api/track.hostname 確認）")
 
 
 def main(argv: list[str] | None = None) -> int:

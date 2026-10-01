@@ -75,7 +75,8 @@ def apply_profile(env) -> None:
         if device["role"] == "station":
             if _has_define(env.get("CPPDEFINES", []), "SHORE_STATION_HOSTNAME"):
                 raise ValueError("SHORE_STATION_HOSTNAME is already defined; use the device manifest")
-            env.Append(CPPDEFINES=[("SHORE_STATION_HOSTNAME", '\\"' + device["hostname"] + '\\"')])
+            if device["hostname"] != "auto":
+                env.Append(CPPDEFINES=[("SHORE_STATION_HOSTNAME", '\\"' + device["hostname"] + '\\"')])
             client = devices[device["client"]]
             if "radio_id" in client:
                 env.Append(CPPDEFINES=[("SHORE_DEFAULT_CLIENT_ID", str(client["radio_id"]))])

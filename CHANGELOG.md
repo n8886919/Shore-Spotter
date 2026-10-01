@@ -9,6 +9,13 @@
 
 ## 未發行
 
+- **2026-10-02 Station MAC 固定網址（V4 USB 已部署）**：device config 的 `hostname: "auto"`
+  選擇既有完整 Wi-Fi MAC 命名路徑；範例與本機 V4 改採 auto，保留自訂 hostname。
+  多台 auto 不視為重名，只有實際自訂名需唯一；`plan` 不以 USB serial 冒充 Wi-Fi MAC。
+  config 6 tests、V4 build 通過；app-only 燒錄 hash 驗證成功，API 回報 MAC 名稱，
+  電腦瀏覽器以新 `.local` 名稱開啟控制頁成功，RF 收包恢復。手機熱點端尚待驗收。
+  T096 2 Hz 缺口已補程式對照紀錄，本次未變更其 GNSS／RF 排程。
+
 - **2026-10-02 每台 Station 固定名稱（V4 USB 已部署）**：device manifest 新增必填 `hostname`，
   檢查 DNS 格式與唯一性；`SHORE_DEVICE` 將名稱帶入 Wi-Fi／mDNS／OTA，並宣告 HTTP service。
   通用 Station build 改採完整 MAC 後綴，避免多板使用同一名稱。`/api/track.hostname` 與 `plan`

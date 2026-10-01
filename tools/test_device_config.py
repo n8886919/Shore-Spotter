@@ -60,7 +60,7 @@ class DeviceConfigTest(unittest.TestCase):
             listed = subprocess.run(command + ["list"], text=True, capture_output=True, check=True)
             self.assertIn("station-v4", listed.stdout)
             self.assertIn("RF B (id 1, 923.8 MHz)", listed.stdout)
-            self.assertIn("http://shore-b.local/", listed.stdout)
+            self.assertIn("shore-<完整 Wi-Fi MAC>.local/", listed.stdout)
             planned = subprocess.run(command + ["plan", "station-v4"], text=True, capture_output=True, check=True)
             self.assertIn("配對 Client t096-client", planned.stdout)
             self.assertIn("SHORE_DEVICE=station-v4 pio run -e heltec-v4-station", planned.stdout)
@@ -96,12 +96,17 @@ class DeviceConfigTest(unittest.TestCase):
                 with self.assertRaisesRegex(device_config.ConfigError, "hostname"):
                     self._load_data(devices, GROUPS)
         devices = copy.deepcopy(DEVICES["devices"])
+        devices[0]["hostname"] = "shore-b"
         devices.append(dict(devices[0], name="station-other", usb_serial="OTHER"))
         with self.assertRaisesRegex(device_config.ConfigError, "hostname 重複"):
             self._load_data(devices, GROUPS)
         devices[2].update(hostname="a" * 31, client="client-other", rf_group="A")
         devices.append(dict(devices[1], name="client-other", usb_serial="CLIENTOTHER", rf_group="A"))
         self.assertEqual(len(self._load_data(devices, GROUPS)), 4)
+        devices[0]["hostname"] = devices[2]["hostname"] = "auto"
+        parsed = self._load_data(devices, GROUPS)
+        self.assertEqual(len(parsed), 4)
+        self.assertIsNone(device_config.summary(parsed["station-v4"], device_config.load_groups(ROOT / "config/rf-groups.json"))["local_url"])
         devices[1]["hostname"] = "client-host"
         with self.assertRaisesRegex(device_config.ConfigError, "hostname 只適用 Station"):
             self._load_data(devices, GROUPS)
@@ -130,7 +135,12 @@ class DeviceConfigTest(unittest.TestCase):
                 load_rf_profile.apply_profile(env)
                 self.assertIn(("SHORE_RF_GROUP", "1"), env["CPPDEFINES"])
                 self.assertIn(("SHORE_DEFAULT_CLIENT_ID", "4660"), env["CPPDEFINES"])
-                self.assertIn(("SHORE_STATION_HOSTNAME", '\\"shore-b\\"'), env["CPPDEFINES"])
+                self.assertFalse(any(d[0] == "SHORE_STATION_HOSTNAME" for d in env["CPPDEFINES"]))
+                devices["devices"][0]["hostname"] = "shore-b"
+                (root / "config/devices.local.json").write_text(json.dumps(devices))
+                named = FakeEnv("B")
+                load_rf_profile.apply_profile(named)
+                self.assertIn(("SHORE_STATION_HOSTNAME", '\\"shore-b\\"'), named["CPPDEFINES"])
                 with self.assertRaisesRegex(ValueError, "SHORE_STATION_HOSTNAME is already defined"):
                     load_rf_profile.apply_profile(FakeEnv("B", [("SHORE_STATION_HOSTNAME", "duplicate")]))
                 env.subst = lambda key: "tbeam-station"

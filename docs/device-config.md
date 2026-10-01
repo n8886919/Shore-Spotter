@@ -12,8 +12,9 @@
 - `environment`：對應的 PlatformIO environment。
 - `usb_serial`：僅作 USB 裝置辨識；不可重複，工具不會開啟 serial port。
 - `rf_group`：`rf-groups.json` 內的組別名稱，目前為 `A` 或 `B`。
-- Station 的 `hostname`：每台唯一的小寫 DNS 名稱，例如 `shore-b`；不填 `.local`。
-  1–31 字元（配合目前 ESP32 網路函式庫的長度限制），只接受英數與中間的連字號，名稱必須以英文字母開頭；Client 不使用此欄位。
+- Station 的 `hostname`：建議填 `auto`，由完整 Wi-Fi MAC 產生固定名稱。
+  也可自訂如 `shore-b`，不填 `.local`；1–31 字元（ESP32 網路函式庫上限），只接受小寫英數與中間的連字號，
+  以英文字母開頭。`auto` 為保留值；Client 不使用此欄位。
 - Station 的 `client`：配對 Client 的 **device name**。兩端必須在同一 RF group；一個 Client 不可被兩個 Station 配對。
 
 範例以 Heltec V4 Station 與 T096 Client 同在 B 示範，USB serial 是待替換的 placeholder。
@@ -44,16 +45,17 @@ Client 可增加 `radio_id` 整數欄位（取自實際 USB 開機訊息，不�
 
 ## Station 固定名稱
 
-`SHORE_DEVICE=station-v4` 會把該設備的 `hostname` 編入韌體，Wi-Fi DHCP hostname、
-mDNS／HTTP service 與 OTA 共用同一名稱。範例 `shore-b` 的入口為 `http://shore-b.local/`；
-它是設備身份，不隨 RF group、家中 Wi-Fi 或熱點分配的 IP 改變。改名後需重新 build／燒錄。
-工具拒絕同一 manifest 中的重名；不同 manifest 的名稱也應由管理者避免重複。
+`hostname: "auto"` 讓每台 Station 在開機時讀取自己的完整 Wi-Fi MAC，
+產生 `shore-<12位小寫hex>`，例如示意 MAC `00:11:22:33:44:55` 對應
+`http://shore-001122334455.local/`。不使用冒號，也不從 USB serial 猜 MAC。
+同一份通用韌體燒到不同板子會得到不同名稱；換 Wi-Fi／IP／RF group 不改名。
 
-沒有指定 `SHORE_DEVICE` 的通用 Station build 以完整 Wi-Fi MAC 產生 `shore-<12位hex>`，
-不再讓所有 Station 共用 `shore-spotter-station`。`GET /api/track` 的 `hostname` 回報當前名稱，
-`plan` 也列出 `.local` 網址。現有 IP 網址仍可直接使用。
+自訂 `hostname` 則由 `SHORE_DEVICE` 編入名稱。Wi-Fi DHCP hostname、mDNS／HTTP service 與 OTA
+共用結果；`GET /api/track.hostname` 回報實際名稱。`plan` 對 auto 只列格式，沒有假稱查到硬體 MAC。
+工具拒絕重複的自訂名稱；多台 `auto` 合法。沒有指定 `SHORE_DEVICE` 的通用 Station build 也使用 MAC。
+變更命名方式或自訂名需重新 build／燒錄；更換實體板子後 MAC 網址會變，桌面捷徑需更新。
 
 `.local` 依賴區網 mDNS；韌體保存名稱不代表每一種手機的熱點主機端都能解析。
-2026-10-02 已在目前家中網路，由電腦瀏覽器以 `http://shore-b.local/` 開啟 V4 控制頁成功。
-接著需由開熱點的同一支手機實測，成功後再將名稱網址加入主畫面。
+2026-10-02 已在目前家中網路，由電腦瀏覽器分別以 V4 原自訂名稱、後續燒錄的 MAC 名稱成功開啟控制頁。
+手機熱點端仍需由開熱點的同一支手機實測，再將名稱網址加入主畫面。
 目前沒有新增雲端 IP 登記服務，也沒有改 Wi-Fi 帳密／追蹤更新率。

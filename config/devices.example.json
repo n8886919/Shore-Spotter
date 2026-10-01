@@ -5,7 +5,7 @@
       "name": "station-v4",
       "board": "heltec-v4",
       "role": "station",
-      "hostname": "shore-b",
+      "hostname": "auto",
       "environment": "heltec-v4-station",
       "usb_serial": "EXAMPLE_V4_USB_SERIAL",
       "rf_group": "B",
