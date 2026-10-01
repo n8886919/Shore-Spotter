@@ -28,34 +28,31 @@ class HttpGate {
   uint32_t epoch_ = 0, sequence_ = 0;
 };
 
-// Legacy LoRa lacks a boot/session id. While connected, reject duplicates and
-// backwards seq. After a gap, require two advancing candidates before rebinding
-// the baseline (supports client reboot without accepting a lone late packet).
+// Single transmitter, no retries/queued history. A >=3 s DATA gap explicitly
+// starts a new sequence baseline on the first valid fix. This deliberately
+// cannot distinguish reboot from an outage or authenticate a replay.
+// Within a connected interval, keep rejecting duplicate/backward sequences.
 class RadioSequence {
  public:
-  bool accept(uint16_t seq, uint32_t now) {
-    if (!have_) { commit(seq, now); return true; }
-    if (now - acceptedMs_ < 2500) {
-      const uint16_t delta = seq - sequence_;
-      if (!delta || delta >= 0x8000) return false;
+  static constexpr uint32_t kResetGapMs = 3000;
+  bool accept(uint16_t seq, uint32_t now, bool validFix = true) {
+    resetAfterGap_ = false;
+    if (!have_ || now - acceptedMs_ >= kResetGapMs) {
+      if (!validFix) return false;
+      resetAfterGap_ = have_;
       commit(seq, now); return true;
     }
-    const uint16_t delta = seq - candidate_;
-    if (candidateValid_ && now - candidateMs_ >= 250 && now - candidateMs_ < 2000 &&
-        delta && delta < 0x8000) {
-      commit(seq, now); return true;
-    }
-    if (!candidateValid_ || now - candidateMs_ >= 2000) {
-      candidate_ = seq; candidateMs_ = now; candidateValid_ = true;
-    }
-    return false;
+    const uint16_t delta = seq - sequence_;
+    if (!delta || delta >= 0x8000) return false;
+    commit(seq, now); return true;
   }
+  bool resetAfterGap() const { return resetAfterGap_; }
  private:
   void commit(uint16_t seq, uint32_t now) {
-    have_ = true; sequence_ = seq; acceptedMs_ = now; candidateValid_ = false;
+    have_ = true; sequence_ = seq; acceptedMs_ = now;
   }
-  bool have_ = false, candidateValid_ = false;
-  uint16_t sequence_ = 0, candidate_ = 0;
-  uint32_t acceptedMs_ = 0, candidateMs_ = 0;
+  bool have_ = false, resetAfterGap_ = false;
+  uint16_t sequence_ = 0;
+  uint32_t acceptedMs_ = 0;
 };
 }  // namespace command_freshness

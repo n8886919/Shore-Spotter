@@ -2,17 +2,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-namespace async_lora_ack {
+namespace async_lora_tx {
 enum class Event : uint8_t { None, Started, Sent, Failed, Timeout, Cancelled };
 struct Result {
   Event event = Event::None;
   int16_t txStatus = 0;
-  int16_t rxStatus = 0;
 };
 
-// Radio uses the RadioLib startTransmit/getIrqFlags/finishTransmit/startReceive
+// Radio uses the RadioLib startTransmit/getIrqFlags/finishTransmit
 // interface. Keeping the lifecycle here lets native tests drive the real logic
-// with a fake radio, including IRQ ordering and failure recovery.
+// with a fake radio. finishTransmit returns to standby; this one-way Client
+// never enters RX or waits for a Station acknowledgement.
 template <typename Radio>
 class Transmitter {
  public:
@@ -25,7 +25,7 @@ class Transmitter {
 
   Result start(const uint8_t *data, size_t length, uint32_t nowMs,
                uint32_t timeoutMs) {
-    if (active_) return {};  // no ACK queue and no overwriting a transmission
+    if (active_) return {};  // no queue and no overwriting a transmission
     irq_ = false;
     startedMs_ = nowMs;
     timeoutMs_ = timeoutMs;
@@ -61,13 +61,11 @@ class Transmitter {
       event = Event::Failed;
       status = finished;
     }
-    // Clear the old TX interrupt BEFORE restarting RX. A fresh RxDone raised
-    // during startReceive must remain available for the main loop to consume.
+    // Clear the completed TX notification before the next transmission.
     irq_ = false;
     Result result;
     result.event = event;
     result.txStatus = status;
-    result.rxStatus = radio_.startReceive();
     return result;
   }
 
@@ -80,4 +78,4 @@ class Transmitter {
   uint32_t timeoutMs_ = 0;
   bool active_ = false;
 };
-}  // namespace async_lora_ack
+}  // namespace async_lora_tx

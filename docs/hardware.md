@@ -12,6 +12,13 @@
 
 韌體行為見 [features.md](features.md)；封包/HTTP 介面見 [interface.md](interface.md)。
 
+韌體啟動順序：先連接 AXP2101，再設定 ALDO3 為 3300 mV、啟用並讀回確認，
+等待 10 ms 後才執行 LoRa SPI／radio.begin；無線電復原也重新套用與驗證。
+PMU 連線、設定寫入或讀回失敗時不進行 radio 初始化，序列紀錄明示錯誤。
+ALDO4 仍供 GPS；ALDO1 供 OLED／BME280，不因 OLED 睡眠而斷電。
+這是寄存器設定驗證，不代表已量測實際電壓／RF 功率。
+電源通道來源：[LILYGO 官方 T-Beam Supreme 文件](https://wiki.lilygo.cc/products/t-beam-series/t-beam-supreme/)。
+
 ---
 
 # LILYGO T-Beam Supreme - V3.0 / L76K / 915mhz / SX1262
@@ -139,7 +146,7 @@
   1. In shutdown mode, press the PWR button to turn on the power supply
   2. In power-on mode, press the PWR button for 6 seconds (default time) to turn off the power supply
 
-> 韌體用法（本專案）：Client 端**短按 PWR** 喚醒 OLED 顯示狀態 10 秒；**長按 PWR** 顯示關機畫面後由 PMU 斷電。Server 端長按 PWR 同樣為關機。
+> 韌體用法（本專案）：Client 端**短按 PWR** 喚醒 OLED 顯示狀態 10 秒；**長按 PWR** 顯示關機畫面後由 PMU 斷電。Station 端長按 PWR 同樣為關機。Client 第一次完整讀取／清除啟動 IRQ 只建立基準；其後新的按下沿，在動畫／資訊頁內也能接受一般短／長按。初始殘留或持續按住開機鍵不算新按壓；硬體長按關斷仍由 PMU 自身設定決定，韌體未更改該設定。
 
 # GXServo Brushless 42KG (QY3242BLS / GX3242)
 
@@ -153,7 +160,8 @@
 > 若日後把 servo 上下顛倒重裝，方向會反轉，追蹤會往錯的方向跑（surfer 往左、鏡頭往右），
 > 而且**不會有任何錯誤訊息**。重裝機構後請務必重驗：
 >
-> 手動模式把滑桿從 90 拉到 120，從上方看相機應該**逆時針**轉。若變成順時針，
+> 目前網頁滑桿採 `raw = 180 - ui`；手動從顯示 90 拉到 120，內部為 90→60，
+> 從上方看相機應該**順時針**轉。若與此相反，
 > 就要先修正安裝方向或控制幾何，再重新用鏡頭指南針校正；目前校正僅存 RAM，
 > 已無 `SERVO_CAL_VERSION` 或校正 NVS 版本需要更新。
 
@@ -190,7 +198,8 @@
 目前只使用黏在鏡頭上的普通磁針指南針；韌體不初始化／取樣板上 QMC，不做 hard-iron，
 也不保存板上校正到 NVS。上方表格仍記錄板子實際裝有的元件與位址。
 
-手動時輸入北 0°、東 90°等讀數，RAM 保存 `mount_offset = compass_bearing + servo_angle`。
+先按「回到 90°」切為手動，等鏡頭停穩再輸入北 0°、東 90°、南 180°、西 270°等讀數。
+校正僅接受 Servo 命令位置與目標均為 90°、不再移動；RAM 保存 `mount_offset = compass_bearing + servo_angle`。
 GPS 追蹤以 `servo_angle = mount_offset + declination - true_bearing` 計算，維持原本
 Servo 角度增加為逆時針的方向；台灣磁偏角依 GPS 位置／日期自動換算。
 
@@ -224,9 +233,9 @@ Servo 直供為 2026-09-09 使用者確認；2000 mAh × 35C 對應標稱 70 A�
 
 ## 電源與電量量測
 
-- **Server**：2S 經 Type-C 變壓供 USB-C（PMU 視為 VBUS），同時板載 **18650** 作備援 → 像手機插著電使用。
+- **Station**：2S 經 Type-C 變壓供 USB-C（PMU 視為 VBUS），同時板載 **18650** 作備援 → 像手機插著電使用。
 - **Client**：板載 **18650** 單獨供電。
-- 板上 **AXP2101 只量得到 18650（單 cell）**；2S 無法直接讀（對 Server 只是 VBUS）。
+- 板上 **AXP2101 只量得到 18650（單 cell）**；2S 無法直接讀（對 Station 只是 VBUS）。
 - 電量 %：**3.2V=0%、4.15V=100%**（線性）。低於 3.2V 自動關機；**接 USB（VBUS 在）時不關機**，Type-C 失效改吃 18650 過低才關（保險）。
 - 接 USB/Type-C 時 OLED 與網頁顯示 **⚡**；「插著 Type-C 仍回報 18650 電壓」為正常。
 - 18650 為 LilyGO 板載電池，亦是 GPS 熱啟動備援電源。
@@ -236,3 +245,17 @@ Servo 直供為 2026-09-09 使用者確認；2000 mAh × 35C 對應標稱 70 A�
 使用 3.3 V USB-to-TTL：TX 接 GPIO44、RX 接 GPIO43，共地，獨立供電時不接 VCC。
 UART2 為 115200 8N1，與 GPS 的 UART1（GPIO9/8）分開。控制規則見
 [uart-servo.md](uart-servo.md)。鏡頭上的磁針指南針跟著鏡頭轉；板上 QMC 不參與控制。
+
+
+## 目前 GNSS／RX 設定（2026-09-19，待實機驗證）
+
+本版依 L76K 設定 115200 baud、500 ms 更新間隔，只開 RMC＋GGA；沒有使用 PMTK，
+也未宣稱支援表中另一款 u-blox M10 的設定命令。先送 9600→115200 切換命令，再於
+115200 重送，涵蓋冷啟動與 MCU 重啟但 GNSS 仍供電。未將設定另存 GNSS flash。
+L76K 原廠要求 >1 Hz 時僅開一種 NMEA 語句；本版雙語句是使用者確認的驗證選擇，
+必須在序列／診斷核對實際 epoch、RMC、GGA Hz，而非看到命令送出就認定已成功。
+來源：[Quectel L76K 協定，第 22–23 頁](https://forums.quectel.com/uploads/short-url/kmb3zNuV2SldThkOOJoNg9th40S.pdf)。
+
+Station 每次初始化／復原開啟 SX1262 boosted RX gain，較高接收耗電用於接收性能，
+不是提高 Client 發射功率，也不能保證穿透水、人體、地形遮蔽。這次只驗證設定路徑與錯誤處理；
+實際改善幅度須同位置、天線、姿態、頻率與 SF 的現場對照。ALDO3 讀回亦非供電電壓實測。

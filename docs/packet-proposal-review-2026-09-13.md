@@ -5,8 +5,8 @@
 17-byte v4 DATA、來源 age、向量有效性、獨立 DATA 序號及非阻塞 RF 2 Hz 排程，
 另有低頻 Client 診斷與網頁匯出。GNSS 真實 2 Hz 尚待模組實測，沒有硬送更新率命令。
 現行格式以 [interface.md](interface.md)／[protocol.h](../include/protocol.h) 為準，
-實作與驗證狀態見 [CHANGELOG](../CHANGELOG.md)。後續 Server 已 OTA、Client 已 USB 燒錄；
-v4 上行收包與 Server ACK 發送已實測，Client ACK 接收仍待驗；尚未切頻或量測
+實作與驗證狀態見 [CHANGELOG](../CHANGELOG.md)。後續 Station 已 OTA、Client 已 USB 燒錄；
+v4 上行收包與 Station ACK 發送已實測，Client ACK 接收仍待驗；尚未切頻或量測
 戶外定位／機械追蹤效果，詳見 [通訊測試](link-test-2026-09-13.md)。
 
 原審核依當時工作目錄（包含未提交變更）、RadioLib／TinyGPSPlus 及 GNSS 原廠文件。
@@ -14,7 +14,7 @@ v4 上行收包與 Server ACK 發送已實測，Client ACK 接收仍待驗；尚
 ## 結論
 
 **可以精簡，但不核准原 17-byte 提案直接定稿，也不核准只改 500 ms 就宣稱完整定位 2 Hz。**
-移除空 MAC、加速度、固定 group／Server ID 是合理刪減。真正影響追蹤的來源資料年齡、
+移除空 MAC、加速度、固定 group／Station ID 是合理刪減。真正影響追蹤的來源資料年齡、
 速度有效性和定位狀態，不能為湊 17 bytes 而省略。
 
 我的首選是 **18-byte DATA**：保持約 0.1 m 座標量化、速度／方向、HDOP，壓縮衛星分級，
@@ -44,7 +44,7 @@ v4 上行收包與 Server ACK 發送已實測，Client ACK 接收仍待驗；尚
 
 ### 1. 接收年齡不是定位年齡（P1）
 
-`buildDataPacket()` 允許來源位置 age 未滿 2 秒，Server 的 `haveBearingFix()`／
+`buildDataPacket()` 允許來源位置 age 未滿 2 秒，Station 的 `haveBearingFix()`／
 `gpsModeAvailable()` 再以收到後未滿 2 秒為門檻。最差可用到接近 **4 秒＋airtime**
 之前的資料；每 500 ms 重發同一筆定位只會得到新封包序號，不會變成新定位。
 
@@ -59,7 +59,7 @@ TinyGPS 的 age 是解析更新後時間，仍不是精確 GNSS 測量 epoch；�
 ### 2. 速度向量的有效性未定義（P1）
 
 目前 `buildDataPacket()` 對 speed／course 只有 `isValid()`，沒有 `.age()`。
-如果 GGA 繼續、RMC 停止，可形成「新位置＋舊速度／方向」，Server 卻繼續外推。
+如果 GGA 繼續、RMC 停止，可形成「新位置＋舊速度／方向」，Station 卻繼續外推。
 course 缺漏初始化為 0，也會被誤解為向北。
 
 新增 `velocity_valid`：速度、方向都有效、新鮮，且與位置時間可接受地一致時才置 1。
@@ -74,11 +74,11 @@ course 缺漏初始化為 0，也會被誤解為向北。
 
 既有追蹤門檻：Good 為 fix、衛星 ≥8、HDOP ≤1.5；OK 為 fix、衛星 ≥6、HDOP ≤3。
 只保留「八顆以上」會失去 OK 類別，並且無法取代 HDOP。建議使用 2-bit 衛星分級
-（未知／0–5／6–7／≥8），另外保留 fix 與 velocity_valid，Server 繼續判斷門檻。
+（未知／0–5／6–7／≥8），另外保留 fix 與 velocity_valid，Station 繼續判斷門檻。
 
 ### 4. 遙測會吃掉 ACK 序號（P1）
 
-目前 DATA 與 TEL 共用 `txSeq++`，Server 以 `seq % ACK_EVERY_N == 0` 決定 ACK。
+目前 DATA 與 TEL 共用 `txSeq++`，Station 以 `seq % ACK_EVERY_N == 0` 決定 ACK。
 若改成 N=8 且 2 Hz，以下情況會漏掉整次 ACK：
 
 ```text
@@ -183,7 +183,7 @@ T(n) = [20.25 + 5 × ceil((8n + 8) / 36)] × 4.096 ms
 因此若堅持 2 Hz，TEL 獨立包的排程需要實際重設，不能照搬現有 fallback。
 
 `computeAirtimeBudget()` 算不下時會放寬窗口到整個 interval，這可跨下次 deadline。
-Client 的 blocking transmit 在失敗時等待約 5 倍 airtime，Server ACK 也有較長 timeout；
+Client 的 blocking transmit 在失敗時等待約 5 倍 airtime，Station ACK 也有較長 timeout；
 正常平均算得下不代表故障時仍每 500 ms 到點。要定義過期工作跳過、不積欠補發，並驗證 RX 恢復。
 
 提高 UART 至 115200 後，1024-byte buffer 在滿線速約 89 ms 填滿，而 TX 正常阻塞約
@@ -196,8 +196,8 @@ Client 的 blocking transmit 在失敗時等待約 5 倍 airtime，Server ACK �
   接收路徑又可能先截短，不能直接移植成 v4 strict parser。端點、短包、長包、未知 type 必須拒收。
 - signed24 差值要先判斷範圍再編碼，接收要 sign extension；不能取低 24 bits 後讓超界位置回繞。
   零 offset 是 24N121E，不能當無定位。不得因刪 fix 而產生看似有效的假位置。
-- 現在 NETWORK_ID／SERVER_ID 已是固定常數，刪除不會憑空失去本來不存在的每站唯一性。
-  但所有新 Server 都預設綁 E91C，若同時啟用便可能搶回同一 Client；必須實際確認每套配對。
+- 現在 NETWORK_ID／STATION_ID 已是固定常數，刪除不會憑空失去本來不存在的每站唯一性。
+  但所有新 Station 都預設綁 E91C，若同時啟用便可能搶回同一 Client；必須實際確認每套配對。
   MAC 後 16 bits 的 nodeId 不是全域唯一，還需處理 0／FFFF 保留值與 ID 衝突。
 - 換協定預期 v3／v4 互不接受，兩端協調更新並保留回復方式。無需為此先建多版本自動協商系統。
 - 頻道掃描應標為「CAD 偵測比例、RSSI 統計、取樣時間」，不是「保證乾淨」或完整占用率。

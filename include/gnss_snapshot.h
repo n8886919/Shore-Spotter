@@ -12,6 +12,8 @@ constexpr uint32_t kDayMs = 86400000;
 constexpr uint32_t kBacklogAllowanceMs = 200;
 constexpr uint8_t kUnknownSatellites = 255;
 constexpr const char *kAgeOrigin = "nmea_epoch_aligned_arrival";
+constexpr uint32_t kRecoveryAgeMs = 2000;
+constexpr uint32_t kRecoverySpanMs = 2000;
 
 struct Snapshot {
   double lat = 0.0, lon = 0.0;
@@ -20,6 +22,7 @@ struct Snapshot {
   uint8_t satellites = kUnknownSatellites;
   double hdop = NAN;
   uint32_t sourceAgeMs = UINT32_MAX, epochMsOfDay = 0;
+  uint32_t arrivalAgeMs = UINT32_MAX;  // since first receipt of this NEW epoch; no clock alignment
   uint32_t ageUncertaintyMs = kBacklogAllowanceMs;
   bool haveEpoch = false;
   bool haveRmc = false, haveGga = false;
@@ -31,6 +34,7 @@ struct Counters {
   uint32_t rmcSentences = 0, ggaSentences = 0, checksumErrors = 0;
   uint32_t snapshots = 0, lastEpochIntervalMs = 0;
   uint32_t ignoredSentences = 0;
+  uint32_t missingTime = 0, timeResyncs = 0;
 };
 
 class Collector {
@@ -46,8 +50,14 @@ class Collector {
   const Counters &counters() const { return counters_; }
   const Counters &stats() const { return counters_; }
   uint32_t backlogAllowanceMs() const { return allowanceMs_; }
+  uint32_t byteAgeMs(uint32_t now) const { return haveByte_ ? now - lastByteMs_ : UINT32_MAX; }
+  uint32_t sentenceAgeMs(uint32_t now) const { return haveSentence_ ? now - lastSentenceMs_ : UINT32_MAX; }
+  uint32_t advanceAgeMs(uint32_t now) const { return haveAdvance_ ? now - lastAdvanceMs_ : UINT32_MAX; }
+  bool recovering() const { return recovery_.present; }
 
   void feed(char ch, uint32_t now) {
+    haveByte_ = true;
+    lastByteMs_ = now;
     if (ch == '$') {
       collecting_ = true;
       length_ = 0;
@@ -66,11 +76,13 @@ class Collector {
     if (static_cast<unsigned char>(ch) < 32 ||
         static_cast<unsigned char>(ch) > 126) {
       collecting_ = false;
+      recovery_ = Recovery{};
       ++counters_.rejectedSentences;
       return;
     }
     if (length_ + 1 >= sizeof(line_)) {
       collecting_ = false;
+      recovery_ = Recovery{};
       ++counters_.overflows;
       ++counters_.rejectedSentences;
       return;
@@ -81,16 +93,10 @@ class Collector {
   bool sample(uint32_t now, Snapshot &out) const {
     out = Snapshot{};
     if (!current_.present) return false;
-    // RMC and GGA travel sequentially over UART. During the short interval
-    // before the newest GGA arrives, retain an older coherent sample with its
-    // ORIGINAL age instead of fabricating missing quality every other RF tick.
-    // Explicit invalidity always wins. A newest GGA without RMC is useful as
-    // position/quality only and must not borrow an older velocity vector.
-    const bool holdPrevious = current_.rmc && current_.rmcFix &&
-        !current_.invalidRmc && !current_.invalidGga && !current_.gga &&
-        previous_.present && previous_.gga && previous_.ggaFix &&
-        !previous_.invalidRmc && !previous_.invalidGga;
-    const Epoch &e = holdPrevious ? previous_ : current_;
+    // Expose the latest epoch; Client cadence owns its bounded RMC/GGA wait.
+    // Never borrow previous position/quality/velocity when a sentence is absent.
+    const Epoch &e = current_;
+    out.arrivalAgeMs = now - e.arrival;
     out.haveEpoch = true;
     out.ageUncertaintyMs = allowanceMs_;
     out.epochMsOfDay = e.utc;
@@ -128,6 +134,7 @@ class Collector {
     current_ = Epoch{};
     previous_ = Epoch{};
     invalidated_ = true;
+    recovery_ = Recovery{};
     ++counters_.invalidations;
   }
 
@@ -141,13 +148,51 @@ class Collector {
  private:
   struct Epoch {
     bool present = false;
-    uint32_t utc = 0, origin = 0;
+    uint32_t utc = 0, origin = 0, arrival = 0;
     bool rmc = false, gga = false, rmcFix = false, ggaFix = false;
     bool invalidRmc = false, invalidGga = false, rmcVelocity = false;
     double rmcLat = 0, rmcLon = 0, ggaLat = 0, ggaLon = 0;
     double speed = 0, course = 0, hdop = NAN;
     uint8_t satellites = kUnknownSatellites;
   };
+  struct Recovery {
+    bool present = false;
+    uint32_t firstUtc = 0, firstArrival = 0, utc = 0, arrival = 0;
+    uint32_t count = 0;
+  };
+
+  // A new clock mapping needs multiple measured fixes arriving at the GNSS
+  // cadence over >=2 s. Never refresh a duplicate or drain a burst into a new
+  // baseline. The caller still MUST discard UART backlog on servicing gaps.
+  // A receiver-internal stream replayed at real-time speed is not distinguishable
+  // from live NMEA here; internal receiver latency remains unmeasured.
+  bool recoverTime(uint32_t utc, uint32_t arrival, bool fix, uint32_t duration) {
+    if (!fix || duration > allowanceMs_) { recovery_ = Recovery{}; return false; }
+    if (recovery_.present && utc == recovery_.utc) return false;
+    if (recovery_.present) {
+      const uint32_t step = (utc + kDayMs - recovery_.utc) % kDayMs;
+      const uint32_t elapsed = arrival - recovery_.arrival;
+      const uint32_t span = (utc + kDayMs - recovery_.firstUtc) % kDayMs;
+      const uint32_t wallSpan = arrival - recovery_.firstArrival;
+      const uint32_t error = step > elapsed ? step - elapsed : elapsed - step;
+      const uint32_t spanError = span > wallSpan ? span - wallSpan : wallSpan - span;
+      if (step >= 100 && step <= 2000 && elapsed >= 100 && elapsed <= 2000 &&
+          error <= allowanceMs_ && spanError <= allowanceMs_) {
+        recovery_.utc = utc; recovery_.arrival = arrival; ++recovery_.count;
+        if (recovery_.count >= 3 && wallSpan >= kRecoverySpanMs && span >= kRecoverySpanMs) {
+          counters_.lastEpochIntervalMs = step;
+          recovery_ = Recovery{};
+          current_ = previous_ = Epoch{};
+          haveAnchor_ = false; invalidated_ = false;
+          ++counters_.timeResyncs;
+          return true;
+        }
+        return false;
+      }
+    }
+    recovery_ = Recovery{true, utc, arrival, utc, arrival, 1};
+    return false;
+  }
 
   static int hex(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -223,7 +268,7 @@ class Collector {
     return true;
   }
 
-  Epoch *selectEpoch(uint32_t utc, uint32_t now, uint32_t observedOrigin) {
+  Epoch *selectEpoch(uint32_t utc, uint32_t now, uint32_t observedOrigin, bool fix) {
     if (haveAnchor_) {
       const uint32_t delta = (utc + kDayMs - anchorUtc_) % kDayMs;
       if (delta == 0) {
@@ -242,40 +287,49 @@ class Collector {
         if (!invalidated_ && previous_.present && previous_.utc == utc)
           return &previous_;  // interleaved older counterpart, never latest
         ++counters_.backwardEpochs;
-        return nullptr;
+        if (!recoverTime(utc, now, fix, now - observedOrigin)) return nullptr;
       }
-      counters_.lastEpochIntervalMs = delta;
+      if (haveAnchor_) counters_.lastEpochIntervalMs = delta;
       const uint32_t projectedOrigin = anchorOrigin_ + delta;
       // UTC progression detects late/backlogged epochs. Never stamp them as
       // fresh simply because the bytes were parsed in this service pass.
-      if (static_cast<int32_t>(now - projectedOrigin) >= 0 &&
-          now - projectedOrigin > now - observedOrigin)
-        observedOrigin = projectedOrigin;
+      if (haveAnchor_ && static_cast<int32_t>(now - projectedOrigin) >= 0 &&
+          now - projectedOrigin > now - observedOrigin) {
+        if (now - projectedOrigin >= kRecoveryAgeMs) {
+          if (!recoverTime(utc, now, fix, now - observedOrigin))
+            observedOrigin = projectedOrigin;
+        } else { recovery_ = Recovery{}; observedOrigin = projectedOrigin; }
+      } else if (haveAnchor_) recovery_ = Recovery{};
     }
     previous_ = current_;
     current_ = Epoch{};
     current_.present = true;
     current_.utc = utc;
     current_.origin = observedOrigin;
+    current_.arrival = now;
     anchorUtc_ = utc;
     anchorOrigin_ = observedOrigin;
     haveAnchor_ = true;
     invalidated_ = false;
     ++counters_.snapshots;
+    haveAdvance_ = true; lastAdvanceMs_ = now;
     return &current_;
   }
 
+  bool rejectSentence() { recovery_ = Recovery{}; return false; }
+
   bool consume(uint32_t now) {
     char *star = strchr(line_, '*');
-    if (!star || star - line_ < 6 || strlen(star + 1) != 2) return false;
+    if (!star || star - line_ < 6 || strlen(star + 1) != 2) return rejectSentence();
     const int hi = hex(star[1]), lo = hex(star[2]);
-    if (hi < 0 || lo < 0) { ++counters_.checksumErrors; return false; }
+    if (hi < 0 || lo < 0) { ++counters_.checksumErrors; return rejectSentence(); }
     uint8_t checksum = 0;
     for (char *p = line_ + 1; p < star; ++p) checksum ^= static_cast<uint8_t>(*p);
     if (checksum != ((hi << 4) | lo)) {
       ++counters_.checksumErrors;
-      return false;
+      return rejectSentence();
     }
+    haveSentence_ = true; lastSentenceMs_ = now;
     // GSV/GSA/VTG/TXT etc. are normal GNSS output, not decoder errors.
     // Ignore them before tokenization (some contain more fields than RMC/GGA).
     if (strncmp(line_ + 1, "GNRMC,", 6) != 0 &&
@@ -291,26 +345,28 @@ class Collector {
     fields[count++] = line_ + 1;
     for (char *p = line_ + 1; *p; ++p) {
       if (*p != ',') continue;
-      if (count == sizeof(fields) / sizeof(fields[0])) return false;
+      if (count == sizeof(fields) / sizeof(fields[0])) return rejectSentence();
       *p = '\0';
       fields[count++] = p + 1;
     }
     if (strlen(fields[0]) != 5 || fields[0][0] != 'G' ||
-        (fields[0][1] != 'N' && fields[0][1] != 'P')) return false;
+        (fields[0][1] != 'N' && fields[0][1] != 'P')) return rejectSentence();
     const bool rmc = strcmp(fields[0] + 2, "RMC") == 0;
     const bool gga = strcmp(fields[0] + 2, "GGA") == 0;
-    if ((!rmc && !gga) || (rmc && count < 10) || (gga && count < 10)) return false;
+    if ((!rmc && !gga) || (rmc && count < 10) || (gga && count < 10)) return rejectSentence();
     uint32_t utc;
-    if (!utcTime(fields[1], utc)) return false;
+    if (!utcTime(fields[1], utc)) {
+      ++counters_.missingTime; recovery_ = Recovery{}; return rejectSentence();
+    }
 
     double lat = 0, lon = 0, speed = 0, course = 0, hdop = NAN;
     bool fix = false, velocity = false;
     uint8_t satellites = kUnknownSatellites;
     if (rmc) {
-      if ((strcmp(fields[2], "A") != 0) && (strcmp(fields[2], "V") != 0)) return false;
+      if ((strcmp(fields[2], "A") != 0) && (strcmp(fields[2], "V") != 0)) return rejectSentence();
       fix = fields[2][0] == 'A';
       if (fix && (!coordinate(fields[3], fields[4], true, lat) ||
-                  !coordinate(fields[5], fields[6], false, lon))) return false;
+                  !coordinate(fields[5], fields[6], false, lon))) return rejectSentence();
       // Explicit estimated/manual/simulated/no-fix mode is not a measured fix.
       if (count > 12 && fields[12][0] &&
           strchr("EMNS", fields[12][0])) fix = false;
@@ -319,10 +375,10 @@ class Collector {
       speed *= 1852.0 / 3600.0;
     } else {
       unsigned quality, sats;
-      if (!integer(fields[6], 8, quality)) return false;
+      if (!integer(fields[6], 8, quality)) return rejectSentence();
       fix = quality >= 1 && quality <= 5;
       if (fix && (!coordinate(fields[2], fields[3], true, lat) ||
-                  !coordinate(fields[4], fields[5], false, lon))) return false;
+                  !coordinate(fields[4], fields[5], false, lon))) return rejectSentence();
       if (integer(fields[7], 254, sats)) satellites = static_cast<uint8_t>(sats);
       if (!decimal(fields[8], hdop)) hdop = NAN;
     }
@@ -332,7 +388,8 @@ class Collector {
     const uint32_t duration = observedDuration > serializedMs ? observedDuration : serializedMs;
     // Uncertainty is used by the freshness gate, NEVER as invented elapsed
     // movement in the position predictor. Keep it separate from sourceAgeMs.
-    Epoch *e = selectEpoch(utc, now, now - duration);
+    if (!fix) recovery_ = Recovery{};
+    Epoch *e = selectEpoch(utc, now, now - duration, fix);
     if (!e) return false;
     // The expected RMC+GGA pair is one epoch, not a duplicate transmission.
     if ((rmc && e->rmc) || (gga && e->gga)) ++counters_.duplicateEpochs;
@@ -361,6 +418,9 @@ class Collector {
   size_t length_ = 0;
   uint32_t lineStartMs_ = 0, anchorUtc_ = 0, anchorOrigin_ = 0;
   bool collecting_ = false, haveAnchor_ = false, invalidated_ = false;
+  bool haveByte_ = false, haveSentence_ = false, haveAdvance_ = false;
+  uint32_t lastByteMs_ = 0, lastSentenceMs_ = 0, lastAdvanceMs_ = 0;
+  Recovery recovery_;
   Epoch current_, previous_;
   Counters counters_;
 };

@@ -2,10 +2,16 @@
 #include <stdint.h>
 
 namespace lora_schedule {
+// Two guard intervals are needed to place an extra packet after DATA and
+// before the next slot. At SF10 this is impossible, so reserve a whole slot.
+inline bool dedicatedTelemetrySlot(uint32_t periodMs, uint32_t dataMs,
+                                   uint32_t extraMs, uint32_t guardMs) {
+  return uint64_t(dataMs) + extraMs + 2ULL * guardMs > periodMs;
+}
 inline bool dataFits(uint32_t now, uint32_t nextData, uint32_t dataMs,
-                     uint32_t ackMs, uint32_t guardMs, bool ackCycle) {
+                     uint32_t guardMs) {
   return static_cast<int32_t>(nextData - now) > 0 &&
-         nextData - now >= dataMs + (ackCycle ? ackMs : 0) + guardMs;
+         nextData - now >= dataMs + guardMs;
 }
 // Claim at most one current slot. Missed slots are skipped, never replayed.
 inline bool claim(uint32_t now, uint32_t period, uint32_t &next, uint32_t &skipped) {
@@ -17,25 +23,9 @@ inline bool claim(uint32_t now, uint32_t period, uint32_t &next, uint32_t &skipp
 }
 inline bool telemetryFits(uint32_t now, uint32_t lastDataStart, uint32_t nextData,
                           uint32_t dataMs, uint32_t telemetryMs, uint32_t guardMs,
-                          bool haveData, bool ackCycle) {
-  if (!haveData || ackCycle || static_cast<int32_t>(nextData - now) <= 0) return false;
+                          bool haveData) {
+  if (!haveData || static_cast<int32_t>(nextData - now) <= 0) return false;
   return now - lastDataStart >= dataMs + guardMs &&
          nextData - now >= telemetryMs + guardMs;
 }
-class AckWindow {
- public:
-  void expect(uint16_t seq, uint32_t now, uint32_t lengthMs) {
-    seq_ = seq; started_ = now; length_ = lengthMs; pending_ = true;
-  }
-  void clear() { pending_ = false; }
-  bool pending(uint32_t now) const { return pending_ && now - started_ < length_; }
-  bool accept(uint16_t seq, uint32_t now) {
-    if (!pending_ || seq != seq_ || now - started_ >= length_) return false;
-    pending_ = false; return true;
-  }
- private:
-  uint16_t seq_ = 0;
-  uint32_t started_ = 0, length_ = 0;
-  bool pending_ = false;
-};
 }  // namespace lora_schedule

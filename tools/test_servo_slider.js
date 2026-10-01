@@ -50,7 +50,8 @@ function page(responseMs = 10) {
       return new Promise(resolve => setTimer(() => { --inFlight; resolve(); }, responseMs));
     },
     post(url) { posts.push({ kind: 'mode', at: now, url }); return Promise.resolve(); },
-    refresh: () => Promise.resolve()
+    refresh: () => Promise.resolve(),
+    renderServoRing(){},cancelRingGesture(){}
   };
   vm.createContext(context);
   vm.runInContext(script, context);
@@ -78,16 +79,14 @@ function page(responseMs = 10) {
     release: v => event('change', v), maxInFlight: () => maxInFlight };
 }
 
-test('manual ramp keeps the slider target and blocks compass calibration until settled', () => {
+test('manual ramp keeps the slider target without locking calibration', () => {
   const p = page();
   p.context.applyMode({ mode: 'manual', angle: 95, target: 120, moving: true });
   assert.equal(p.context.$('sld').value, 60);
   assert.equal(p.context.$('sld').disabled, false);
-  assert.equal(p.context.$('btnCompassCal').disabled, true);
-  assert.match(p.context.$('controlState').textContent, /85° → 60°/);
-  p.context.applyMode({ mode: 'manual', angle: 120, target: 120, moving: false });
   assert.equal(p.context.$('btnCompassCal').disabled, false);
-  assert.equal(p.context.$('controlState').textContent, '手動');
+  p.context.applyMode({ mode: 'manual', angle: 120, target: 120, moving: false, pwm_ok: false });
+  assert.equal(p.context.$('btnCompassCal').disabled, false);
 });
 
 test('mode polling preserves active drag and still disables manual controls for GPS and UART', () => {
@@ -99,7 +98,7 @@ test('mode polling preserves active drag and still disables manual controls for 
   for (const mode of ['gps', 'uart']) {
     p.context.applyMode({ mode, source: mode, angle: 95, target: 120 });
     assert.equal(p.context.$('sld').disabled, true);
-    assert.equal(p.context.$('btnCompassCal').disabled, true);
+    assert.equal(p.context.$('btnCompassCal').disabled, false);
   }
 });
 

@@ -1,6 +1,6 @@
 # GPS / UART 獨立控制
 
-正式映像為 `tbeam-server`。開機 Servo 置中 90°，初始化完成後預設 UART，等待新的完整 SET。
+正式映像為 `tbeam-station`。開機 Servo 置中 90°，初始化完成後預設手動。
 網頁選「手動／GPS／UART」，只有所選模式能控制 Servo，訊號變差不切換到另一模式。
 UART 模式可由 Jetson 或其他 3.3 V TTL 控制端使用。Wi-Fi 提供監控頁、手動 HTTP
 控制與 OTA；外部 UDP 控制已移除。
@@ -8,7 +8,7 @@ UART 模式可由 Jetson 或其他 3.3 V TTL 控制端使用。Wi-Fi 提供監�
 | 模式 | 行為 | 訊號失效 |
 |---|---|---|
 | 手動 | slider 控制；GPS／UART 均不自動移動 | 保持最後輸出角度 |
-| GPS | 使用單一綁定 client 的位置與鏡頭指南針校正 | 保持，不切 UART |
+| GPS | 使用單一綁定 client 的位置與鏡頭指南針校正 | 停止外推，轉完最後有效目標再停住，不切 UART |
 | UART | 僅使用 UART SET，不要求 GPS 或指南針校正 | SET 過期後保持，不切 GPS |
 
 切換模式會清除舊目標、關閉舊 UART session。只在 UART 模式開啟 UART；重新進入後
@@ -29,7 +29,7 @@ UART2，115200 8N1；GPS 使用另一組 UART1（RX9/TX8）。
 SET 90000
 ```
 
-Server 開機預設 UART，初始化完成後等待新 SET；資訊頁速限 1–90°/s，修改自動保存。
+Station 開機預設手動，切到 UART 後等待新 SET；資訊頁速限 1–90°/s，修改自動保存。
 單位毫度，範圍 0..180000。建議持續 20 Hz；不再需要 ARM，也不再接受 STOP。
 停送 SET 後，最後有效指令滿 250 ms 便撤銷 UART 目標。新 SET 可直接恢復，第一步
 從最後輸出角度開始；預設限速 30°/s；所有模式按微秒實際時間推進，只共用最高速度限制。
@@ -43,15 +43,22 @@ Server 開機預設 UART，初始化完成後等待新 SET；資訊頁速限 1�
 
 ## GPS 與鏡頭校正
 
-GPS 按鈕與 API 要求兩端 Good／OK：衛星 ≥6、HDOP ≤3、位置／品質未滿 2 秒；
-Bad／Miss 不可選。追蹤另需鏡頭校正、有效磁偏角與條件穩定 2 秒；失效保持，不啟用 UART。
+GPS 按鈕與 API 要求兩端有效位置且新資料未滿 2 秒；品質差只警告，外推另需衛星 ≥6、HDOP ≤3；
+Bad／Miss 不可選。開機即採用 90°有效鏡頭校正，追蹤仍需有效磁偏角；條件恢復即於下個控制週期追蹤，
+沒有額外 2 秒等待。失效停止更新目標，按速限轉完最後有效目標再停住，不啟用 UART。
+手動暫停、模式切換與 PWM 故障仍立即撤銷；`finishing_last_gps_target` 明示正在轉完舊目標。
 
 資訊頁新增 GPS 位置預測 α 開關（未發行）：開啟沿速度方向外推，關閉使用最後收到位置；
-預設開啟、自動保存。兩者仍共用 Servo 速限，切換不更改模式或校正；UART 不使用此設定。
+預設關閉、自動保存。兩者仍共用 Servo 速限，切換不更改模式或校正；UART 不使用此設定。
 詳見 [GPS 預測說明](motion-control.md#gps-位置預測開關α未發行)。
 
-切到手動，固定腳架，輸入鏡頭上普通磁針指南針角度（北 0°、東 90°）。校正本身不需
-GPS 或地標；RAM 參考在 start/resume／模式切換間保留，重開機必須重校。
+固定腳架，先按「回到 90°」：切為手動，依共用速限回到 Servo 90°，不自動恢復追蹤。
+等鏡頭與磁針停穩，再填鏡頭朝向：北 0°、東 90°、南 180°、西 270°；其他方向填實際讀數。
+僅命令位置與目標均為 90°、且限速器不再移動時接受校正；不需兩端 GPS 定位或地標。
+非 90°／移動中按校正會通知，後端重查並回 409，保留原校正。校正不切模式，完成後可再選 GPS。
+角度是 PWM 命令而非機械回饋；仍需自行確認鏡頭停穩。
+請求仍檢查角度與命令新鮮度，失敗顯示原因，可再次提交；校正不解除 PWM 故障。
+RAM 參考在 start/resume／模式切換間保留，重開機恢復 90°有效偏移；需要其他參考時再重新校正。
 只使用這個參考，沒有板上 QMC 航向補償；腳架轉動、重新架設或移動指南針後請重校。
 
 ```text
@@ -60,7 +67,7 @@ true_camera_bearing = mount_offset + declination - servo_angle
 ```
 
 磁偏角東正西負，依攝影站 GPS 位置與 UTC 日期使用 WMM2025 離線表，適用北緯 18–28°、
-東經 116–124°、2025–2029 年、海平面。位置／日期無效或超出模型範圍時，GPS 保持。
+東經 116–124°、2025–2029 年、海平面。位置／日期無效或超出模型範圍時，GPS 不更新目標，最多轉完最後有效目標後保持。
 UART 模式完全不依賴此校正。來源與更新方式見 `tools/make_declination.py`。
 
 ## ACK 與阻塞診斷
@@ -87,7 +94,7 @@ add 不覆寫不同 ID。成功變更後清空舊 client 狀態並回手動。
 `POST /api/servo/mode?mode=manual|gps|uart` 是模式入口；舊 mode=auto 回 400。
 舊 `mode=jetson` 保留為 UART 的輸入別名，所有模式回應與 status／track 統一回 `uart`。
 HTTP `/api/track/stop` 與 `/api/mag/calibrate` 已移除，回 404。
-`/api/track/start` 選 GPS；`/api/track/resume` 恢復上次選取的 GPS／UART（開機預設 UART）；
+`/api/track/start` 選 GPS；`/api/track/resume` 恢復上次選取的 GPS／UART（未選過自動來源時以 UART 為候選，開機模式為手動）；
 `/api/track/pause` 暫停；要手動調整請先明確選 manual。舊 UART 程式若依賴 ARM／STOP，應同步改用 SET
 與停送；本專案不會修改或部署外部控制端程式。
 
@@ -95,8 +102,8 @@ HTTP `/api/track/stop` 與 `/api/mag/calibrate` 已移除，回 404。
 
 所有來源只共用預設 30°/s 速限；資訊頁可調 1–90°/s，修改自動保存，重開機沿用。
 加速度、jerk、死區與頻率調參已移除，詳見 [共用控制器](motion-control.md)。
-資訊頁提供 GPS 預測 α 開關；唯讀「除錯」頁可錄製並匯出資料，見 [操作指南](debug-export.md)。
+資訊頁提供 GPS 預測 α 開關；離線資料存 SD 並由 USB 匯出，見 [操作指南](debug-export.md)。
 HTTP 控制需要 epoch／seq／stamp，模式 API 保留 jetson 別名。GPS 的 mode／start／resume
-入口都檢查兩端 Good／OK；拒絕時保留來源。舊 SET 保留，SYNC／SET2 可檢查 session、
+入口都檢查兩端有效且持續更新的位置；拒絕時保留來源。舊 SET 保留，SYNC／SET2 可檢查 session、
 序號與期限；接受 SET2 後該 session 不再接受裸 SET。指南針校正仍只存 RAM。
-UART 契約保留；LoRa 已改為 v4／17-byte DATA，Client、Server 必須一起更新才能互通。
+UART 契約保留；LoRa 已改為 v5／18-byte DATA，Client、Station 必須一起更新才能互通。

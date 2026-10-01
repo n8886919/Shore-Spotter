@@ -117,7 +117,7 @@ inline uint8_t batteryPercent(uint16_t mv) {
 }
 
 // --- GPS 分級 --------------------------------------------------------------
-// Server OLED 與 Web UI 共用同一組門檻（web_ui.h 的 gpsGrade()）。
+// Station OLED 與 Web UI 共用同一組門檻（web_ui.h 的 gpsGrade()）。
 enum SigLevel : uint8_t { SIG_GOOD = 0, SIG_OK = 1, SIG_BAD = 2, SIG_MISS = 3 };
 
 inline const char *sig4Text(SigLevel s) {

@@ -14,20 +14,22 @@ void test_gps_accepts_good_ok_and_rejects_bad_missing_stale() {
   TEST_ASSERT_TRUE(tracking_policy::usableGps(true, 7, 1.0f, 0));
   TEST_ASSERT_TRUE(tracking_policy::usableGps(true, 8, 1.6f, 0));
   TEST_ASSERT_TRUE(tracking_policy::usableGps(true,6,3.0f,0));
-  TEST_ASSERT_FALSE(tracking_policy::usableGps(true,6,3.01f,0));
-  TEST_ASSERT_FALSE(tracking_policy::usableGps(true,5,1.0f,0));
+  TEST_ASSERT_TRUE(tracking_policy::usableGps(true,6,3.01f,0));
+  TEST_ASSERT_TRUE(tracking_policy::usableGps(true,5,1.0f,0));
   TEST_ASSERT_FALSE(tracking_policy::usableGps(false,0,0,0));
-  TEST_ASSERT_FALSE(tracking_policy::usableGps(true, 8, -1.0f, 0));
-  TEST_ASSERT_FALSE(tracking_policy::usableGps(true, 8, NAN, 0));
+  TEST_ASSERT_TRUE(tracking_policy::usableGps(true, 8, -1.0f, 0));
+  TEST_ASSERT_TRUE(tracking_policy::usableGps(true, 8, NAN, 0));
 }
 
 void test_gps_mode_never_falls_back_to_uart() {
   Selector s;
-  TEST_ASSERT_TRUE(s.update(0, Mode::Gps, true, true) == Source::Hold);
-  TEST_ASSERT_TRUE(s.update(1999, Mode::Gps, true, true) == Source::Hold);
-  TEST_ASSERT_TRUE(s.update(2000, Mode::Gps, true, true) == Source::Gps);
-  TEST_ASSERT_TRUE(s.update(2001, Mode::Gps, false, true) == Source::Hold);
-  TEST_ASSERT_TRUE(s.update(2002, Mode::Gps, false, false) == Source::Hold);
+  TEST_ASSERT_TRUE(s.update(0, Mode::Gps, true, true) == Source::Gps);
+  TEST_ASSERT_TRUE(s.gpsReady());
+  TEST_ASSERT_TRUE(s.update(1, Mode::Gps, false, true) == Source::Hold);
+  TEST_ASSERT_FALSE(s.gpsReady());
+  TEST_ASSERT_TRUE(s.update(2, Mode::Gps, false, false) == Source::Hold);
+  TEST_ASSERT_TRUE(s.update(3, Mode::Gps, true, false) == Source::Gps);
+  TEST_ASSERT_TRUE(s.gpsReady());
 }
 
 void test_uart_ignores_gps_and_manual_blocks_both() {
@@ -41,24 +43,38 @@ void test_uart_ignores_gps_and_manual_blocks_both() {
   TEST_ASSERT_TRUE(s.update(3004, Mode::Paused, true, true) == Source::Hold);
 }
 
-void test_gps_flapping_and_mode_switch_reset_recovery() {
+void test_gps_flapping_and_mode_switch_do_not_delay_valid_fixes() {
   Selector s;
-  s.update(0, Mode::Gps, true, false);
-  s.update(1999, Mode::Gps, false, false);
-  TEST_ASSERT_TRUE(s.update(2000, Mode::Gps, true, false) == Source::Hold);
-  TEST_ASSERT_TRUE(s.update(4000, Mode::Gps, true, false) == Source::Gps);
-  s.update(4001, Mode::Uart, true, true);
-  TEST_ASSERT_TRUE(s.update(4002, Mode::Gps, true, true) == Source::Hold);
-  TEST_ASSERT_TRUE(s.update(6002, Mode::Gps, true, true) == Source::Gps);
+  for (uint32_t now = 0; now < 100; now += 2) {
+    TEST_ASSERT_TRUE(s.update(now, Mode::Gps, true, false) == Source::Gps);
+    TEST_ASSERT_TRUE(s.gpsReady());
+    TEST_ASSERT_TRUE(s.update(now + 1, Mode::Gps, false, true) == Source::Hold);
+    TEST_ASSERT_FALSE(s.gpsReady());
+  }
+  const Mode modes[] = {Mode::Uart, Mode::Manual, Mode::Paused};
+  for (Mode mode : modes) {
+    TEST_ASSERT_TRUE(s.update(100, Mode::Gps, true, true) == Source::Gps);
+    const Source expected = mode == Mode::Uart ? Source::Uart : Source::Hold;
+    TEST_ASSERT_TRUE(s.update(101, mode, true, true) == expected);
+    TEST_ASSERT_FALSE(s.gpsReady());
+    TEST_ASSERT_TRUE(s.update(102, Mode::Gps, true, true) == Source::Gps);
+    TEST_ASSERT_TRUE(s.gpsReady());
+  }
 }
 
-void test_recovery_and_deadline_rollover() {
+void test_gps_reset_and_millis_rollover_have_no_wait() {
   Selector s;
   const uint32_t start = UINT32_MAX - 1000;
-  s.update(start, Mode::Gps, true, false);
+  TEST_ASSERT_TRUE(s.update(start, Mode::Gps, true, false) == Source::Gps);
+  TEST_ASSERT_TRUE(s.update(start + 1999, Mode::Gps, false, false) == Source::Hold);
   TEST_ASSERT_TRUE(s.update(start + 2000, Mode::Gps, true, false) == Source::Gps);
   s.reset();
-  TEST_ASSERT_TRUE(s.update(start + 2001, Mode::Gps, true, false) == Source::Hold);
+  TEST_ASSERT_FALSE(s.gpsReady());
+  TEST_ASSERT_TRUE(s.update(start + 2001, Mode::Gps, true, false) == Source::Gps);
+}
+
+void test_deadline_rollover() {
+  const uint32_t start = UINT32_MAX - 1000;
   TEST_ASSERT_FALSE(loop_metrics::due(start, start + 2000));
   TEST_ASSERT_TRUE(loop_metrics::due(start + 2000, start + 2000));
   TEST_ASSERT_TRUE(loop_metrics::due(start + 2001, start + 2000));
@@ -83,11 +99,17 @@ void test_duration_and_gap_record_actual_delays() {
 
 int main(int, char **) {
   UNITY_BEGIN();
+  TEST_ASSERT_TRUE(tracking_policy::predictionQuality(6,3));
+  TEST_ASSERT_FALSE(tracking_policy::predictionQuality(5,1));
+  TEST_ASSERT_FALSE(tracking_policy::predictionQuality(8,3.1));
+  TEST_ASSERT_FALSE(tracking_policy::predictionQuality(255,1));
+  TEST_ASSERT_FALSE(tracking_policy::predictionQuality(8,NAN));
   RUN_TEST(test_gps_accepts_good_ok_and_rejects_bad_missing_stale);
   RUN_TEST(test_gps_mode_never_falls_back_to_uart);
   RUN_TEST(test_uart_ignores_gps_and_manual_blocks_both);
-  RUN_TEST(test_gps_flapping_and_mode_switch_reset_recovery);
-  RUN_TEST(test_recovery_and_deadline_rollover);
+  RUN_TEST(test_gps_flapping_and_mode_switch_do_not_delay_valid_fixes);
+  RUN_TEST(test_gps_reset_and_millis_rollover_have_no_wait);
+  RUN_TEST(test_deadline_rollover);
   RUN_TEST(test_duration_and_gap_record_actual_delays);
   return UNITY_END();
 }

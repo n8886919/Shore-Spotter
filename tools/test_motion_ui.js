@@ -4,11 +4,11 @@ const source=fs.readFileSync(process.env.SHORE_WEB_UI_TEST_SOURCE||'include/web_
 const html=source.includes('R"')?source.match(/R"(\w+)\(([\s\S]*?)\)\1"/)[2]:source;
 const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const examples=[...fs.readFileSync('docs/interface.md','utf8').matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(m=>JSON.parse(m[1]));
-const trackExample=examples.find(x=>x.server&&x.client&&x.servo);
+const trackExample=examples.find(x=>x.station&&x.client&&x.servo);
 function createPage(options={}){
 const track=structuredClone(trackExample);
 Object.assign(track.servo,{mode:'uart',source:'hold',angle:90,target:90,moving:false,speed_limit_deg_s:30,
-  gps_available:false,gps_usable:false,motion_fault:false,control_boot_id:1,control_epoch:10,command_seq:0,clock_ms:1000,
+  gps_available:false,gps_usable:false,calibration_ready:true,motion_fault:false,control_boot_id:1,control_epoch:10,command_seq:0,clock_ms:1000,
   prediction_enabled:options.enabled!==false,prediction_alpha:options.enabled===false?0:1});
 if(options.unsupported){delete track.servo.prediction_enabled;delete track.servo.prediction_alpha;}
 const settings={speed:30,min_speed:1,max_speed:90,default_speed:30};
@@ -19,9 +19,12 @@ const canvas=new Proxy({measureText:text=>({width:String(text).length*6}),create
 const elements={};
 for(const id of ids){let value='30';elements[id]={get value(){return value;},set value(v){value=String(v);},style:{},
  disabled:new RegExp('<[^>]+id="'+id+'"[^>]*\\bdisabled').test(html),checked:false,indeterminate:false,
- textContent:'',clientWidth:500,clientHeight:500,getContext:()=>canvas,classList:{toggle(){},add(){},remove(){}},addEventListener(){}};}
+ textContent:'',clientWidth:500,clientHeight:500,getContext:()=>canvas,classList:{toggle(){},add(){},remove(){}},
+ attrs:{},handlers:{},setAttribute(k,v){this.attrs[k]=String(v);},getBoundingClientRect(){return {left:0,top:0,width:this.clientWidth,height:this.clientHeight};},
+ setPointerCapture(){},addEventListener(k,fn){this.handlers[k]=fn;}};}
 const posts=[],gates=[];
 const api={failSave:false,failPrediction:0,predictionNetworkError:false,invalidPredictionPost:false,
+  failCalibration:0,calibrationNetworkError:false,invalidCalibrationPost:false,failCenter:0,invalidCenter:false,
   failPredictionGet:options.unsupported?404:options.failPredictionGet||0};
 function holdNext(path,method='GET'){
  let release;const promise=new Promise(resolve=>{release=resolve;});
@@ -52,6 +55,25 @@ const c={document:{getElementById:id=>elements[id],activeElement:null},window:{a
     if(api.failPrediction){ok=false;status=api.failPrediction;payload={ok:false,error:'prediction rejected'};}
     else if(api.invalidPredictionPost)payload={ok:true,enabled:'true'};
     else {setPrediction(u.searchParams.get('enabled')==='1');payload={ok:true,...prediction,...contextFields()};}
+   }else if(u.pathname==='/api/track/calibrate'){
+    assert.deepEqual([...u.searchParams.keys()].sort(),['bearing','epoch','seq','stamp']);
+    if(api.calibrationNetworkError)return Promise.reject(new Error('network failure'));
+    if(api.failCalibration){ok=false;status=api.failCalibration;payload={ok:false,error:'calibration rejected'};}
+    else if(api.invalidCalibrationPost)payload={ok:true};
+    else {
+     const bearing=Number(u.searchParams.get('bearing'));track.servo.calibrated=true;
+     track.servo.mount_offset_deg=(bearing+track.servo.angle)%360;
+     if(track.servo.mount_offset_deg>180)track.servo.mount_offset_deg-=360;
+     payload={ok:true,method:'compass',bearing,servo_angle:track.servo.angle,mount_offset_deg:track.servo.mount_offset_deg};
+    }
+   }else if(u.pathname==='/api/servo/center'){
+    assert.deepEqual([...u.searchParams.keys()].sort(),['epoch','seq','stamp']);
+    if(api.failCenter){ok=false;status=api.failCenter;payload={ok:false,error:'centre rejected'};}
+    else if(api.invalidCenter)payload={ok:true};
+    else {track.servo.mode='manual';track.servo.source='manual';track.servo.target=90;
+     track.servo.moving=track.servo.angle!==90;track.servo.calibration_ready=!track.servo.moving;
+     ++track.servo.control_epoch;track.servo.command_seq=0;
+     payload={ok:true,mode:'manual',angle:track.servo.angle,target:90,...contextFields()};}
    }else if(u.pathname==='/api/servo/mode'){
     const mode=u.searchParams.get('mode');
     if(mode==='gps'&&!track.servo.gps_available){ok=false;payload={ok:false,error:'GPS unavailable'};}
@@ -70,14 +92,26 @@ const c={document:{getElementById:id=>elements[id],activeElement:null},window:{a
   if(index>=0)return gates.splice(index,1)[0].promise.then(()=>response);
   return Promise.resolve(response);
  }};
+const viewportWrites={};
+c.document.documentElement={style:{setProperty(k,v){viewportWrites[k]=v;}}};
+if(options.visualViewport)c.window.visualViewport=options.visualViewport;
 Object.assign(c,options.context||{});
 vm.createContext(c);vm.runInContext(script,c);
-return {c,track,settings,prediction,elements,posts,api,holdNext,setPrediction};
+return {c,track,settings,prediction,elements,posts,api,holdNext,setPrediction,viewportWrites};
 }
 async function settle(){for(let i=0;i<150;i++)await Promise.resolve();}
 let motionTestsDone=false;
 if(require.main===module)process.on('beforeExit',()=>{if(!motionTestsDone){console.error('FAIL motion UI: unfinished async test');process.exitCode=1;}});
 if(require.main===module)(async()=>{
+ const finishing=createPage();await settle();
+ Object.assign(finishing.track.servo,{mode:'gps',source:'hold',finishing_last_gps_target:true});
+ finishing.track.station_average={samples:60,rms_m:3.5,warning:true};
+ await finishing.c.refresh();await settle();
+ assert(finishing.elements.sld.disabled);
+ assert.equal(finishing.elements.stationSpread.textContent,'3.5 m RMS・偏大');
+ delete finishing.track.station_average;finishing.track.servo.finishing_last_gps_target=false;
+ await finishing.c.refresh();await settle();
+ assert.equal(finishing.elements.stationSpread.textContent,'等待資料');
  const {c,track,settings,elements,posts,api}=createPage();
  await settle();c.applyMode(track.servo);
  assert.equal(elements.cfgSpeed.value,'30');assert.equal(elements.cfgSpeed.disabled,false);
@@ -101,6 +135,160 @@ if(require.main===module)(async()=>{
  elements.cfgSpeed.value='29.5';elements.cfgSpeed.onchange();await settle();assert.equal(settings.speed,29.5);assert.equal(track.servo.mode,'gps');
  await c.loadSpeedSetting();assert.equal(elements.cfgSpeed.value,'29.5');
  console.log('PASS full UI: Info shared speed, automatic save in all modes, persistence reload, validation/failure, active edits and GPS availability race');
+ const cal=createPage();
+ assert.equal(cal.elements.btnCompassCal.disabled,false);await settle();
+ assert.match(html,/北 0°、東 90°、南 180°、西 270°/);
+ assert.match(html,/回到 90° 會切為手動/);
+ Object.assign(cal.track.client,{fix:0,satellites:null,hdop:null});
+ Object.assign(cal.track.station,{fix:0,satellites:0,hdop:null});
+ for(const mode of ['manual','uart','gps','paused']){
+  Object.assign(cal.track.servo,{mode,moving:false,calibration_ready:true,gps_available:false,pwm_ok:false,motion_fault:true,calibrated:false});
+  cal.c.applyMode(cal.track.servo);
+  assert.equal(cal.elements.btnCompassCal.disabled,false);
+  cal.elements.compassBearing.value='100';
+  const done=cal.elements.btnCompassCal.onclick();
+  assert.equal(cal.elements.btnCompassCal.disabled,false);assert.equal(cal.c.controlChanging,false);
+  assert.match(cal.elements.compassCalState.textContent,/校正送出中/);
+  await done;await settle();
+  assert.equal(cal.track.servo.mode,mode);assert.equal(cal.track.servo.calibrated,true);
+  assert.equal(cal.elements.btnCompassCal.disabled,false);
+  assert.match(cal.elements.compassCalState.textContent,/已校正 100°/);
+  assert.equal(cal.elements.mcOff.textContent,'-170.0°');
+  assert.equal(cal.posts.at(-1).pathname,'/api/track/calibrate');
+  assert.equal(cal.posts.at(-1).searchParams.get('bearing'),'100');
+ }
+ const calCount=cal.posts.length;
+ for(const value of ['','-1','360','NaN','Infinity','1e2','0x10','12345678901234567']){
+  cal.elements.compassBearing.value=value;cal.elements.btnCompassCal.onclick();await settle();
+  assert.match(cal.elements.compassCalState.textContent,/請輸入/);
+ }
+ assert.equal(cal.posts.length,calCount);
+ // Rejections and connection failures report a retryable result without disabling the button.
+ cal.elements.compassBearing.value='350';
+ for(const code of [400,409,503]){
+  cal.api.failCalibration=code;await cal.elements.btnCompassCal.onclick();await settle();
+  assert.equal(cal.elements.btnCompassCal.disabled,false);
+  assert.match(cal.elements.compassCalState.textContent,/校正未確認：calibration rejected/);
+ }
+ cal.api.failCalibration=0;cal.api.calibrationNetworkError=true;
+ await cal.elements.btnCompassCal.onclick();await settle();
+ assert.match(cal.elements.compassCalState.textContent,/network failure/);
+ assert.equal(cal.elements.btnCompassCal.disabled,false);cal.api.calibrationNetworkError=false;
+ cal.api.invalidCalibrationPost=true;await cal.elements.btnCompassCal.onclick();await settle();
+ assert.match(cal.elements.compassCalState.textContent,/校正回覆不完整/);cal.api.invalidCalibrationPost=false;
+ await cal.elements.btnCompassCal.onclick();await settle();assert.match(cal.elements.compassCalState.textContent,/已校正 350°/);
+ // A conflicting settings operation shows a notice; retry after it completes.
+ const speedGate=cal.holdNext('/api/servo/settings','POST');
+ cal.elements.cfgSpeed.value='20';const speedDone=cal.elements.cfgSpeed.onchange();await settle();
+ assert.equal(cal.c.controlChanging,true);assert.equal(cal.elements.btnCompassCal.disabled,false);
+ const calDuringSave=cal.elements.btnCompassCal.onclick();
+ speedGate.release();await speedDone;await calDuringSave;await settle();
+ assert.match(cal.elements.compassCalState.textContent,/請先回到 90°/);
+ await cal.elements.btnCompassCal.onclick();await settle();
+ assert.equal(cal.posts.at(-1).pathname,'/api/track/calibrate');
+ assert.match(cal.elements.compassCalState.textContent,/已校正 350°/);
+ // A successful settings POST followed by failed track refresh used to leave calibration grey.
+ const originalFetch=cal.c.fetch;
+ cal.c.fetch=(url,options)=>new URL(url,'http://test').pathname==='/api/track'
+   ?Promise.reject(new Error('simulated track refresh failure')):originalFetch(url,options);
+ cal.elements.cfgSpeed.value='25';await cal.elements.cfgSpeed.onchange();await settle();
+ assert.equal(cal.c.controlChanging,false);assert.equal(cal.elements.btnCompassCal.disabled,false);
+ cal.elements.compassBearing.value='120';await cal.elements.btnCompassCal.onclick();await settle();
+ assert.equal(cal.elements.btnCompassCal.disabled,false);assert.match(cal.elements.compassCalState.textContent,/已校正 120°/);
+ assert.equal(cal.elements.mcOff.textContent,'-150.0°');
+ cal.c.fetch=originalFetch;await cal.c.refresh();
+ // Each new click is allowed; an earlier delayed reply cannot overwrite the latest request's hint.
+ const firstGate=cal.holdNext('/api/track/calibrate','POST');
+ cal.elements.compassBearing.value='350';const first=cal.elements.btnCompassCal.onclick();await settle();
+ const secondGate=cal.holdNext('/api/track/calibrate','POST');
+ cal.elements.compassBearing.value='351';const second=cal.elements.btnCompassCal.onclick();await settle();
+ assert.equal(cal.elements.btnCompassCal.disabled,false);
+ firstGate.release();await first;await settle();assert.match(cal.elements.compassCalState.textContent,/校正送出中/);
+ secondGate.release();await second;await settle();assert.match(cal.elements.compassCalState.textContent,/已校正 351°/);
+ assert.equal(cal.track.servo.mount_offset_deg,81);
+ // Before any status arrives the button remains usable; offline attempts explain
+ // failure, and a new click acquires fresh context after the connection recovers.
+ const early=createPage(),earlyFetch=early.c.fetch;
+ early.c.fetch=()=>Promise.reject(new Error('offline'));
+ assert.equal(early.c.motionContext,null);assert.equal(early.elements.btnCompassCal.disabled,false);
+ early.elements.compassBearing.value='350';await early.elements.btnCompassCal.onclick();await settle();
+ assert.match(early.elements.compassCalState.textContent,/請先回到 90°/);
+ assert.equal(early.elements.btnCompassCal.disabled,false);assert.equal(early.posts.length,0);
+ early.c.fetch=earlyFetch;await early.c.refresh();await early.elements.btnCompassCal.onclick();await settle();
+ assert.match(early.elements.compassCalState.textContent,/已校正 350°/);
+ assert.equal(early.posts.at(-1).pathname,'/api/track/calibrate');
+ console.log('PASS full UI: centre-gated calibration across modes, validation and failure/retry feedback, repeated clicks preserve latest result');
+
+ // Non-centre and movement are rejected visibly without transmitting calibration.
+ const resetPage=createPage();await settle();resetPage.elements.compassBearing.value='90';
+ for(const state of [
+  {angle:80,target:80,moving:false,calibration_ready:false},
+  {angle:90,target:120,moving:true,calibration_ready:false},
+  {angle:89.999,target:89.999,moving:false,calibration_ready:false}
+ ]){
+  Object.assign(resetPage.track.servo,state);await resetPage.c.refresh();
+  const n=resetPage.posts.length;await resetPage.elements.btnCompassCal.onclick();await settle();
+  assert.equal(resetPage.posts.length,n);assert.match(resetPage.elements.toast.textContent,/請先回到 90°/);
+ }
+ Object.assign(resetPage.track.servo,{mode:'gps',angle:120,target:160,moving:true,calibration_ready:false});
+ await resetPage.c.refresh();const centerEpoch=resetPage.track.servo.control_epoch;
+ resetPage.c.servoPendingAngle=20;resetPage.c.servoPendingIntent=resetPage.c.controlIntent();
+ await resetPage.elements.btnCompassCenter.onclick();await settle();
+ assert.equal(resetPage.posts.at(-1).pathname,'/api/servo/center');
+ assert.equal(resetPage.track.servo.mode,'manual');assert.equal(resetPage.track.servo.target,90);
+ assert.notEqual(resetPage.track.servo.control_epoch,centerEpoch);
+ assert.equal(resetPage.c.servoPendingAngle,null);assert.equal(resetPage.track.servo.angle,120);
+ assert.match(resetPage.elements.compassCalState.textContent,/等鏡頭停穩/);
+ await resetPage.elements.btnCompassCal.onclick();assert.match(resetPage.elements.toast.textContent,/請先回到 90°/);
+ Object.assign(resetPage.track.servo,{angle:90,target:90,moving:false,calibration_ready:true});
+ await resetPage.c.refresh();await resetPage.elements.btnCompassCal.onclick();await settle();
+ assert.equal(resetPage.track.servo.mount_offset_deg,180);
+ // A stale centre status never converts a backend rejection to a success hint.
+ resetPage.api.failCalibration=409;await resetPage.elements.btnCompassCal.onclick();await settle();
+ assert.match(resetPage.elements.compassCalState.textContent,/校正未確認/);
+ for(const code of [409,503]){
+  resetPage.api.failCenter=code;await resetPage.elements.btnCompassCenter.onclick();await settle();
+  assert.match(resetPage.elements.compassCalState.textContent,/回中未確認：centre rejected/);
+  assert.equal(resetPage.elements.btnCompassCenter.disabled,false);assert.equal(resetPage.c.controlChanging,false);
+ }
+ resetPage.api.failCenter=0;resetPage.api.invalidCenter=true;
+ await resetPage.elements.btnCompassCenter.onclick();await settle();
+ assert.match(resetPage.elements.compassCalState.textContent,/回中回覆不完整/);
+
+ // Centre waits for a manual write already in flight and never releases a queued
+ // old slider target afterwards. The next POST uses the new centre epoch.
+ const ordering=createPage();await settle();ordering.track.servo.mode='manual';
+ let finishSlider;ordering.c.servoRequest=new Promise(resolve=>{finishSlider=resolve;});
+ ordering.c.servoPendingAngle=170;ordering.c.servoPendingIntent=ordering.c.controlIntent();
+ const centreDone=ordering.elements.btnCompassCenter.onclick();await settle();
+ assert.equal(ordering.posts.length,0);assert.equal(ordering.c.controlChanging,true);
+ assert.equal(ordering.c.servoPendingAngle,null);
+ finishSlider();await centreDone;await settle();
+ assert.equal(ordering.posts.length,1);assert.equal(ordering.posts[0].pathname,'/api/servo/center');
+ ordering.elements.compassBearing.value='270';await ordering.elements.btnCompassCal.onclick();await settle();
+ assert.equal(ordering.posts.at(-1).pathname,'/api/track/calibrate');
+ assert.equal(ordering.track.servo.mount_offset_deg,0);
+ console.log('PASS centre button: notice off-centre, cancel pending slider, switch GPS to Manual, wait for arrival, reject stale/failing responses');
+ // Screenshot regression: the user selects GPS before the first calibration.
+ // gps_usable remains false while waiting for calibration; it must not lock the button.
+ const waiting=createPage();await settle();
+ Object.assign(waiting.track.servo,{calibrated:false,gps_available:true,
+   gps_usable:false,gps_ready:false,source:'hold',moving:false,declination_deg:-5});
+ Object.assign(waiting.track.station,{fix:1,satellites:8,hdop:1.2});
+ Object.assign(waiting.track.client,{fix:1,satellite_class:3,satellites:8,hdop:1.2});
+ await waiting.c.refresh();waiting.elements.mGps.onclick();await settle();
+ assert.equal(waiting.track.servo.mode,'gps');assert.equal(waiting.track.servo.calibrated,false);
+ assert.equal(waiting.track.servo.gps_usable,false);
+ assert(waiting.elements.sld.disabled);
+ assert.equal(waiting.elements.btnCompassCal.disabled,false);
+ const waitingEpoch=waiting.track.servo.control_epoch,postsBeforeCal=waiting.posts.length;
+ waiting.elements.compassBearing.value='350';await waiting.elements.btnCompassCal.onclick();await settle();
+ assert.equal(waiting.posts.length,postsBeforeCal+1);
+ assert.equal(waiting.posts.at(-1).pathname,'/api/track/calibrate');
+ assert.equal(waiting.posts.at(-1).searchParams.get('bearing'),'350');
+ assert.equal(waiting.track.servo.mode,'gps');assert.equal(waiting.track.servo.control_epoch,waitingEpoch);
+ assert.equal(waiting.track.servo.calibrated,true);assert.equal(waiting.elements.btnCompassCal.disabled,false);
+ console.log('PASS screenshot regression: enter GPS before calibration, remain in hold with Good fixes, click 350 degrees successfully without switching to Manual');
  // v4 carries a current satellite class; a lower bound must never look like an exact satellite count.
  for(const [cls,label,grade] of [[0,'未知','miss'],[1,'≤5 顆','bad'],[2,'6–7 顆','ok'],[3,'≥8 顆','good']]){
   Object.assign(track.client,{satellite_class:cls,satellites:null,hdop:1});await c.refresh();

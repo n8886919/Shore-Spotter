@@ -47,8 +47,12 @@ cpp = r'''
 #include <type_traits>
 #include "firmware_version.h"
 #include "protocol.h"
+#include "client_cadence.h"
 #include "packet_diagnostics.h"
 #include "gnss_snapshot.h"
+#include "gnss_diagnostics.h"
+#include "gnss_rate.h"
+#include "station_position.h"
 #include "tracking_policy.h"
 #include "command_freshness.h"
 #include "servo_profile.h"
@@ -91,17 +95,21 @@ struct LogStub {
   void println() {}
 } Log;
 uint16_t gpsClientId = 0xE91C;
-uint32_t dataAirtimeMs = 165, ackAirtimeMs = 145, telemetryAirtimeMs = 145, diagnosticAirtimeMs = 165;
+uint32_t dataAirtimeMs = 330, telemetryAirtimeMs = 289, gnssDiagnosticAirtimeMs = 494, diagnosticAirtimeMs = 330;
 uint32_t gpsBacklogDrops = 0;
 gnss_snapshot::Collector gnssCollector;
+gnss_rate::Monitor gpsRate;
+station_position::Average stationAverage;
 DiagnosticPayload lastClientDiagnostic{};
+gnss_diagnostics::Latest clientGnssDiagnostic;
+uint32_t rxGnssDiagnosticCount = 0;
 bool haveClientDiagnostic = false;
 uint32_t lastClientDiagnosticMs = 0;
 packet_diagnostics::Ring<64> packetEvents;
 uint32_t rxDataCount = 0, rxTelemetryCount = 0, rxDiagnosticCount = 0, rxErrorCount = 0;
 uint32_t rejectedLength = 0, rejectedFormat = 0, rejectedBinding = 0, rejectedGpsSequence = 0;
 uint32_t sequenceMissing = 0, sequenceResyncs = 0, invalidFixPackets = 0, invalidVelocityPackets = 0;
-uint32_t ackTxCount = 0, ackErrorCount = 0, ackSkippedCount = 0, radioRecoverCount = 0;
+uint32_t radioRecoverCount = 0;
 uint32_t lastDataIntervalMs = 0, maxDataIntervalMs = 0, sourceEpochUpdates = 0, lastSourceEpochIntervalMs = 0;
 struct Http {
   std::map<std::string, String> args, headers;
@@ -116,7 +124,7 @@ struct Http {
 } httpServer;
 '''
 for name in [
-    "RF_FREQUENCY", "RF_BW", "RF_SF", "RF_CR", "SEND_INTERVAL_MS", "ACK_EVERY_N",
+    "RF_FREQUENCY", "RF_BW", "RF_SF", "RF_CR", "SEND_INTERVAL_MS", "TELEMETRY_INTERVAL_MS",
     "GPS_BAUD", "GPS_BACKLOG_GUARD_MS", "GPS_FIX_MAX_AGE_MS", "LOG_BUF_BYTES",
     "SERVO_PIN", "SERVO_PWM_HZ", "SERVO_PWM_RES_BITS",
 ]:
@@ -127,7 +135,7 @@ for name in [
 cpp += "char logBuf[LOG_BUF_BYTES]{}; size_t logHead = 0; bool logWrapped = false; uint32_t logTotal = 0;\n"
 for marker in [
     "static void logPush(", "static bool gpsFixFresh(",
-    "static String buildDebugJson(", "static String buildLogText(",
+    "static void appendStationAverageJson(", "static void appendGnssReportJson(", "static String buildDebugJson(", "static String buildLogText(",
     "static bool initServo()",
 ]:
     cpp += block(marker) + "\n"
@@ -194,6 +202,8 @@ int main() {
   feed("GNRMC,120000.500,A,2400.000,N,12100.000,E,9.72,90,130926,,,A", 1500);
   feed("GNGGA,120000.500,2400.000,N,12100.000,E,1,09,1.5,10,M,0,M,,", 1600);
   clockMs = 1800;
+  gpsRate.observe(clockMs-5000,0,0,0);gpsRate.observe(clockMs,10,10,10);
+  stationAverage.observe(1000,true,0,24,121);stationAverage.observe(1500,true,500,24.0001,121);
   // Populate the remote diagnostic through its actual codec rather than
   // copying its counters into a separate JSON fixture.
   const PacketHeader dh{gpsClientId, 2, MSG_DIAGNOSTIC};
@@ -202,19 +212,31 @@ int main() {
   assert(protocol::encodeDiagnostic(diagWire, sizeof(diagWire), dh, diag) == 17);
   assert(protocol::decodeDiagnostic(diagWire, sizeof(diagWire), decodedHeader, lastClientDiagnostic));
   haveClientDiagnostic = true; lastClientDiagnosticMs = 1750; rxDiagnosticCount = 1;
-  rxDataCount = 70; rxTelemetryCount = 2; rejectedLength = 3; ackTxCount = 8;
+  auto remote = gnss_diagnostics::capture(gnssCollector, 1700);
+  remote.sourceAgeMs = 5077; remote.flags = 27; remote.resyncs = 4; remote.missingTime = 12;
+  remote.byteAgeMs = 5; remote.sentenceAgeMs = 7; remote.advanceAgeMs = 9;
+  uint8_t gnssWire[GNSS_DIAGNOSTIC_PACKET_LEN];
+  emitDebug("gnss_partial"); // no report received yet; v5 has no partial assembly
+  const PacketHeader gh{gpsClientId, 1, MSG_GNSS_DIAGNOSTIC};
+  assert(gnss_diagnostics::encode(gnssWire,sizeof(gnssWire),gh,remote)==36);
+  gnss_diagnostics::Report decoded;
+  assert(gnss_diagnostics::decode(gnssWire,sizeof(gnssWire),decodedHeader,decoded));
+  assert(clientGnssDiagnostic.accept(decodedHeader,decoded,1750));
+  ++rxGnssDiagnosticCount;
+
+  rxDataCount = 70; rxTelemetryCount = 2; rejectedLength = 3;
   lastDataIntervalMs = 500; maxDataIntervalMs = 1000; sourceEpochUpdates = 35;
   lastSourceEpochIntervalMs = 1000;
   for (uint16_t i = 0; i < 70; ++i) {
     packet_diagnostics::Event event;
     event.kind = packet_diagnostics::Kind::Data; event.ms = 100 + i * 10;
     event.clientId = gpsClientId; event.seq = i; event.length = DATA_PACKET_LEN;
-    event.sourceAgeMs = 250; event.rssiDbm10 = -987; event.snrQuarterDb = -53;
+    event.sourceAgeMs = UINT16_MAX; event.rssiDbm10 = -987; event.snrQuarterDb = -53;
     event.flags = 3;
-    PositionPayload position{24000000, 121000000, 50, 900, 3, true, true, 15, 25};
+    PositionPayload position{240000000, 1210000000, 50, 900, 3, true, true, 15};
     const PacketHeader header{gpsClientId, i, MSG_DATA};
     event.rawLength = protocol::encodeData(event.raw, sizeof(event.raw), header, position);
-    assert(event.rawLength == 17);
+    assert(event.rawLength == 18);
     packetEvents.push(event);
   }
   uint32_t cursor = emitDebug("full_0");
@@ -305,7 +327,7 @@ int main() {
   // Metadata scalars from the real headers let the Python assertions detect
   // later hard-coded JSON constants drifting away from the wire definitions.
   std::cout << "META\t" << unsigned(PROTO_VERSION) << '\t' << DATA_PACKET_LEN << '\t'
-      << ACK_PACKET_LEN << '\t' << TELEMETRY_PACKET_LEN << '\t' << DIAGNOSTIC_PACKET_LEN << '\t'
+      << 0 << '\t' << TELEMETRY_PACKET_LEN << '\t' << DIAGNOSTIC_PACKET_LEN << '\t'
       << LOG_BUF_BYTES << '\t' << SHORE_SPOTTER_VERSION << '\n';
 }
 '''
@@ -352,17 +374,20 @@ assert metadata is not None
 version, data_bytes, ack_bytes, telemetry_bytes, diagnostic_bytes, capacity = map(int, metadata[:6])
 firmware_version = metadata[6]
 empty = snapshots["empty"]
-assert empty["schema_version"] == 2 and empty["protocol_version"] == version == 4
+assert empty["schema_version"] == 3 and empty["protocol_version"] == version == 5
 assert empty["firmware_version"] == firmware_version and empty["build"]
 assert empty["boot_id"] == 1234567 and empty["clock_ms"] == 1000
+assert empty["station_average"]["samples"] == 0 and empty["station_average"]["rms_m"] is None
+assert empty["gps"]["observed_hz"] is None
 config = empty["config"]
 assert (config["data_bytes"], config["ack_bytes"], config["telemetry_bytes"], config["diagnostic_bytes"]) == (
     data_bytes, ack_bytes, telemetry_bytes, diagnostic_bytes)
-assert config["send_interval_ms"] == 500 and config["ack_every_n"] == 8
+assert config["send_interval_ms"] == 500 and config["ack_every_n"] == 0 and config["ack_enabled"] is False and config["sf"] == 10
 assert config["rf_frequency_mhz"] == 923.2 and config["bw_khz"] == 125
-assert config["sf"] == 9 and config["cr"] == 5
+assert config["send_mode"] == "latest_valid_fix" and config["status_heartbeat_ms"] == 0 and config["diagnostic_interval_ms"] == 60000
+assert config["sf"] == 10 and config["cr"] == 5
 assert config["bound_client_id"] == 0xE91C and config["gnss_age_uncertainty_ms"] == 200
-assert empty["gps"]["scope"] == "server_local"
+assert empty["gps"]["scope"] == "station_local"
 assert empty["gps"]["source_age_ms"] is None and empty["gps"]["epoch_ms_of_day"] is None
 assert empty["gps"]["measurement_clock_synchronized"] is False
 assert empty["gps"]["fix"] is False and empty["events"]["items"] == []
@@ -372,7 +397,22 @@ for field in ["rx_age_ms", "epoch_interval_ms", "backlog_drops", "nmea_errors", 
 print("PASS actual debug JSON parses strictly, agrees with wire/version metadata and emits unknowns as null")
 
 full = snapshots["full_0"]
+assert full["gps"]["observed_hz"] == 2 and full["gps"]["rate_state"] == "observed_2hz"
+assert full["station_average"]["samples"] == 2 and full["station_average"]["warning"] is True
+assert 5.5 < full["station_average"]["rms_m"] < 5.6
+assert full["station_average"]["raw_lat"] != full["station_average"]["mean_lat"]
 assert full["gps"]["fix"] is True and full["gps"]["have_rmc"] is True and full["gps"]["have_gga"] is True
+assert snapshots["gnss_partial"]["client_gnss"]["received"] is False
+assert snapshots["gnss_partial"]["client_gnss"]["snapshot"] is None
+assert full["client_gnss"]["received"] is True
+assert full["client_gnss"]["fresh"] is True and full["client_gnss"]["rx_age_ms"] == 50
+remote = full["client_gnss"]["snapshot"]
+assert remote["source_age_ms"] == 5077 and remote["state"] == "recovering"
+assert remote["raw_fix"] is True and remote["satellites"] == 9
+assert remote["time_resyncs"] == 4 and remote["missing_or_invalid_time"] == 12
+assert (remote["last_byte_age_ms"], remote["last_sentence_age_ms"], remote["last_advance_age_ms"]) == (5, 7, 9)
+assert full["gps"]["stream"]["state"] == "fresh_fix"
+assert full["counters"]["rx_gnss_diagnostic"] == 1
 assert full["gps"]["epochs"] == 2 and full["gps"]["last_epoch_interval_ms"] == 500
 assert full["gps"]["rmc"] == 2 and full["gps"]["gga"] == 2
 assert full["gps"]["epoch_ms_of_day"] == 43200500 and 300 <= full["gps"]["source_age_ms"] < 500
@@ -381,17 +421,17 @@ assert full["client_diagnostic"]["rx_age_ms"] == 50
 assert full["client_diagnostic"]["backlog_drops"] == 65535 and full["client_diagnostic"]["epoch_interval_ms"] == 500
 assert full["client_diagnostic"]["counter_encoding"] == "uint16_saturating_since_client_boot"
 assert full["counters"]["rx_data"] == 70 and full["counters"]["rx_diagnostic"] == 1
-assert full["counters"]["rejected_length"] == 3 and full["counters"]["ack_sent"] == 8
-assert full["counters"]["inferred_source_interval_ms"] == 1000
+assert full["counters"]["rejected_length"] == 3 and full["counters"]["ack_sent"] is None
+assert full["counters"]["inferred_source_interval_ms"] is None
 assert full["events"]["capacity"] == 64 and full["events"]["total"] == 70 and full["events"]["overwritten"] == 6
 items = [item for page in range(8) for item in snapshots[f"full_{page}"]["events"]["items"]]
 assert len(items) == 64 and [item["id"] for item in items] == list(range(7, 71))
 for index, item in enumerate(items, start=6):
     assert item["kind"] == "data" and item["seq"] == index and item["client_id"] == 0xE91C
-    assert item["source_age_ms"] == 250 and item["flags"] == 3
+    assert item["source_age_ms"] is None and item["flags"] == 3
     assert item["rssi_dbm"] == -98.7 and item["snr_db"] == -13.25
     raw = bytes.fromhex(item["raw_hex"])
-    assert item["length"] == len(raw) == 17 and raw[:4] == bytes([0x53, 0x41, 0x1C, 0xE9])
+    assert item["length"] == len(raw) == 18 and raw[:4] == bytes([0x53, 0x51, 0x1C, 0xE9])
     assert int.from_bytes(raw[4:6], "little") == index
 missing = snapshots["missing_event"]["events"]
 assert missing["overwritten"] == 7 and missing["total"] == 71 and len(missing["items"]) == 1
@@ -401,6 +441,8 @@ assert last["source_age_ms"] is None and last["rssi_dbm"] is None and last["snr_
 assert snapshots["stale"]["client_diagnostic"]["fresh"] is False
 assert snapshots["stale"]["client_diagnostic"]["rx_age_ms"] == 90000
 assert snapshots["stale"]["gps"]["fix"] is False
+assert snapshots["stale"]["client_gnss"]["fresh"] is False
+assert snapshots["stale"]["client_gnss"]["snapshot"]["source_age_ms"] == 5077
 assert len(full["limitations"]) >= 4
 print("PASS real GNSS/DIAG snapshots, 64 events recovered through pages, raw hex and unknown signal values")
 
@@ -439,12 +481,12 @@ assert_page("limit_one_last", [71], 71)
 assert_page("limit_eight", range(64, 72), 71)
 assert len(debug_errors) == 32
 assert all(isinstance(body.get("error"), str) and body["error"] for body in debug_errors.values())
-assert all(snapshot["schema_version"] == 2 and len(snapshot["events"]["items"]) <= 8
+assert all(snapshot["schema_version"] == 3 and len(snapshot["events"]["items"]) <= 8
            for snapshot in snapshots.values())
 max_debug_bytes = max(debug_bytes.values())
-assert max_debug_bytes < 4500, debug_bytes
+assert max_debug_bytes < 5600, debug_bytes
 print(f"PASS debug GET limit 1..8, 32 malformed argument cases; {len(snapshots)} responses <=8 events, "
-      f"largest ordinary fixture JSON {max_debug_bytes} bytes (<4500)")
+      f"largest ordinary fixture JSON {max_debug_bytes} bytes (<5600)")
 
 utf8 = "位置A\n".encode()
 assert logs["empty"] == dict(boot=1234567, next=0, dropped=False, body=b"")

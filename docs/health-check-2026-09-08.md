@@ -9,8 +9,8 @@
   Bad／Miss／品質缺漏／過期拒絕；進入後仍需校正、磁偏角與穩定期，失效保持。
 - 49 個 native 測試通過；10 個滑桿案例、完整 UI 自動保存／失敗／GPS 按鈕狀態競態，
   實際 HTTP／PWM／GPS gate／NVS 主機整合通過。舊曲線測試隨功能移除。
-- 三環境最終 build 成功；Server flash 1,272,344 B（38.1%）、RAM 60,580 B（18.5%）。
-  Server OTA 成功、版本 `0.5`，開機歸中後預設 UART，等待新指令，PWM 正常、無故障。
+- 三環境最終 build 成功；Station flash 1,272,344 B（38.1%）、RAM 60,580 B（18.5%）。
+  Station OTA 成功、版本 `0.5`，開機歸中後預設 UART，等待新指令，PWM 正常、無故障。
 - 板上 HTML 47,155 bytes 與本地完全相同；以下載頁面重跑 10 個滑桿與完整 UI 模擬通過。
   8 個更新後的 API JSON 範例與文件連結通過；diagnostics API 回 404，調試控制與 log 頁移除。
 - 實機 GPS 不可用，mode=gps／track/start 均回 409 並保留 UART；Good／OK 與資料過期、
@@ -29,9 +29,9 @@
 - 新測試涵蓋不規則／同時刻／小於 1 ms 更新、微秒回繞、不同取樣率的相同軌跡、
   速度／加減速度／jerk 限制、長停頓及輸出量化精度；擷取實際 PWM／HTTP／後端驗證。
 - 60 個 native 測試、10 個滑桿案例、完整 UI 模擬、實際 handler／PWM 主機整合通過，
-  8 個 API JSON 範例及文件相對連結通過。三環境 build 成功；Server flash 1,457,536 B
+  8 個 API JSON 範例及文件相對連結通過。三環境 build 成功；Station flash 1,457,536 B
   （43.6%）、RAM 64,772 B（19.8%）。新增入口 `python3 tools/test_motion_backend.py`。
-- Server OTA 成功，板上回報 `0.4`；來源／產物雜湊一致，下載頁面 51,678 bytes 與本地
+- Station OTA 成功，板上回報 `0.4`；來源／產物雜湊一致，下載頁面 51,678 bytes 與本地
   相同，以下載頁面重跑滑桿／參數診斷模擬通過。Client 綁定 E91C 保留，Client 未重刷。
 - 開機依既有流程回 90°。升級後還原 RAM 設定：速度 30、加速度 30、減速度 30，三項
   開啟；jerk 120、deadband 1 保留數值但關閉，saved=false；OLED 暫停。未寫 NVS。
@@ -61,8 +61,8 @@
 - 57 個 native 測試（全部開關組合、途中反向、獨立加減速、舊格式與計時 wrap），
   10 個滑桿案例、完整設定頁模擬通過。擷取實際 HTTP handler／serviceControl 的主機
   整合模擬確認模式隔離、UART 過期、GPS 恢復／失效、NVS 失敗保持、PWM 故障與 50 ms 更新。
-- 三環境 build 通過；Server 韌體 1,456,504 B（43.6%），RAM 64,684 B（19.7%）。
-  **Server OTA 成功**，產物雜湊未變；板上回報 `0.3`、manual 90°、PWM 正常、無故障，
+- 三環境 build 通過；Station 韌體 1,456,504 B（43.6%），RAM 64,684 B（19.7%）。
+  **Station OTA 成功**，產物雜湊未變；板上回報 `0.3`、manual 90°、PWM 正常、無故障，
   五項預設 90／30／30／120／1 與開關全開，指南針清空，E91C 綁定保留。
 - 板上頁面 51,594 bytes 與本地完全相同，以下載頁面重跑 10 個滑桿案例及完整設定頁
   模擬通過。Client 未重刷，無實體轉角命令；尚未驗收機械減振或戶外追蹤。
@@ -89,8 +89,8 @@
   速度 30°/s、saved=false，Client E91C 綁定保留；預期更新後採用 90°/s 預設。
 - 53 個 native 測試、11 個滑桿案例與完整設定頁模擬通過；新增雙向接近 90°/s
   仍有界、及舊速度設定可讀回的測試。8 個 API JSON 範例與文件連結檢查通過。
-- Client／Server／Server OTA 三環境 build 通過。Server OTA 韌體 1,448,152 B，
-  靜態 RAM 64,524 B；**OTA 已成功上傳 Server**，上傳產物雜湊未變。
+- Client／Station／Station OTA 三環境 build 通過。Station OTA 韌體 1,448,152 B，
+  靜態 RAM 64,524 B；**OTA 已成功上傳 Station**，上傳產物雜湊未變。
 - 板上 API 已回報版本 `0.2`、speed=90、acceleration=30、jerk=120、deadband=1、
   minimum=0、maximum=180、saved=false（使用韌體預設，不另寫 NVS）。開機 manual
   90°、PWM 正常、無 motion fault，指南針校正清空，單一 E91C 綁定保留。
@@ -101,18 +101,18 @@
 ## 2026-09-09 版本 0.1
 
 - 新增版本唯一來源 `include/firmware_version.h` 與 `CHANGELOG.md`，以現有功能作為
-  0.1 基準。Client／Server 開機 OLED、序列紀錄共用版本；Server status API 的
+  0.1 基準。Client／Station 開機 OLED、序列紀錄共用版本；Station status API 的
   `health.firmware_version` 與資訊頁顯示實際運行版本。
 - 本次不修改控制參數、LoRa wire 或 NVS 格式。舊 Client 不會自動更新或回傳韌體版本。
 - 使用者確認 Servo 直接 2S 2000 mAh 35C 電池，固定時偶爾抖動；硬體文件已修正
   原 UBEC 接法。尚未量測動態供電電壓／電流或機構振動，不能斷定抖動原因。
 - 11 個滑桿案例、完整設定頁模擬及實際 status 渲染函式的版本／舊韌體顯示檢查通過，
   8 個 API JSON 範例與本地文件連結有效。本批未更動控制邏輯，因此未重跑 native 控制測試。
-- `tbeam-client`／`tbeam-server`／`tbeam-server-ota` 全部編譯通過，三個產物均確認
-  包含 `v0.1`；Server 產物包含 API 版本欄位。Server／OTA 靜態 RAM 64,524 B，
+- `tbeam-client`／`tbeam-station`／`tbeam-station-ota` 全部編譯通過，三個產物均確認
+  包含 `v0.1`；Station 產物包含 API 版本欄位。Station／OTA 靜態 RAM 64,524 B，
   韌體分別 1,448,132／1,448,148 B。快照、log 與來源／產物雜湊保存在
   `/tmp/shore-version-01-y6qso363/`。
-- Server 兩次連線檢查回 `No route to host`，USB 未接，**Client 與 Server 均尚未
+- Station 兩次連線檢查回 `No route to host`，USB 未接，**Client 與 Station 均尚未
   上傳本次 0.1 版本**；下方共用後端的 OTA 成功紀錄是前一個未標版韌體。
 
 ## 最新狀態：2026-09-09 共用後端、S 曲線與 1° 死區
@@ -134,9 +134,9 @@
   millidegree／浮點邊界。擷取實際 HTTP handler、
   serviceControl、模式切換做主機整合模擬，deadband／S 曲線／舊世代拒絕／模式隔離／
   UART 過期／GPS 恢復與失效／設定保存失敗／PWM 故障保持皆通過。
-- `tbeam-client`／`tbeam-server`／`tbeam-server-ota` 最終 build 全部通過，來源與產物
-  SHA-256 已記錄。Server RAM 64,524 B（19.7%）、韌體 1,447,888 B（43.3%）。
-- **Server OTA 已成功**（`upload-ota.log` 回 `Success`，上傳產物雜湊未變）。板上
+- `tbeam-client`／`tbeam-station`／`tbeam-station-ota` 最終 build 全部通過，來源與產物
+  SHA-256 已記錄。Station RAM 64,524 B（19.7%）、韌體 1,447,888 B（43.3%）。
+- **Station OTA 已成功**（`upload-ota.log` 回 `Success`，上傳產物雜湊未變）。板上
   首頁 49,361 bytes 與本地新版逐 byte 相同，以下載頁面重跑 11 個滑桿案例與完整
   設定頁模擬皆通過。status／track／settings API 新欄位已核對。
 - 板上回報 manual 90°、PWM 正常、無 motion fault、指南針校正清空；共用設定為
@@ -165,8 +165,8 @@
   手動目標替換與保持、GPS 恢復／失效、UART watchdog／模式切換、停頓限步、非法目標／
   PWM 故障，以及 HTTP 非同步目標／校正阻擋／400／503 回應。時鐘與硬體寫入為替身，
   不代表實體 Servo 已量測驗收。
-- `tbeam-client`／`tbeam-server`／`tbeam-server-ota` build 全部通過，最終來源再次核對完成。
-  Server 靜態 RAM 60,420 B（18.4%），韌體空間 1,266,556 B（37.9%）；Client 邏輯未改。
+- `tbeam-client`／`tbeam-station`／`tbeam-station-ota` build 全部通過，最終來源再次核對完成。
+  Station 靜態 RAM 60,420 B（18.4%），韌體空間 1,266,556 B（37.9%）；Client 邏輯未改。
 - **OTA 已成功上傳。** USB 未接，透過 Wi-Fi 更新；首輪已接受邀請，但等待回連 TCP 3233
   逾時，未傳送韌體，並恢復手動保持 68°。使用者開啟 3233 後重試成功，espota 回 `OK`／
   `Success`，韌體產物 SHA-256 與更新前記錄一致。成功 log：`upload-ota-retry.log`。
@@ -186,9 +186,9 @@
   非阻塞 ACK，以及第一筆立即送出的手動滑桿排程。
 - 本次名稱調整的 45 個 native 測試、7 個滑桿案例與完整網頁模擬通過；所有本地文件
   連結／章節與 7 個 JSON 範例已檢查，status／track 範例欄位與板上 API 核對一致。
-- 本次 `tbeam-client`、`tbeam-server`、`tbeam-server-ota` build 全部通過；
+- 本次 `tbeam-client`、`tbeam-station`、`tbeam-station-ota` build 全部通過；
   專案 src／include 無編譯警告，SDK／第三方套件仍有既有警告。
-  依 USB 晶片尾碼 584C 確認 Server 後上傳成功，各區塊雜湊驗證通過。
+  依 USB 晶片尾碼 584C 確認 Station 後上傳成功，各區塊雜湊驗證通過。
 - 板上首頁與本地 UART 版逐 byte 相同，下載頁面重跑 7 個滑桿案例全部通過。
   開機 API 回報 manual、angle／target 90°、PWM 正常；LoRa 初始化成功、Client E91C
   綁定保留。本次短測尚未收到 Client 封包，因此未重新確認 LoRa 通聯，不能以先前
@@ -202,7 +202,7 @@
 校正版本與命令角度含義。名稱調整不改 LoRa 封包或 Client 運作邏輯，Client 保留本日
 先前已成功上傳的版本。
 
-本次 Server 韌體空間 1,265,784 B（37.9%）、靜態 RAM 60,420 B（18.4%）。
+本次 Station 韌體空間 1,265,784 B（37.9%）、靜態 RAM 60,420 B（18.4%）。
 驗證 log、上傳產物雜湊、板上頁面與只讀 API 樣本位於 `/tmp/shore-uart-rename-4hsw_uh9/`。
 瀏覽器需重新整理才會顯示 UART 名稱。本次未送實體 UART SET 或手動角度測試指令。
 後續開啟 USB 序列觀察時讀到新的開機紀錄，並遇到一次 HTTP 拒絕連線；再讀 API
@@ -217,7 +217,7 @@
 本批依最新需求改為 GPS／Jetson 獨立模式，移除 ARM、STOP、HTTP track/stop，
 只用鏡頭指南針校正，並處理 I2C 逾時、服務間隔診斷、關機撤銷控制與週期計時。
 修改階段依要求未 build；後續收到「build and upload」授權，已完成 native 測試、
-三個韌體環境 build、USB Server 燒錄與開機／HTTP 檢查；後續亦依授權完成 Client
+三個韌體環境 build、USB Station 燒錄與開機／HTTP 檢查；後續亦依授權完成 Client
 USB 燒錄與開機／LoRa 發送檢查。未 commit／push。
 工作目錄仍包含前批未提交修改；原有 .vscode 與 Wi-Fi 帳密未更動。
 
@@ -241,20 +241,20 @@ USB 燒錄與開機／LoRa 發送檢查。未 commit／push。
 | 環境 | Build | 靜態 RAM | 韌體空間 |
 |---|---|---|---|
 | tbeam-client | 通過 | 36,700 B（11.2%） | 630,407 B（18.9%） |
-| tbeam-server | 通過 | 60,420 B（18.4%） | 1,265,364 B（37.9%） |
-| tbeam-server-ota | 通過 | 60,420 B（18.4%） | 1,265,364 B（37.9%） |
+| tbeam-station | 通過 | 60,420 B（18.4%） | 1,265,364 B（37.9%） |
+| tbeam-station-ota | 通過 | 60,420 B（18.4%） | 1,265,364 B（37.9%） |
 
 使用 espressif32 55.3.39／Arduino-ESP32 3.3.9。專案 src／include 無編譯警告；
 SDK／第三方套件仍有初始化、fallthrough 與 USB CDC 提醒，未改動套件來源。
 
-Server 先以序列紀錄確認角色，再透過 `/dev/ttyACM0` 上傳；
+Station 先以序列紀錄確認角色，再透過 `/dev/ttyACM0` 上傳；
 esptool 各區塊雜湊驗證成功並重開機。
 後續接入 Client，依晶片 MAC 尾碼 E91C 確認為原綁定裝置；當時也分配到
 `/dev/ttyACM0`，使用 `tbeam-client` 並明確覆寫 upload port 完成燒錄。
 Client 各區塊雜湊驗證成功，韌體 SHA-256 與先前通過 build 的產物一致。
 OTA 環境本輪僅驗證 build，沒有執行無線傳送。
 
-Server 開機與 HTTP 驗證：
+Station 開機與 HTTP 驗證：
 
 - LoRa、PMU、BME280 初始化成功；PWM 初始化成功，狀態為 manual、angle／target 90°。
 - 校正為 false、mount offset 為 0，UART inactive；GPS client E91C 遷移保留、capacity 1。
@@ -268,12 +268,12 @@ Client 開機與發送驗證（25 秒序列觀察，包含開機等待）：
 
 - 回報 CLIENT 模式、node ID E91C，LoRa／PMU／BME280 初始化成功。
 - 記錄 13 次 position TX 成功、1 次 telemetry TX 成功，position TX 失敗 0 次。
-- GPS fix 為 0，未收到 ACK；本輪 Server HTTP 亦無法連線。
-  已確認 Client 開機與本機無線電完成發送，尚未確認 Server 收到或 GPS 實際追蹤。
+- GPS fix 為 0，未收到 ACK；本輪 Station HTTP 亦無法連線。
+  已確認 Client 開機與本機無線電完成發送，尚未確認 Station 收到或 GPS 實際追蹤。
 
 ### 後續室內兩端通聯測試
 
-使用者同時開啟 Client／Server，電腦 USB 接 Server（晶片尾碼 584C）。
+使用者同時開啟 Client／Station，電腦 USB 接 Station（晶片尾碼 584C）。
 先確認 GPS client 綁定仍為 E91C；接著以 GET track 約每秒、status 約每 3 秒進行
 120.06 秒觀察，共 164 個 HTTP 請求，全部成功。
 
@@ -298,7 +298,7 @@ Jetson 指令；LoRa 仍持續接收。沒有注入 UART SET 或設定指南針�
 
 已移除的 stop／磁力計校正 API POST 回 404；舊 auto 模式與 bearing=360 校正
 請求回 400，未寫入校正。GPS 實際定位追蹤、Client 端收到 ACK 的紀錄、斷線恢復
-與實際機械指向仍未驗證；不能把 Server 的 ack_tx 當成 Client 已接收的直接證據。
+與實際機械指向仍未驗證；不能把 Station 的 ack_tx 當成 Client 已接收的直接證據。
 
 本次發現兩項問題，尚未修改韌體：
 
@@ -327,7 +327,7 @@ Jetson 指令；LoRa 仍持續接收。沒有注入 UART SET 或設定指南針�
   第一筆在 0 ms、之後間隔 75 ms，放開於 1,000 ms 補第 15 筆。這是模擬傳輸結果，
   實際網路較慢時頻率會降低，保留最新角度而不累積舊指令。
 - 既有網頁語法／DOM／模式／指南針模擬檢查與 `git diff --check` 通過。
-- Server build 通過：RAM 60,420 B，韌體空間 1,265,748 B；依晶片尾碼 584C 確認
+- Station build 通過：RAM 60,420 B，韌體空間 1,265,748 B；依晶片尾碼 584C 確認
   `/dev/ttyACM0` 後 USB 上傳成功，各區塊雜湊驗證通過。
 - 板上下載的首頁與本地修正版逐 byte 相同；以該頁程式重跑 7 個滑桿案例也全部通過。
   開機紀錄與 API 回報 manual／90°／PWM 正常、E91C 綁定保留，6 秒內新增 6 個
@@ -437,7 +437,7 @@ WMM 磁偏角無法補 Servo、鏡頭金屬與線路電流造成的局部磁場�
 斷電、不同指向的讀數；若變化明顯，拉開距離或改非磁性支架。現在沒有板上旋轉補償，
 腳架固定與重校的操作尤其重要。
 
-native 45 案例、client/server/server-ota build 與 USB Server 開機驗證已完成。
+native 45 案例、client/station/station-ota build 與 USB Station 開機驗證已完成。
 仍需台架測模式隔離、斷線／恢復、晚命令丟棄、I2C 故障與慢 HTTP 的最大服務間隔。
 編譯通過不能取代實機 OLED 位址、PWM 指向、GPS 日期、手機 UI 與 OTA 驗收。
 

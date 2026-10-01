@@ -1,4 +1,4 @@
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 #include "uart_servo_mode.h"
 
 namespace uart_servo_mode {

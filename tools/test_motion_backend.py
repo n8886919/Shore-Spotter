@@ -20,6 +20,8 @@ cpp=r'''
 #include <string>
 #include <map>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include "servo_motion.h"
 #include "servo_profile.h"
 #include "uart_target.h"
@@ -32,8 +34,11 @@ cpp=r'''
 #define ESP_ARDUINO_VERSION_MAJOR 3
 constexpr int SERVO_PIN=21;
 using std::isfinite;
+using geo::normalize360;
 template<class T>T constrain(T x,T a,T b){return std::min(std::max(x,a),b);}
-struct String:std::string{using std::string::string;String(const std::string&s):std::string(s){}explicit String(uint32_t n):std::string(std::to_string(n)){}float toFloat()const{return std::strtof(c_str(),nullptr);}};
+struct String:std::string{using std::string::string;String(const std::string&s):std::string(s){}explicit String(uint32_t n):std::string(std::to_string(n)){}
+ String(double n,unsigned char places){std::ostringstream s;s<<std::fixed<<std::setprecision(places)<<n;assign(s.str());}
+ float toFloat()const{return std::strtof(c_str(),nullptr);}};
 uint32_t clockMs=0,subMsUs=0,epochCounter=100,lastRxMs=0,controlBootId=42;
 uint32_t dataAirtimeMs=0;
 double radians(double degrees){return degrees*3.14159265358979323846/180.0;}
@@ -49,25 +54,26 @@ tracking_policy::Source controlSource=tracking_policy::Source::Hold;
 tracking_policy::Selector sourceSelector;servo_motion::Controller servoMotion;
 control_cadence::GpsCadence gpsCadence;
 command_freshness::HttpGate commandGate;
-uint32_t rejectedMotionCommands=0,servoLastDuty=UINT32_MAX;
+uint32_t rejectedMotionCommands=0,rejectedGpsSequence=0,servoLastDuty=UINT32_MAX;
 float servoAngleDeg=90,servoTargetDeg=90,gpsTarget=120,mountOffsetDeg=0;
 bool servoPwmReady=true,writeFails=false,mountCalibrated=false,declinationReady=false;
-bool serverFix=true,havePkt=true,gpsFeed=true;
-bool gpsPredictionEnabled=true;
+bool stationFix=true,havePkt=true,gpsFeed=true,haveStationSample=true;
+float declinationDeg=0;
+bool gpsPredictionEnabled=true, gpsFinishingTarget=false;
 struct Value{bool valid=true;double data=8;uint32_t ageMs=0;
  bool isValid()const{return valid;}double value()const{return data;}double hdop()const{return data;}uint32_t age()const{return ageMs;}};
 struct Gps{Value satellites,hdop{true,1.2,0},location;}gps;
-struct Data{bool fix=true,velocityValid=true;uint8_t satellites=8,hdop10=12,age10ms=0;double lat=24,lon=121;uint16_t speedCmS=500,courseDeg10=900;}lastData;
+struct Data{bool fix=true,velocityValid=true;uint8_t satellites=8,hdop10=12;double lat=24,lon=121;uint16_t speedCmS=500,courseDeg10=900;}lastData;
 struct CollectorStub{bool sample(uint32_t,gnss_snapshot::Snapshot&s){
- s.fix=serverFix;s.satellites=gps.satellites.valid?gps.satellites.data:255;
+ s.fix=stationFix;s.satellites=gps.satellites.valid?gps.satellites.data:255;
  s.hdop=gps.hdop.valid?gps.hdop.data:NAN;
- s.sourceAgeMs=std::max(gps.location.ageMs,std::max(gps.satellites.ageMs,gps.hdop.ageMs));return true;}}gnssCollector;
-bool gpsFixFresh(){return serverFix;}
+ s.sourceAgeMs=9000;s.arrivalAgeMs=gps.location.ageMs;return haveStationSample;}}gnssCollector;
+bool gpsFixFresh(){return stationFix&&haveStationSample&&gps.location.ageMs<2000;}
 int writes=0;
 bool ledcWrite(int,uint32_t){if(writeFails)return false;++writes;return true;}
 static bool gpsModeAvailable();static bool gpsTrackingUsable();
 void updateTracking(){if(trackMode==TrackMode::Gps&&controlSource==tracking_policy::Source::Gps&&gpsTrackingUsable())servoMotion.target(gpsTarget);}
-const char*trackModeStr(TrackMode){return "mode";}
+static const char *trackModeStr(TrackMode);
 String controlReply(){return "{}";}String motionSettingsJson(){return "{}";}
 void loadGpsClientBinding(){}
 struct Endpoint{
@@ -75,6 +81,7 @@ struct Endpoint{
  void enter(uint32_t){leave();}void leave(){mailbox=uart_target::Mailbox{};}
  void poll(){mailbox.expire(millis());}bool ready(){return mailbox.ready();}
  int32_t targetMdeg(){return mailbox.target();}
+ const char*stateName(){return ready()?"tracking":"waiting";}
 }uartServoMode;
 struct Http{
  std::map<std::string,String> params;int code=0;String body;
@@ -92,9 +99,12 @@ struct Prefs{
 '''
 for name in ['GPS_PREDICTION_KEY','DR_MIN_SPEED_CMS','DR_MAX_AGE_S','GPS_BACKLOG_GUARD_MS']:
  cpp+=re.search(r'constexpr[^;\n]*\b'+name+r'\b[^;]*;',source).group()+'\n'
-for marker in ['static uint32_t clientSampleAgeMs()','static bool clientFixFresh()','static bool haveBearingFix()','static bool setServoAngle(float deg) {','static bool gpsModeAvailable() {','static bool gpsTrackingUsable() {','static void enterManual() {','static void serviceControl() {','static bool selectTrackingMode(TrackMode mode) {','static bool parseAngleArgument(','static bool acceptMotionRequest() {','static bool saveServoSpeed(double speed) {','static bool requestTrackingMode(TrackMode mode) {','static void loadServerSettings() {','static void predictClientPos(','static void appendCommandContext(','static String gpsPredictionJson() {','static bool saveGpsPrediction(']:
+cpp+=block('static const char *trackModeStr(')+'\n'
+for marker in ['static uint32_t clientSampleAgeMs()','static bool clientFixFresh()','static bool haveBearingFix()','static bool setServoAngle(float deg) {','static bool gpsModeAvailable() {','static bool gpsPredictionAllowed() {','static bool gpsTrackingUsable() {','static void enterManual() {','static void serviceControl() {','static bool selectTrackingMode(TrackMode mode) {','static bool parseAngleArgument(','static bool acceptMotionRequest() {','static bool saveServoSpeed(double speed) {','static bool requestTrackingMode(TrackMode mode) {','static void loadStationSettings() {','static void predictClientPos(','static void appendCommandContext(','static String gpsPredictionJson() {','static bool saveGpsPrediction(']:
  cpp+=block(marker)+'\n'
-for path,name in [('/api/servo','manualHttp'),('/api/servo/mode','modeHttp'),('/api/servo/settings','settingsHttp'),('/api/track/start','startHttp'),('/api/track/resume','resumeHttp'),('/api/track/prediction','predictionHttp')]:
+for marker in ['static float lockMountOffset(','static bool compassCalibrationReady() {','static void appendServoJson(']:
+ cpp+=block(marker)+'\n'
+for path,name in [('/api/servo/center','centerHttp'),('/api/servo','manualHttp'),('/api/servo/mode','modeHttp'),('/api/servo/settings','settingsHttp'),('/api/track/start','startHttp'),('/api/track/resume','resumeHttp'),('/api/track/pause','pauseHttp'),('/api/track/prediction','predictionHttp'),('/api/track/calibrate','calibrateHttp')]:
  marker=re.search(r'httpServer.on\("'+re.escape(path)+r'",\s*HTTP_POST,\s*\[\]\(\)\s*{',source).group()
  b=block(marker);cpp+='void '+name+'()'+b[b.index('{'):]+'\n'
 marker=re.search(r'httpServer.on\("/api/track/prediction",\s*HTTP_GET,\s*\[\]\(\)\s*{',source).group()
@@ -102,12 +112,18 @@ b=block(marker);cpp+='void predictionGet()'+b[b.index('{'):]+'\n'
 cpp+=r'''
 void auth(){httpServer.params.clear();httpServer.params["epoch"]=std::to_string(commandGate.epoch());
  httpServer.params["seq"]=std::to_string(commandGate.sequence()+1);httpServer.params["stamp"]=std::to_string(clockMs);}
-void reset(){clockMs=subMsUs=0;writes=0;writeFails=false;servoPwmReady=true;serverFix=havePkt=gpsFeed=true;
- gps=Gps{};lastData=Data{};lastRxMs=0;dataAirtimeMs=0;mountCalibrated=declinationReady=false;gpsPredictionEnabled=true;
- gpsCadence={};servoLastDuty=servo_profile::dutyForAngle(90);servoMotion.initializeUs(90,0);
+void reset(){clockMs=subMsUs=0;writes=0;writeFails=false;servoPwmReady=true;stationFix=havePkt=gpsFeed=true;
+ gps=Gps{};lastData=Data{};lastRxMs=0;dataAirtimeMs=0;mountCalibrated=declinationReady=false;gpsPredictionEnabled=haveStationSample=true;mountOffsetDeg=0;
+ gpsCadence={};gpsTarget=120;servoLastDuty=servo_profile::dutyForAngle(90);servoMotion.initializeUs(90,0);
  servoMotion.setSpeed(30);servoAngleDeg=servoTargetDeg=90;enterManual();lastTrackingMode=TrackMode::Uart;}
 void run(uint32_t duration){const auto end=clockMs+duration;while(clockMs<end){clockMs+=10;if(gpsFeed)lastRxMs=clockMs;serviceControl();}}
 int main(){
+ reset();mountOffsetDeg=-123;mountCalibrated=false;loadStationSettings();
+ assert(mountCalibrated&&mountOffsetDeg==90);declinationReady=true;
+ assert(gpsTrackingUsable());selectTrackingMode(TrackMode::Gps);run(50);
+ assert(controlSource==tracking_policy::Source::Gps);
+ loadStationSettings();assert(mountOffsetDeg==90&&mountCalibrated);
+ std::cout<<"PASS valid 90-degree boot calibration, immediate GPS eligibility and reboot reference reset\n";
  reset();assert(selectTrackingMode(TrackMode::Uart));assert(trackMode==TrackMode::Uart&&!uartServoMode.ready());
  run(1000);assert(writes==0&&servoAngleDeg==90);
  for(int i=0;i<100;i++){uartServoMode.mailbox.set(120000,clockMs);run(10);}
@@ -120,13 +136,13 @@ int main(){
  auth();httpServer.params["speed"]="20";settingsHttp();assert(httpServer.code==200&&servoMotion.speed()==20);
  assert(prefs.writes==1&&prefs.getUInt(servo_motion::kSpeedKey,0)==20000&&servoMotion.requested()==goal&&trackMode==mode);
  auth();httpServer.params["speed"]="20";settingsHttp();assert(httpServer.code==200&&prefs.writes==1);
- reset();loadServerSettings();assert(servoMotion.speed()==20);selectTrackingMode(TrackMode::Uart);
+ reset();loadStationSettings();assert(servoMotion.speed()==20);selectTrackingMode(TrackMode::Uart);
  auth();httpServer.params["speed"]="29.5";settingsHttp();assert(httpServer.code==200&&servoMotion.speed()==29.5&&trackMode==TrackMode::Uart);
  prefs.fail=true;auth();httpServer.params["speed"]="90";settingsHttp();assert(httpServer.code==503&&servoMotion.speed()==29.5);
  prefs.fail=false;auth();httpServer.params["speed"]="91";settingsHttp();assert(httpServer.code==400);
  auth();httpServer.params["speed"]="30";httpServer.params["action"]="apply";settingsHttp();assert(httpServer.code==400);
- reset();loadServerSettings();assert(servoMotion.speed()==29.5);
- prefs.values.clear();prefs.values["motioncfg"]=90000;loadServerSettings();assert(servoMotion.speed()==30);
+ reset();loadStationSettings();assert(servoMotion.speed()==29.5);
+ prefs.values.clear();prefs.values["motioncfg"]=90000;loadStationSettings();assert(servoMotion.speed()==30);
  std::cout<<"PASS live automatic speed persistence, reboot reload, no duplicate writes, failed-save retention and old profile retirement\n";
  reset();gps.satellites.data=6;gps.hdop.data=3;lastData.satellites=6;lastData.hdop10=30;
  assert(gpsModeAvailable());selectTrackingMode(TrackMode::Uart);lastData.fix=false;
@@ -134,17 +150,72 @@ int main(){
  assert(httpServer.code==409&&trackMode==TrackMode::Uart&&commandGate.epoch()==epoch);
  auth();startHttp();assert(httpServer.code==409&&trackMode==TrackMode::Uart);
  lastTrackingMode=TrackMode::Gps;auth();resumeHttp();assert(httpServer.code==409&&trackMode==TrackMode::Uart);
- lastData.fix=true;gps.hdop.ageMs=2000;assert(!gpsModeAvailable());gps.hdop.ageMs=0;
+ lastData.fix=true;gps.hdop.ageMs=2000;assert(gpsModeAvailable());gps.hdop.ageMs=0;
  gps.location.ageMs=2000;assert(!gpsModeAvailable());gps.location.ageMs=0;
- lastData.hdop10=255;assert(!gpsModeAvailable());lastData.hdop10=30;
- serverFix=false;assert(!gpsModeAvailable());serverFix=true;
- gps.satellites.data=5;assert(!gpsModeAvailable());gps.satellites.data=6;
- gps.hdop.data=NAN;assert(!gpsModeAvailable());gps.hdop.data=3;
+ lastData.hdop10=255;assert(gpsModeAvailable()&&!gpsPredictionAllowed());lastData.hdop10=30;
+ stationFix=false;assert(!gpsModeAvailable());stationFix=true;
+ gps.satellites.data=5;assert(gpsModeAvailable()&&!gpsPredictionAllowed());gps.satellites.data=6;
+ gps.hdop.data=NAN;assert(gpsModeAvailable()&&!gpsPredictionAllowed());gps.hdop.data=3;
  auth();httpServer.params["mode"]="gps";modeHttp();assert(httpServer.code==200&&trackMode==TrackMode::Gps);
  run(3000);assert(servoAngleDeg==90);mountCalibrated=declinationReady=true;
- run(2000);assert(servoAngleDeg==90);run(1500);assert(std::abs(servoAngleDeg-120)<1e-4);
+ run(50);assert(controlSource==tracking_policy::Source::Gps&&sourceSelector.gpsReady());
+ assert(servoTargetDeg==120&&servoAngleDeg>90&&servoAngleDeg<=91.5);
+ run(1000);assert(std::abs(servoAngleDeg-120)<1e-4);
  gpsFeed=false;run(2000);assert(controlSource==tracking_policy::Source::Hold&&trackMode==TrackMode::Gps);
- std::cout<<"PASS actual dual-GPS Good/OK gate, Bad/Miss/stale rejection on mode/start/resume, calibration and loss hold\n";
+ std::cout<<"PASS actual dual-GPS valid-position gate, weak quality accepted, invalid/stale rejection on mode/start/resume, calibration and frozen last target\n";
+ // Real serviceControl + source/RF/receive age: resume at the next GPS cadence
+ // without waiting 2 s; freeze the target at the unchanged freshness boundary.
+ reset();gpsFeed=false;mountCalibrated=declinationReady=true;
+ gpsTarget=180;dataAirtimeMs=330;
+ assert(selectTrackingMode(TrackMode::Gps));serviceControl();
+ assert(controlSource==tracking_policy::Source::Gps&&sourceSelector.gpsReady());
+ run(50);assert(servoTargetDeg==180&&servoAngleDeg>90&&servoAngleDeg<=91.5);
+ run(1940);clockMs+=5;serviceControl();assert(clientSampleAgeMs()==1995);
+ assert(controlSource==tracking_policy::Source::Gps);
+ clockMs+=5;serviceControl();
+ assert(clientSampleAgeMs()==2000);
+ assert(controlSource==tracking_policy::Source::Hold&&!sourceSelector.gpsReady());
+ const auto expiredAngle=servoAngleDeg;const auto expiredWrites=writes;
+ assert(servoTargetDeg==180&&gpsFinishingTarget);run(100);
+ assert(servoAngleDeg>expiredAngle&&writes>expiredWrites&&servoTargetDeg==180);
+ run(1000);assert(servoAngleDeg==180&&!gpsFinishingTarget);
+ const auto finishedAngle=servoAngleDeg;
+ lastRxMs=clockMs;gpsTarget=60;serviceControl();
+ assert(controlSource==tracking_policy::Source::Gps&&sourceSelector.gpsReady());
+ run(50);assert(servoTargetDeg==60&&servoAngleDeg<finishedAngle);
+ assert(finishedAngle-servoAngleDeg<=1.5001);
+ // Even short alternating valid/invalid periods must not accumulate a new
+ // recovery wait, reuse stale targets, bypass mode isolation or skip slew limits.
+ for(int i=0;i<4;++i){
+  lastData.fix=false;uartServoMode.mailbox.set(180000,clockMs);serviceControl();
+  assert(controlSource==tracking_policy::Source::Hold&&!sourceSelector.gpsReady());
+  const auto angle=servoAngleDeg;const auto target=servoTargetDeg;run(10);
+  assert(servoTargetDeg==target&&std::abs(servoAngleDeg-angle)<=.3001);
+  const auto recoveredAngle=servoAngleDeg;
+  lastData.fix=true;lastRxMs=clockMs;gpsTarget=i%2?60:120;serviceControl();
+  assert(controlSource==tracking_policy::Source::Gps&&sourceSelector.gpsReady());
+  run(50);assert(servoTargetDeg==gpsTarget&&std::abs(servoAngleDeg-recoveredAngle)<=1.5001);
+ }
+ gps.hdop.data=3.01;serviceControl();assert(controlSource==tracking_policy::Source::Gps&&!gpsPredictionAllowed());
+ gps.hdop.data=1.2;serviceControl();assert(controlSource==tracking_policy::Source::Gps);
+ stationFix=false;serviceControl();assert(controlSource==tracking_policy::Source::Hold);
+ stationFix=true;serviceControl();assert(controlSource==tracking_policy::Source::Gps);
+ const auto faultWrites=writes;servoPwmReady=false;serviceControl();run(50);
+ assert(trackMode==TrackMode::Paused&&controlSource==tracking_policy::Source::Hold);
+ assert(!sourceSelector.gpsReady()&&writes==faultWrites);
+ // The last-GPS-target exception must never survive an explicit pause/mode change.
+ for(const auto requested:{TrackMode::Paused,TrackMode::Manual,TrackMode::Uart}) {
+  reset();mountCalibrated=declinationReady=true;
+  assert(selectTrackingMode(TrackMode::Gps));run(100);
+  lastData.fix=false;serviceControl();assert(gpsFinishingTarget&&servoMotion.moving());
+  const auto stoppedAt=servoAngleDeg;
+  if(requested==TrackMode::Paused){auth();pauseHttp();assert(httpServer.code==200);}
+  else if(requested==TrackMode::Manual)enterManual();
+  else assert(selectTrackingMode(requested));
+  run(1000);
+  assert(!gpsFinishingTarget&&servoAngleDeg==stoppedAt);
+ }
+ std::cout<<"PASS actual GPS initial/recovered target within 50 ms, age-2000 freezes target and finishes, flapping without delay, shared slew limit, mode isolation and PWM fault hold\n";
  reset();auth();httpServer.params["angle"]="150";manualHttp();serviceControl();
  subMsUs=100;serviceControl();assert(writes==0);subMsUs=400;serviceControl();assert(writes==1);
  int previous=writes;serviceControl();assert(writes==previous);
@@ -154,8 +225,119 @@ int main(){
  reset();selectTrackingMode(TrackMode::Uart);auto oldEpoch=commandGate.epoch();enterManual();
  auth();httpServer.params["epoch"]=std::to_string(oldEpoch);httpServer.params["angle"]="0";manualHttp();assert(httpServer.code==409);
  std::cout<<"PASS stale HTTP epoch rejection\n";
- reset();prefs.values.clear();prefs.writes=0;loadServerSettings();assert(gpsPredictionEnabled);
- predictionGet();assert(httpServer.code==200&&httpServer.body.find("\"enabled\":true,\"alpha\":1")!=std::string::npos);
+ // Screenshot regression: already selected GPS, fresh Good fixes, stationary
+ // but still uncalibrated. Tracking holds, yet calibration must remain usable.
+ reset();declinationReady=true;declinationDeg=-5;
+ assert(selectTrackingMode(TrackMode::Gps));serviceControl();
+ assert(!mountCalibrated&&!servoMotion.moving()&&controlSource==tracking_policy::Source::Hold);
+ assert(gpsModeAvailable()&&!gpsTrackingUsable());
+ String waiting;appendServoJson(waiting);
+ for(const char *field:{"\"mode\":\"gps\"","\"source\":\"hold\"","\"calibrated\":false",
+                        "\"gps_available\":true","\"gps_usable\":false"})
+  assert(waiting.find(field)!=std::string::npos);
+ auto calibrationEpoch=commandGate.epoch();auto calibrationWrites=prefs.writes;
+ auth();httpServer.params["bearing"]="350";calibrateHttp();
+ assert(httpServer.code==200&&mountCalibrated&&std::abs(mountOffsetDeg-80)<1e-5);
+ assert(trackMode==TrackMode::Gps&&commandGate.epoch()==calibrationEpoch&&gpsTrackingUsable());
+ assert(writes==0&&prefs.writes==calibrationWrites&&servoAngleDeg==90&&servoMotion.requested()==90);
+ assert(httpServer.body.find("\"bearing\":350.00")!=std::string::npos);
+ assert(httpServer.body.find("\"mount_offset_deg\":80.00")!=std::string::npos);
+ String calibrated;appendServoJson(calibrated);
+ assert(calibrated.find("\"calibrated\":true")!=std::string::npos);
+ std::cout<<"PASS screenshot regression: GPS hold while uncalibrated accepts 350 degrees and stays in GPS without immediate PWM\n";
+ // Exercise the actual calibration handler and status serializer, including the
+ // reported UART/no-Client case and a command still moving at receipt time.
+ for(auto m:{TrackMode::Manual,TrackMode::Uart,TrackMode::Gps,TrackMode::Paused}){
+  reset();trackMode=m;havePkt=false;lastData.fix=false;declinationReady=false;
+  gps.hdop.data=1.5;gps.location.ageMs=1799;servoMotion.target(150);
+  assert(servoMotion.moving()&&!gpsModeAvailable());
+  auto savedEpoch=commandGate.epoch();auto savedSource=controlSource;auto savedWrites=prefs.writes;
+  auth();httpServer.params["bearing"]="100";calibrateHttp();
+  assert(httpServer.code==409&&!mountCalibrated&&mountOffsetDeg==0);
+  assert(trackMode==m&&controlSource==savedSource&&commandGate.epoch()==savedEpoch);
+  assert(servoMotion.requested()==150&&servoAngleDeg==90&&writes==0&&prefs.writes==savedWrites);
+  assert(httpServer.body.find("90°")!=std::string::npos);
+ }
+ for(int bad=0;bad<12;++bad){
+  reset();mountCalibrated=true;mountOffsetDeg=23;
+  switch(bad){
+   case 0:stationFix=false;break;
+   case 1:gps.satellites.data=7;break; // OK quality no longer gates calibration
+   case 2:gps.hdop.data=1.51;break;
+   case 3:gps.hdop.data=NAN;break;
+   case 4:gps.hdop.data=-1;break;
+   case 5:gps.satellites.valid=false;break;
+   case 6:gps.hdop.valid=false;break;
+   case 7:gps.location.ageMs=1800;break; // source plus 200 ms uncertainty
+   case 8:gps.location.ageMs=UINT32_MAX;break;
+   case 9:haveStationSample=false;break;
+   case 10:gps.satellites.ageMs=1800;break;
+   case 11:gps.hdop.ageMs=1800;break;
+  }
+  auth();httpServer.params["bearing"]="100";calibrateHttp();
+  assert(httpServer.code==200&&mountCalibrated&&mountOffsetDeg==-170&&writes==0);
+ }
+ for(auto m:{TrackMode::Manual,TrackMode::Uart,TrackMode::Gps,TrackMode::Paused}){
+  reset();trackMode=m;stationFix=havePkt=haveStationSample=servoPwmReady=false;
+  servoMotion.faultUs(micros());auto faultEpoch=commandGate.epoch();auto faultWrites=prefs.writes;
+  for(const char *bearing:{"100","350","0"}){
+   auth();httpServer.params["bearing"]=bearing;calibrateHttp();
+   assert(httpServer.code==200&&mountCalibrated&&servoMotion.faulted()&&!servoPwmReady);
+   assert(trackMode==m&&commandGate.epoch()==faultEpoch&&writes==0&&prefs.writes==faultWrites);
+   assert(servoAngleDeg==90&&servoMotion.requested()==90);
+  }
+  assert(mountOffsetDeg==90); // the latest accepted calibration replaces the old reference
+ }
+ reset();for(const char*invalid:{"","nan","inf","-1","360","100junk"}){
+  auth();httpServer.params["bearing"]=invalid;calibrateHttp();assert(httpServer.code==400&&!mountCalibrated);
+ }
+ auth();httpServer.params["bearing"]="100";httpServer.params["epoch"]="0";calibrateHttp();
+ assert(httpServer.code==409&&!mountCalibrated);
+ auth();httpServer.params["bearing"]="100";calibrateHttp();assert(httpServer.code==200);
+ calibrateHttp();assert(httpServer.code==409); // duplicate command
+ auto previousOffset=mountOffsetDeg;auth();httpServer.params["bearing"]="350";clockMs+=2000;calibrateHttp();
+ assert(httpServer.code==409&&mountOffsetDeg==previousOffset); // no late overwrite
+ std::cout<<"PASS actual compass recalibration: settled centre required in all modes, GPS independent; repeat replaces RAM without changing control/PWM/NVS; invalid/stale/replayed requests rejected\n";
+
+ // Rounded display angles, moving through centre, and a newly queued target
+ // must not bypass the authoritative centre check or change the old reference.
+ for(double angle:{0.,89.96,89.999,90.001,90.04,180.}){
+  reset();mountCalibrated=true;mountOffsetDeg=23;
+  servoAngleDeg=angle;servoMotion.initializeUs(angle,0);
+  assert(!compassCalibrationReady());String status;appendServoJson(status);
+  assert(status.find("\"calibration_ready\":false")!=std::string::npos);
+  auth();httpServer.params["bearing"]="90";calibrateHttp();
+  assert(httpServer.code==409&&mountOffsetDeg==23&&writes==0);
+ }
+ reset();servoMotion.target(120);auth();httpServer.params["bearing"]="90";calibrateHttp();
+ assert(httpServer.code==409&&!mountCalibrated&&servoMotion.requested()==120);
+ reset();assert(compassCalibrationReady());String centre;appendServoJson(centre);
+ assert(centre.find("\"calibration_ready\":true")!=std::string::npos);
+ for(auto m:{TrackMode::Manual,TrackMode::Uart,TrackMode::Gps,TrackMode::Paused}){
+  reset();trackMode=m;servoAngleDeg=150;servoMotion.initializeUs(150,0);servoMotion.target(180);
+  mountCalibrated=true;mountOffsetDeg=23;gpsFinishingTarget=true;
+  uartServoMode.mailbox.set(180000,clockMs);auto savedWrites=prefs.writes;
+  const auto oldEpoch=commandGate.epoch();auth();centerHttp();
+  assert(httpServer.code==200&&trackMode==TrackMode::Manual);
+  assert(servoMotion.requested()==90&&servoTargetDeg==90&&servoAngleDeg==150&&writes==0);
+  assert(!gpsFinishingTarget&&!uartServoMode.ready()&&commandGate.epoch()!=oldEpoch);
+  assert(mountOffsetDeg==23&&mountCalibrated&&servoMotion.speed()==30&&prefs.writes==savedWrites);
+  auth();httpServer.params["bearing"]="90";calibrateHttp();assert(httpServer.code==409);
+  run(1000);assert(std::abs(servoAngleDeg-120)<.001&&!compassCalibrationReady());
+  run(1100);assert(servoAngleDeg==90&&compassCalibrationReady());
+  auth();httpServer.params["bearing"]="90";calibrateHttp();assert(httpServer.code==200&&mountOffsetDeg==180);
+  auth();httpServer.params["epoch"]=std::to_string(oldEpoch);centerHttp();assert(httpServer.code==409);
+ }
+ for(int fail=0;fail<2;++fail){
+  reset();trackMode=TrackMode::Uart;servoMotion.target(120);
+  if(fail)servoMotion.faultUs(0);else servoPwmReady=false;
+  const auto target=servoMotion.requested();const auto epoch=commandGate.epoch();auth();centerHttp();
+  assert(httpServer.code==503&&trackMode==TrackMode::Uart&&servoMotion.requested()==target);
+  assert(commandGate.epoch()==epoch&&writes==0);
+ }
+ std::cout<<"PASS centre-only calibration, authoritative precision/race gate; centre cancels GPS/UART and slews in Manual; failed/stale centre leaves control intact\n";
+ reset();prefs.values.clear();prefs.values["gpspredict"]=1;prefs.writes=0;loadStationSettings();assert(!gpsPredictionEnabled);
+ predictionGet();assert(httpServer.code==200&&httpServer.body.find("\"enabled\":false,\"alpha\":0")!=std::string::npos);
  assert(httpServer.body.find("\"control_boot_id\":42")!=std::string::npos);
  for(auto m:{TrackMode::Manual,TrackMode::Uart,TrackMode::Gps,TrackMode::Paused}){
   if(m==TrackMode::Manual||m==TrackMode::Paused){enterManual();trackMode=m;}else assert(selectTrackingMode(m));
@@ -173,9 +355,10 @@ int main(){
  auto persistedWrites=prefs.writes;auth();httpServer.params["enabled"]="1";predictionHttp();
  assert(httpServer.code==200&&prefs.writes==persistedWrites);
  auth();httpServer.params["enabled"]="0";predictionHttp();assert(httpServer.code==200&&!gpsPredictionEnabled);
- reset();loadServerSettings();assert(!gpsPredictionEnabled);
- prefs.values[GPS_PREDICTION_KEY]=9;loadServerSettings();assert(gpsPredictionEnabled);
- prefs.values.erase(GPS_PREDICTION_KEY);gpsPredictionEnabled=false;loadServerSettings();assert(gpsPredictionEnabled);
+ reset();loadStationSettings();assert(!gpsPredictionEnabled);
+ prefs.values[GPS_PREDICTION_KEY]=9;loadStationSettings();assert(!gpsPredictionEnabled);
+ prefs.values.erase(GPS_PREDICTION_KEY);gpsPredictionEnabled=true;loadStationSettings();assert(!gpsPredictionEnabled);
+ gpsPredictionEnabled=true; // subsequent invalid requests must retain this explicit runtime setting
  std::cout<<"PASS actual prediction GET/POST, all modes isolated, no immediate PWM, reboot/default and duplicate-save behavior\n";
  for(const char*invalid:{"", "true", "2", "0.0", " 1", "1x", "-1"}){
   auth();httpServer.params["enabled"]=invalid;predictionHttp();assert(httpServer.code==400&&gpsPredictionEnabled);
@@ -200,17 +383,22 @@ int main(){
  gpsPredictionEnabled=true;clockMs=8000;lastData.courseDeg10=0;predictClientPos(lat,lon);
  assert(lat==24&&lon==121); // expired position cannot be projected
  clockMs=1500;lastData.velocityValid=false;predictClientPos(lat,lon);assert(lat==24&&lon==121);
- lastData.velocityValid=true;lastData.age10ms=50;dataAirtimeMs=165;predictClientPos(lat,lon);
- assert(clientSampleAgeMs()==1165&&std::abs((lat-24)*111320-5.825)<1e-6);
- lastData.age10ms=150;predictClientPos(lat,lon);assert(lat==24&&lon==121&&!gpsModeAvailable());
- lastData.age10ms=255;assert(!clientFixFresh());lastData.age10ms=0;dataAirtimeMs=0;
+ lastData.velocityValid=true;dataAirtimeMs=330;predictClientPos(lat,lon);
+ assert(clientSampleAgeMs()==500&&std::abs((lat-24)*111320-2.5)<1e-6);
+ for(int bad=0;bad<4;++bad){
+  lastData.hdop10=bad==0?31:12;lastData.satellites=bad==1?0:8;
+  gps.hdop.data=bad==2?NAN:1.2;gps.satellites.data=bad==3?5:8;
+  assert(gpsModeAvailable());predictClientPos(lat,lon);assert(lat==24&&lon==121);
+ }
+ gps.hdop.data=1.2;gps.satellites.data=8;lastData.hdop10=12;lastData.satellites=8;
+ predictClientPos(lat,lon);assert(lat>24); // new eligible vector can be used, no stale cache
  lastData.speedCmS=29;predictClientPos(lat,lon);assert(lat==24&&lon==121);
  lastData.speedCmS=500;lastRxMs=UINT32_MAX-249;clockMs=250;predictClientPos(lat,lon);
  assert(std::abs((lat-24)*111320-2.5)<1e-7);
- std::cout<<"PASS actual predictor alpha=0/1, source+RF+receive age, expiry, velocity validity, low-speed bypass and millis wrap\n";
+ std::cout<<"PASS actual predictor alpha=0/1, receive elapsed only, expiry, velocity validity, low-speed bypass and millis wrap\n";
 }
 '''
-assert '  selectTrackingMode(TrackMode::Uart);  // default source; wait for fresh UART input' in source
+assert '  enterManual();  // boot in Manual; LoRa reception and SD recording remain active' in source
 assert '/api/servo/diagnostics' not in source and 'WEB_LOG_HTML' not in source
 (p/'runtime_integration.cpp').write_text(cpp)
 cmd=['c++','-std=c++17','-Wall','-Wextra','-O2','-I',str(Path('include').resolve()),str(p/'runtime_integration.cpp'),'-o',str(p/'runtime_integration')]

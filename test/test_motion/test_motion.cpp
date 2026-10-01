@@ -73,7 +73,12 @@ void test_http_generation_sequence_age_and_wrap() {
 void test_radio_sequence_and_reboot_candidates() {
   command_freshness::RadioSequence seq;TEST_ASSERT_TRUE(seq.accept(65535,0));TEST_ASSERT_TRUE(seq.accept(0,1000));
   TEST_ASSERT_FALSE(seq.accept(65535,1100));TEST_ASSERT_FALSE(seq.accept(0,1200));TEST_ASSERT_TRUE(seq.accept(10,2000));
-  TEST_ASSERT_FALSE(seq.accept(0,5000));TEST_ASSERT_FALSE(seq.accept(0,6000));TEST_ASSERT_TRUE(seq.accept(1,6000));
+  TEST_ASSERT_FALSE(seq.accept(0,4999));
+  TEST_ASSERT_FALSE(seq.accept(0,5000,false)); // no-fix must not establish a baseline
+  TEST_ASSERT_TRUE(seq.accept(0,5000));TEST_ASSERT_TRUE(seq.resetAfterGap());
+  TEST_ASSERT_FALSE(seq.accept(0,6000));TEST_ASSERT_TRUE(seq.accept(1,6000));
+  TEST_ASSERT_FALSE(seq.resetAfterGap());
+  TEST_ASSERT_TRUE(seq.accept(1,9000));TEST_ASSERT_TRUE(seq.resetAfterGap());
 }
 int main(int,char**){UNITY_BEGIN();
  RUN_TEST(test_shared_default_and_persistent_speed_value);

@@ -5,7 +5,7 @@
 
 namespace client_binding {
 constexpr bool validId(uint16_t id) {
-  return id != 0 && id != SERVER_ID && id != ID_BROADCAST;
+  return id != 0 && id != STATION_ID && id != ID_BROADCAST;
 }
 
 inline bool parseId(const char *text, size_t length, uint16_t &id) {

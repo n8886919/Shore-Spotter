@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include "uart_target.h"

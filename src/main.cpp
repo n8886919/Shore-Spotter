@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <algorithm>
 #include <Wire.h>
 #include <SPI.h>
 #include <RadioLib.h>
@@ -12,27 +13,52 @@
 #include <XPowersLib.h>
 
 #include <U8g2lib.h>
+#include "client_boot_animation.h"
 
-#include "protocol.h"  // shared LoRa wire protocol (client + server)
+#include "protocol.h"  // shared LoRa wire protocol (client + station)
 #include "firmware_version.h"
 #include "geo_math.h"  // pure maths (angles / bearing / circle fit / grading)
 #include "tracking_policy.h"
 #include "loop_metrics.h"
+#include "power_irq.h"
 #include "gnss_snapshot.h"
+#include "gnss_diagnostics.h"
+#include "gnss_rate.h"
 #include "lora_schedule.h"
-#include "async_lora_ack.h"
+#include "client_cadence.h"
+#include "async_lora_tx.h"
+#include "sd_log.h"
+#if defined(FIELD_DIAGNOSTIC)
+#include "diagnostic_store.h"
+#include "field_diagnostic.h"
+#endif
+#if defined(CLIENT_TRIP_LOG)
+#if !defined(FIELD_DIAGNOSTIC) || !defined(ROLE_CLIENT)
+#error CLIENT_TRIP_LOG requires FIELD_DIAGNOSTIC and ROLE_CLIENT
+#endif
+#include "trip_log.h"
+#endif
+#if defined(ROLE_CLIENT)
+#include <atomic>
+#include "client_sd_policy.h"
+#endif
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoOTA.h>
+#include <cJSON.h>
+#include <esp_heap_caps.h>
+#include "axiom_log.h"
 #include "alerts.h"    // 現場提醒的門檻與分級
 #include "uart_servo_mode.h"  // UART input, shared with GPS tracking
 #include "servo_motion.h"
 #include "control_cadence.h"
+#include "station_position.h"
 #include "command_freshness.h"
 #include "client_binding.h"
 #include "packet_diagnostics.h"
+#include "packet_rate.h"
 #include "http_timing.h"
 #include "magnetic_declination.h"
 #include "web_icon.h"  // 分頁圖示（由 tools/make_icon.py 產生）
@@ -42,15 +68,15 @@
 
 // IMPORTANT:
 // This project keeps one main.cpp and splits behavior by build flags:
-// ROLE_CLIENT (water side) / ROLE_SERVER (shore side).
-// Upload env:tbeam-client or env:tbeam-server to each board.
+// ROLE_CLIENT (water side) / ROLE_STATION (shore side).
+// Upload env:tbeam-client or env:tbeam-station to each board.
 //
 // Fail fast at compile time: exactly one role must be selected.
-#if !defined(ROLE_CLIENT) && !defined(ROLE_SERVER)
-#error "No role selected: define ROLE_CLIENT or ROLE_SERVER (use env:tbeam-client / env:tbeam-server)."
+#if !defined(ROLE_CLIENT) && !defined(ROLE_STATION)
+#error "No role selected: define ROLE_CLIENT or ROLE_STATION (use env:tbeam-client / env:tbeam-station)."
 #endif
-#if defined(ROLE_CLIENT) && defined(ROLE_SERVER)
-#error "Both roles defined: pick only ROLE_CLIENT or ROLE_SERVER, not both."
+#if defined(ROLE_CLIENT) && defined(ROLE_STATION)
+#error "Both roles defined: pick only ROLE_CLIENT or ROLE_STATION, not both."
 #endif
 
 // T-Beam Supreme (SX1262) pins from LilyGO hardware docs.
@@ -65,50 +91,28 @@ constexpr int LORA_BUSY = 4;
 // Taiwan legal LoRa sub-band (AS923 profile commonly uses 923.2 MHz).
 constexpr float RF_FREQUENCY = 923.2;
 constexpr float RF_BW = 125.0;
-constexpr int RF_SF = 9;
-// Coding rate 4/5 (RadioLib takes the denominator, 5..8).
-// 4/7 -> 4/5 removes ~21 % of the airtime of every packet at effectively no
-// sensitivity cost — Semtech quotes its sensitivity figures at 4/5; the extra
-// parity of 4/7 buys robustness against burst interference, not link budget.
-// SF is deliberately left at 9: SF8 would halve the airtime again but costs
-// 2.5 dB (~25 % range), which is the wrong trade for a tracker worn in the water.
-//
-// RF_SF / RF_BW / RF_FREQUENCY / RF_SYNC_WORD must match on both boards or the
-// link dies. RF_CR does NOT: in explicit-header mode (RadioLib's default, and
-// implicitHeader() is never called here) the payload coding rate is carried in
-// the header itself, which is always sent at 4/8, so a receiver decodes any CR
-// regardless of how it is configured. Mixed-CR boards interoperate fine — CR
-// only sets what this board uses for its own transmissions.
+constexpr int RF_SF = 10;
+// SF10 trades airtime for sensitivity. DATA fits a 500 ms slot; low-rate
+// diagnostics use dedicated slots interleaved with DATA. Both roles must match.
+// Coding rate 4/5; v5 uplink codecs are shared by both roles.
 constexpr int RF_CR = 5;
 constexpr int RF_SYNC_WORD = 0x12;
+// Fixed per-role power is applied by initRadio() on boot and radio recovery.
+// Legacy Client NVS txpwr/atpc values are intentionally no longer read.
+#if defined(ROLE_CLIENT)
+constexpr int TX_POWER_DBM = 20;
+#else
 constexpr int TX_POWER_DBM = 17;
-constexpr int TX_POWER_MIN_DBM = 10;
-constexpr int TX_POWER_MAX_DBM = 22;
-constexpr uint32_t ATPC_EVAL_MS = 15000;
+#endif
 
-constexpr uint32_t SEND_INTERVAL_MS = 500;  // RF 2 Hz; GNSS epochs are measured separately
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000;  // battery + env packet rate
-// TELEMETRY_INTERVAL_MS is an exact multiple of SEND_INTERVAL_MS, so a telemetry
-// packet that is simply "due" always lands on top of a position packet and the
-// ACK that follows it — both sides end up transmitting at once and both packets
-// are lost. Telemetry is therefore only started inside the quiet slot of the
-// position cycle. The slot bounds are derived at boot from the radio's own
-// time-on-air (see computeAirtimeBudget) rather than hand-tuned, so they follow
-// any change to RF_SF / RF_CR / packet size / SEND_INTERVAL_MS automatically.
+constexpr uint32_t SEND_INTERVAL_MS = gnss_rate::kTargetIntervalMs;  // requested GNSS period, not a DATA timer
+constexpr uint32_t TELEMETRY_INTERVAL_MS = 60000;  // battery + env packet rate
+// Leave bounded settling/service headroom before the next RF slot.
 constexpr uint32_t TELEMETRY_SLOT_GUARD_MS = 80;
 constexpr uint32_t BATTERY_UPDATE_MS = 5000;
 
-// DATA owns its sequence. Telemetry cannot consume an ACK slot; selection stays
-// aligned even through packet loss and uint16 wrap (N must divide 65536).
-constexpr uint16_t ACK_EVERY_N = 8;
-constexpr uint32_t ACK_PERIOD_MS = ACK_EVERY_N * SEND_INTERVAL_MS;
-// Client link thresholds derived from the ACK cadence so they cannot drift out
-// of sync when ACK_EVERY_N changes. At N=4 these evaluate to the 16 s / 20 s
-// the firmware used when every packet was acknowledged.
-constexpr uint32_t ACK_STALE_MS = 4 * ACK_PERIOD_MS;
-constexpr uint32_t ATPC_NO_ACK_MS = 5 * ACK_PERIOD_MS;
 constexpr uint32_t ENV_UPDATE_MS = 5000;
-constexpr uint32_t SERVER_IDLE_LOG_MS = 5000;
+constexpr uint32_t STATION_IDLE_LOG_MS = 5000;
 // One log line per received packet floods the 4 KB ring in ~16 s, so whatever you
 // opened the log to look at has already scrolled out — the RX detail crowds out
 // [SERVO], [MAGCAL] and [TRACK] entirely. Accumulate instead and print one
@@ -117,7 +121,7 @@ constexpr uint32_t RX_SUMMARY_MS = 60000;
 constexpr uint32_t LINK_TIMEOUT_MS = 5000;
 constexpr uint32_t LINK_WARN_MS = 15000;
 constexpr uint32_t DISPLAY_REFRESH_MS = 500;
-constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;  // server: re-attempt hotspot every 5 s when offline
+constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;  // station: re-attempt hotspot every 5 s when offline
 // PWR-key IRQ polling rate. loop() no longer blocks, so it spins at several kHz
 // and polling the PMU every pass would mean thousands of I2C transactions per
 // second for a button that only needs to feel instant to a human.
@@ -137,7 +141,7 @@ constexpr uint16_t BATT_PRESENT_MIN_MV = 2500; // ignore implausible/no-battery 
 // Client OLED is normally off to save power; short-press PWR wakes it briefly.
 constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 // Camera servo (GXServo QY3242BLS/GX3242 42KG) driven by ESP32 LEDC PWM on IO21.
 constexpr int SERVO_PIN = 21;
 constexpr uint32_t SERVO_PWM_HZ = servo_profile::kPwmHz;
@@ -154,7 +158,7 @@ constexpr int SERVO_LEDC_CH = 0;     // LEDC channel (arduino-esp32 2.x)
 constexpr uint32_t TRACK_UPDATE_MS = control_cadence::kGpsPeriodMs;
 constexpr float DR_MIN_SPEED_CMS = 30.0f;     // below this the GPS course is noise
 constexpr float DR_MAX_AGE_S = 2.0f;          // source + RF + receive age ceiling
-constexpr const char *GPS_PREDICTION_KEY = "gpspredict";
+constexpr const char *GPS_PREDICTION_KEY = "gpspred5";
 
 #endif
 
@@ -167,7 +171,7 @@ constexpr uint32_t GPS_FIX_MAX_AGE_MS = tracking_policy::kGpsFreshMs;
 constexpr int GPS_RX_PIN = 9;
 constexpr int GPS_TX_PIN = 8;
 constexpr int GPS_EN_PIN = 7;
-constexpr uint32_t GPS_BAUD = 9600;
+constexpr uint32_t GPS_BAUD = gnss_rate::kBaud;
 
 constexpr int PMU_SDA_PIN = 42;
 constexpr int PMU_SCL_PIN = 41;
@@ -183,6 +187,9 @@ constexpr int OLED_SCL_PIN = 18;
 constexpr uint8_t OLED_ADDR_DEFAULT = 0x3C;
 constexpr uint8_t OLED_ADDR_ALT = 0x3D;
 static uint8_t oledI2CAddr = OLED_ADDR_DEFAULT;
+#if defined(ROLE_STATION)
+static bool oledOnline = false;
+#endif
 
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY);
 TinyGPSPlus gps;
@@ -197,14 +204,14 @@ uint32_t nextEnvMs = 0;
 int16_t cachedTempC10 = INT16_MIN;
 uint8_t cachedHumidityPct = 0xFF;
 String cachedApIp = "";
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 IPAddress cachedApIpAddr;  // last address seen, to detect DHCP changes
 #endif
 
 // Shared OLED object — client enables it only during boot-info and shutdown screens.
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 // Rolling log the web UI can render. The station lives on a tripod at the beach,
 // where nobody is going to tether a laptop to read the serial port — and OTA
 // (espota) only uploads firmware, it never carries logs.
@@ -223,10 +230,10 @@ static void logPush(uint8_t c) {
 #endif
 
 // Tee for all firmware logging. Output still goes to the USB serial port; on the
-// server it is additionally captured into logBuf. Deriving from Print inherits
+// station it is additionally captured into logBuf. Deriving from Print inherits
 // every print()/println() overload, so call sites change in name only.
 // Safe without locking: nothing logs from an ISR (the DIO1 handler only sets a
-// flag) and the web server is serviced from loop(), so this is single-threaded.
+// flag) and the web station is serviced from loop(), so this is single-threaded.
 // Buffered to whole lines before touching the USB serial port. This matters far
 // more than it looks: Print::print(F("...")) emits one character at a time, and
 // HWCDC::write() waits up to tx_timeout_ms (100 ms by default) per call when the
@@ -234,7 +241,7 @@ static void logPush(uint8_t c) {
 // plugged into a PC with no terminal open. That turned a ~110-character log line
 // into ~11 s of blocking. Buffering makes it one bulk write per line instead of
 // one per character; setTxTimeoutMs(0) in setup() then removes the wait entirely.
-// Dropped serial output is acceptable because the server's ring buffer (and the
+// Dropped serial output is acceptable because the station's ring buffer (and the
 // web 紀錄 tab) is the authoritative log.
 class LogTee : public Print {
  public:
@@ -251,10 +258,15 @@ class LogTee : public Print {
  private:
   void flushLine() {
     if (lineLen_ == 0) return;
-    Serial.write(lineBuf_, lineLen_);
-#if defined(ROLE_SERVER)
+    if (!sd_log::usbTransferActive()
+#if defined(FIELD_DIAGNOSTIC)
+        && !diagnostic_store::transferActive()
+#endif
+    ) Serial.write(lineBuf_, lineLen_);
+#if defined(ROLE_STATION)
     for (size_t i = 0; i < lineLen_; i++) logPush(lineBuf_[i]);
 #endif
+    sd_log::text(lineBuf_, lineLen_, millis());
     lineLen_ = 0;
   }
   uint8_t lineBuf_[256];  // longest log line here is ~300 B, so at most 2 writes
@@ -262,7 +274,7 @@ class LogTee : public Print {
 };
 static LogTee Log;
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 struct DecodedData {
   uint16_t srcId;
   uint16_t seq;
@@ -274,7 +286,6 @@ struct DecodedData {
   uint8_t  satellites;  // class lower bound for gates only; never exposed as an exact count
   uint8_t  satelliteClass;
   uint8_t  hdop10;
-  uint8_t  age10ms;
   bool     velocityValid;
 };
 
@@ -299,7 +310,8 @@ uint16_t txSeq = 0;
 uint16_t telemetrySeq = 0;
 uint16_t diagnosticSeq = 0;
 uint32_t nextDiagnosticMs = 0;
-uint32_t nextSendMs = 0;
+uint32_t nextGnssDiagnosticMs = 0;
+uint16_t gnssDiagnosticSeq = 0;
 uint32_t lastSendMs = 0;  // start of the last position TX (telemetry slot anchor)
 uint32_t nextTelemetryMs = 0;
 uint32_t nextPmuKeyMs = 0;
@@ -307,10 +319,11 @@ uint32_t nextBatteryMs = 0;
 // Telemetry quiet slot, filled in by computeAirtimeBudget() at boot.
 uint32_t telemetrySlotMinMs = 0;
 uint32_t telemetrySlotMaxMs = 0;
-uint32_t dataAirtimeMs = 0, ackAirtimeMs = 0, telemetryAirtimeMs = 0;
-uint32_t diagnosticAirtimeMs = 0;
+uint32_t dataAirtimeMs = 0, telemetryAirtimeMs = 0;
+uint32_t diagnosticAirtimeMs = 0, gnssDiagnosticAirtimeMs = 0;
 uint32_t dataSkippedSlots = 0;
-static gnss_snapshot::Collector gnssCollector;
+static gnss_snapshot::Collector gnssCollector{GPS_BAUD};
+static gnss_rate::Monitor gpsRate;
 static uint32_t gpsLastServiceMs = 0, gpsBacklogDrops = 0;
 static bool gpsServiceStarted = false;
 uint16_t cachedBatteryMv = 0;
@@ -318,43 +331,70 @@ bool pmuOnline = false;
 uint16_t nodeId = 0;  // set in setup() from chip MAC last 2 bytes
 
 static uint32_t bootMs = 0;
+static uint32_t powerBootId = 0;
+static_assert(power_irq::kStatus1 == XPOWERS_AXP2101_INTSTS1, "PMU IRQ address mismatch");
+static_assert(power_irq::kShort == (XPOWERS_AXP2101_PKEY_SHORT_IRQ >> 8), "PMU short key mismatch");
+static_assert(power_irq::kLong == (XPOWERS_AXP2101_PKEY_LONG_IRQ >> 8), "PMU long key mismatch");
+static_assert(power_irq::kNegative == (XPOWERS_AXP2101_PKEY_NEGATIVE_IRQ >> 8), "PMU press edge mismatch");
+static_assert(power_irq::kPositive == (XPOWERS_AXP2101_PKEY_POSITIVE_IRQ >> 8), "PMU release edge mismatch");
+static power_irq::State powerIrqState;
+static power_irq::Sample powerIrqSample;
+#if defined(ROLE_CLIENT)
+static power_irq::ClientBootGuard clientPowerKeys;
+static void serviceClientPowerKey();
+#endif
+static uint32_t powerIrqMs = 0;
+static int powerVbusRaw[2] = {-1, -1};
+static uint32_t powerVbusReadErrors = 0;
+#if defined(ROLE_CLIENT) && defined(FIELD_DIAGNOSTIC)
+// Results of the original init calls, not extra attempts to change PMU state.
+static int pmuBatteryInit[4] = {-1, -1, -1, -1};
+#endif
 
 #if defined(ROLE_CLIENT)
-static uint32_t lastAckRxMs = 0;
-static uint32_t ackRxCount = 0;
-static uint32_t ackMissCount = 0;
-static uint32_t lastAckMissMarkMs = 0;
-static int8_t currentTxPowerDbm = TX_POWER_DBM;
-static bool atpcEnabled = true;
-static int16_t lastAckRssiDbm10 = -1270;
-static int8_t lastAckSnrQuarterDb = -128;
-static lora_schedule::AckWindow expectedAck;
-static uint32_t ackRejectedCount = 0, clientTxCount = 0, clientTxErrors = 0;
-static uint32_t nextClientRxRetryMs = 0;
-static bool clientRxReady = false, haveDataSent = false, lastDataAckCycle = false;
+static uint32_t clientTxCount = 0, clientTxErrors = 0, diagnosticTxCount = 0;
+static client_cadence::Scheduler clientCadence;
+static bool clientDataDeferred = false;
+static uint32_t nextClientRadioRetryMs = 0;
+static uint32_t nextClientTxMs = 0, nextClientExtraMs = 0;
+static bool clientRadioReady = false, haveDataSent = false;
 static bool clientSendingData = false;
-static uint16_t sendingDataSeq = 0;
-static uint8_t clientTxBuffer[DATA_PACKET_LEN];
-static uint32_t nextAtpcEvalMs = 0;
+static uint8_t clientTxBuffer[MAX_PACKET_LEN];
+static uint8_t clientLogTxLength = 0;
+static uint32_t clientLogTxStarted = 0;
+static client_sd::Gate clientLogGate;
+static loop_metrics::Gap clientLoopGap;
+// XPowers reads span multiple Wire calls, so serialize complete PMU operations,
+// including reads/IRQs. Main-loop callers try once and defer if the worker owns it.
+static std::atomic_flag clientRailLock = ATOMIC_FLAG_INIT;
+struct ClientRailGuard {
+  bool held;
+  explicit ClientRailGuard(bool wait = false) : held(false) {
+    do {
+      held = !clientRailLock.test_and_set(std::memory_order_acquire);
+      if (held || !wait) break;
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } while (true);
+  }
+  ~ClientRailGuard() { if (held) clientRailLock.clear(std::memory_order_release); }
+};
+static bool clientSdPower(bool on) {
+  ClientRailGuard guard(true); // SD worker only, never wait in the main loop
+  if (!pmuOnline) return false;
+  return on ? pmu.setBLDO1Voltage(3300) && pmu.enableBLDO1() && pmu.isEnableBLDO1() && pmu.getBLDO1Voltage() == 3300 :
+              pmu.disableBLDO1() && !pmu.isEnableBLDO1();
+}
 
 // Client OLED wake state (short-press PWR turns the screen on for a few seconds)
 static bool clientOledAwake = false;
 static uint32_t clientOledOffMs = 0;
 static uint32_t nextClientOledRefreshMs = 0;
 
-// Interrupt-driven ACK reception, mirroring the server's RX path.
-//
-// This used to be a blocking radio.receive() called on every loop() pass.
-// RadioLib defaults that call's timeout to 500 % of the expected time-on-air
-// (~1.1 s for a 20-byte ACK at SF9/CR4-7), and the call was reached again right
-// after the ACK had already been consumed — so every cycle spent an extra ~1.1 s
-// parked in a dead wait. That stretched the nominal 1 Hz position cadence to
-// ~1.7 s and overflowed the GPS UART buffer on the way. The ISR now only raises
-// a flag and loop() drains the packet when one genuinely arrives.
-volatile bool clientRxFlag = false;
-void IRAM_ATTR onClientDio1() { clientRxFlag = true; }
-static async_lora_ack::Transmitter<SX1262> clientTransmitter(
-    radio, clientRxFlag, RADIOLIB_SX126X_IRQ_TX_DONE,
+// Client uses DIO1 only for non-blocking TX completion; it never enters RX.
+volatile bool clientTxFlag = false;
+void IRAM_ATTR onClientDio1() { clientTxFlag = true; }
+static async_lora_tx::Transmitter<SX1262> clientTransmitter(
+    radio, clientTxFlag, RADIOLIB_SX126X_IRQ_TX_DONE,
     RADIOLIB_SX126X_IRQ_TIMEOUT, RADIOLIB_ERR_TX_TIMEOUT);
 #endif
 
@@ -366,10 +406,10 @@ static uint16_t derivedNodeId() {
   uint16_t id = ((uint16_t)mac[4] << 8) | mac[5];
   // The 16-bit suffix is not globally unique. Reserved values need remapping;
   // the operator still pairs the actual Client ID explicitly.
-  return id == 0 || id == ID_BROADCAST || id == SERVER_ID ? id ^ 0x0100 : id;
+  return id == 0 || id == ID_BROADCAST || id == STATION_ID ? id ^ 0x0100 : id;
 }
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 // Per-client records are grouped for future extension; one instance is active.
 struct ClientState {
   DecodedData position{};
@@ -396,13 +436,13 @@ uint32_t nextDisplayMs = 0;
 uint32_t nextWifiRetryMs = 0;
 uint32_t wifiReconnectingUntilMs = 0;
 bool otaReady = false;
-uint32_t nextServerIdleLogMs = 0;
+uint32_t nextStationIdleLogMs = 0;
 
 static DecodedTelemetry &lastTelemetry = gpsClient.telemetry;
 static bool &haveTelemetry = gpsClient.haveTelemetry;
 static uint32_t &lastTelemetryRxMs = gpsClient.telemetryRxMs;
 static int &clientHumBaselinePct = gpsClient.humidityBaselinePct;
-static int serverHumBaselinePct = -1;
+static int stationHumBaselinePct = -1;
 
 // LoRa rolling stats (last RSSI_WINDOW received packets)
 constexpr size_t RSSI_WINDOW = 20;
@@ -423,11 +463,13 @@ static tracking_policy::Source controlSource = tracking_policy::Source::Hold;
 static tracking_policy::Selector sourceSelector;
 static float servoAngleDeg = 90.0f;
 static float servoTargetDeg = 90.0f;
-static float mountOffsetDeg = 0.0f;
+static float mountOffsetDeg = 90.0f;
 static float declinationDeg = 0.0f;
 static bool declinationReady = false;
-static bool mountCalibrated = false;
-static bool gpsPredictionEnabled = true;  // alpha = 1; false selects alpha = 0
+static bool mountCalibrated = true; // explicit default: 90-degree reference is usable
+static bool gpsPredictionEnabled = false;  // alpha = 1; false selects alpha = 0
+static bool gpsFinishingTarget = false;
+static station_position::Average stationAverage;
 static bool servoPwmReady = false;
 static control_cadence::GpsCadence gpsCadence;
 static uint32_t servoLastDuty=UINT32_MAX;
@@ -450,32 +492,26 @@ static loop_metrics::Duration loopDuration, httpDuration, envDuration;
 static loop_metrics::Duration pmuDuration, oledDuration, loraDuration, otaDuration, motionDuration;
 
 static uint32_t rxDataCount = 0;
+static packet_rate::Window10s loraDataRate;
 static uint32_t rxTelemetryCount = 0;
 static uint32_t rxDropCount = 0;
 static uint32_t rxErrorCount = 0;
-static uint32_t ackTxCount = 0;
-static uint32_t ackErrorCount = 0;
-static uint32_t ackSkippedCount = 0;
 static packet_diagnostics::Ring<64> packetEvents;
 static uint32_t rejectedLength = 0, rejectedFormat = 0, rejectedBinding = 0;
 static uint32_t invalidFixPackets = 0, invalidVelocityPackets = 0;
 static uint32_t lastDataIntervalMs = 0, maxDataIntervalMs = 0;
-static uint32_t sourceEpochUpdates = 0, lastSourceEpochIntervalMs = 0;
-static uint32_t lastEstimatedSourceMs = 0;
-static bool haveSourceEstimate = false;
 static DiagnosticPayload lastClientDiagnostic{};
+static gnss_diagnostics::Latest clientGnssDiagnostic;
+static uint32_t rxGnssDiagnosticCount = 0;
 static bool haveClientDiagnostic = false;
 static uint32_t lastClientDiagnosticMs = 0, rxDiagnosticCount = 0;
 static uint32_t sequenceMissing = 0, sequenceResyncs = 0, rxWinMissing = 0;
-static int16_t lastAckError = 0;
-static bool serverRxReady = true;
-static uint32_t nextServerRxRetryMs = 0;
-constexpr uint32_t ACK_START_MAX_AGE_MS = 50;
+static bool stationRxReady = true;
+static uint32_t nextStationRxRetryMs = 0;
 
 // Per-minute RX summary window (see RX_SUMMARY_MS).
 static uint32_t nextRxSummaryMs = 0;
 static uint32_t rxWinData = 0, rxWinTelem = 0, rxWinDrop = 0, rxWinErr = 0;
-static uint32_t rxWinAck = 0;
 static int      rxWinLastErr = 0;
 static uint16_t rxWinFirstSeq = 0, rxWinLastSeq = 0;
 static bool     rxWinHaveSeq = false;
@@ -484,31 +520,27 @@ static double   rxWinRssiSum = 0, rxWinSnrSum = 0;
 
 http_timing::Server<WebServer, MetricsClock> httpServer(80);
 
-// DIO1 reports either RxDone or TxDone. The ACK state owns it while sending.
-volatile bool serverRadioIrq = false;
-volatile uint32_t serverRadioIrqMs = 0;
+// Station stays in RX; DIO1 reports packet completion.
+volatile bool stationRadioIrq = false;
+volatile uint32_t stationRadioIrqMs = 0;
 void IRAM_ATTR onLoRaDio1() {
-  serverRadioIrqMs = millis();
-  serverRadioIrq = true;
+  stationRadioIrqMs = millis();
+  stationRadioIrq = true;
 }
-static async_lora_ack::Transmitter<SX1262> ackTransmitter(
-    radio, serverRadioIrq, RADIOLIB_SX126X_IRQ_TX_DONE,
-    RADIOLIB_SX126X_IRQ_TIMEOUT, RADIOLIB_ERR_TX_TIMEOUT);
-static uint8_t ackPacketBuffer[ACK_PACKET_LEN];
 #endif
 
-#if defined(ROLE_SERVER)
-// Decode helpers enforce exact v4 wire lengths before any payload is used.
+#if defined(ROLE_STATION)
+// Decode helpers enforce exact v5 wire lengths before any payload is used.
 static bool parseDataPacket(const uint8_t *buf, size_t n, DecodedData &out) {
   PacketHeader hdr{}; PositionPayload pos{};
   if (!protocol::decodeData(buf, n, hdr, pos) || !isClientAllowed(hdr.clientId)) return false;
   out.srcId = hdr.clientId; out.seq = hdr.seq;
-  out.fix = pos.fix; out.lat = pos.latE6 / 1e6; out.lon = pos.lonE6 / 1e6;
+  out.fix = pos.fix; out.lat = pos.latE7 / 1e7; out.lon = pos.lonE7 / 1e7;
   out.speedCmS = pos.speedDmS == 255 ? UINT16_MAX : uint16_t(pos.speedDmS) * 10;
   out.courseDeg10 = pos.courseDeg10;
   out.satelliteClass = pos.satelliteClass;
   out.satellites = protocol::satLowerBound(pos.satelliteClass);
-  out.hdop10 = pos.hdop10; out.age10ms = pos.age10ms;
+  out.hdop10 = pos.hdop10;
   out.velocityValid = pos.velocityValid;
   return true;
 }
@@ -540,7 +572,11 @@ using geo::gpsSignal;
 using geo::loraSignal;
 
 static uint16_t readBatteryMilliVolts() {
-#if defined(ROLE_SERVER)
+#if defined(ROLE_CLIENT)
+  ClientRailGuard guard;
+  if (!guard.held) return cachedBatteryMv;
+#endif
+#if defined(ROLE_STATION)
   MeasureDuration timing(pmuDuration);
 #endif
   if (!pmuOnline) {
@@ -556,7 +592,11 @@ static uint16_t readBatteryMilliVolts() {
 
 // True when external (USB / Type-C) power is present — board runs "plugged in".
 static bool batteryCharging() {
-#if defined(ROLE_SERVER)
+#if defined(ROLE_CLIENT)
+  ClientRailGuard guard;
+  if (!guard.held) return false;
+#endif
+#if defined(ROLE_STATION)
   MeasureDuration timing(pmuDuration);
 #endif
   return pmuOnline && pmu.isVbusIn();
@@ -570,10 +610,17 @@ static bool initPmu() {
     return false;
   }
 
+#if defined(ROLE_CLIENT) && defined(FIELD_DIAGNOSTIC)
+  pmuBatteryInit[0] = pmu.enableBattDetection() ? 1 : 0;
+  pmuBatteryInit[1] = pmu.enableVbusVoltageMeasure() ? 1 : 0;
+  pmuBatteryInit[2] = pmu.enableBattVoltageMeasure() ? 1 : 0;
+  pmuBatteryInit[3] = pmu.enableSystemVoltageMeasure() ? 1 : 0;
+#else
   pmu.enableBattDetection();
   pmu.enableVbusVoltageMeasure();
   pmu.enableBattVoltageMeasure();
   pmu.enableSystemVoltageMeasure();
+#endif
 
   // GPS rail (ALDO4) is needed by both roles.
   pmu.setALDO4Voltage(3300);
@@ -583,46 +630,333 @@ static bool initPmu() {
   return true;
 }
 
+#if defined(ROLE_CLIENT) && defined(FIELD_DIAGNOSTIC)
+static int readPmuBatteryDiagnosticRegister(uint8_t reg) {
+  // Only set the register pointer. Do not use XPowers readRegister here: its
+  // unchecked short requestFrom can enter Stream::readBytes' 1-second timeout.
+  PMUWire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+  const bool addressed = PMUWire.write(reg) == 1;
+  const uint8_t status = PMUWire.endTransmission();
+  if (!addressed) return -100;
+  if (status) return -100 - status;
+  if (PMUWire.requestFrom(AXP2101_SLAVE_ADDRESS, uint8_t(1)) != 1) return -200;
+  if (PMUWire.available() < 1) return -201;
+  const int value = PMUWire.read();
+  return value >= 0 && value <= 255 ? value : -202;
+}
+
+static void recordClientBatteryDiagnostic(const char *stage) {
+  const uint32_t now = millis();
+  // STATUS1/2, ADC enable, VBAT high then low, battery detection enable,
+  // long-press power-off enable and PWR key timing configuration.
+  // These are not read-clear IRQ registers. Preserve raw values for analysis;
+  // none of these observations participate in the existing shutdown decision.
+  static constexpr uint8_t registers[] = {0x00, 0x01, 0x30, 0x34, 0x35, 0x68, 0x22, 0x27};
+  int raw[8] = {-2, -2, -2, -2, -2, -2, -2, -2};
+  uint8_t failed = 0;
+  bool locked = false;
+  {
+    ClientRailGuard guard;
+    locked = guard.held;
+    if (pmuOnline && locked) {
+      for (size_t i = 0; i < sizeof(registers); ++i) {
+        raw[i] = readPmuBatteryDiagnosticRegister(registers[i]);
+        if (raw[i] < 0) failed |= uint8_t(1U << i);
+      }
+    }
+  } // release the shared PMU/SD rail lock before queueing or USB output
+  const uint32_t elapsed = millis() - now;
+  char line[320];
+  const int length = snprintf(line, sizeof(line),
+      "{\"event\":\"pmu_battery\",\"stage\":\"%s\",\"boot_id\":%lu,\"ms\":%lu,"
+      "\"online\":%s,\"lock\":%s,\"init\":[%d,%d,%d,%d],\"raw\":[%d,%d,%d,%d,%d,%d,%d,%d],"
+      "\"read_fail\":%u,\"elapsed_ms\":%lu}",
+      stage, (unsigned long)powerBootId, (unsigned long)now,
+      pmuOnline ? "true" : "false", locked ? "true" : "false",
+      pmuBatteryInit[0], pmuBatteryInit[1], pmuBatteryInit[2], pmuBatteryInit[3],
+      raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], failed, (unsigned long)elapsed);
+  if (length <= 0 || size_t(length) >= sizeof(line)) {
+    Log.println(F("[PMU] battery diagnostic encoding overflow"));
+    return;
+  }
+  diagnostic_store::submit(2, line, size_t(length), now);
+  Log.println(line);
+}
+#endif
+
+// Verification configuration: Quectel documents single-sentence output above
+// 1 Hz. The user selected an explicit RMC+GGA 2 Hz experiment to retain fields.
+// Do not claim success from writing commands; gpsRate reports actual arrivals.
+#if defined(FIELD_DIAGNOSTIC)
+static uint32_t diagnosticBootId = 0;
+static field_diagnostic::Utc diagnosticUtc;
+#if defined(ROLE_CLIENT)
+#if defined(CLIENT_TRIP_LOG)
+static trip_log::ContinuousPlan diagnosticPlan;
+#else
+static field_diagnostic::Plan diagnosticPlan;
+#endif
+#endif
+static uint8_t diagnosticRaw[128];
+static size_t diagnosticRawLength = 0;
+static uint16_t diagnosticRawKind = 1;
+static uint32_t diagnosticRawSplits = 0;
+static loop_metrics::Gap diagnosticLoopGap;
+#if defined(CLIENT_TRIP_LOG)
+static uint32_t tripRawSequence = 0;
+static void recordTripRaw(uint16_t kind, const uint8_t *data, size_t length, uint32_t now) {
+  // Hex retains noise as well as valid NMEA in UTF-8 NDJSON. Sequence advances
+  // even when SD cannot accept, so the next saved chunk reveals the gap.
+  for (size_t offset = 0; offset < length; offset += trip_log::kRawChunk) {
+    const size_t n = std::min(trip_log::kRawChunk, length-offset);
+    char text[256];
+    const size_t encoded = trip_log::encodeRaw(text, sizeof(text), tripRawSequence++, kind, data+offset, n);
+    if (encoded) sd_log::text(reinterpret_cast<const uint8_t *>(text), encoded, now);
+  }
+}
+#endif
+static void diagnosticByte(char c, uint32_t now, bool discarded = false) {
+  const uint16_t kind = discarded ? 6 : 1;
+  if (diagnosticRawLength && kind != diagnosticRawKind) {
+#if defined(CLIENT_TRIP_LOG)
+    recordTripRaw(diagnosticRawKind, diagnosticRaw, diagnosticRawLength, now);
+#else
+    diagnostic_store::submit(diagnosticRawKind, diagnosticRaw, diagnosticRawLength, now);
+#endif
+    diagnosticRawLength = 0;
+  }
+  diagnosticRawKind = kind;
+  diagnosticRaw[diagnosticRawLength++] = uint8_t(c);
+  if (!discarded) diagnosticUtc.feed(c, now);
+  if (c == '\n' || diagnosticRawLength == sizeof(diagnosticRaw)) {
+    if (c != '\n') ++diagnosticRawSplits;
+#if defined(CLIENT_TRIP_LOG)
+    recordTripRaw(kind, diagnosticRaw, diagnosticRawLength, now);
+#else
+    diagnostic_store::submit(kind, diagnosticRaw, diagnosticRawLength, now);
+#endif
+    diagnosticRawLength = 0;
+  }
+}
+#if defined(ROLE_CLIENT)
+static void recordDiagnosticPhase(uint32_t now) {
+  char line[160];
+  snprintf(line, sizeof(line), "{\"phase\":%u,\"rf_target\":%s,\"sd_target\":%s,\"period_ms\":1000,\"phase_ms\":%lu}",
+      diagnosticPlan.phase(), diagnosticPlan.rf() ? "true" : "false", diagnosticPlan.sd() ? "true" : "false",
+#if defined(CLIENT_TRIP_LOG)
+      0UL);
+#else
+      180000UL);
+#endif
+  diagnostic_store::submit(4, line, strlen(line), now);
+}
+#endif
+static void serviceFieldDiagnostic() {
+  const uint32_t now = millis();
+  diagnosticLoopGap.observe(now);
+  field_diagnostic::Metrics m;
+#if defined(ROLE_CLIENT)
+#if !defined(CLIENT_TRIP_LOG)
+  gnss_snapshot::Snapshot sample;
+  const bool usable = gnssCollector.sample(now, sample) && sample.fix && sample.haveGga &&
+      sample.haveRmc && sample.arrivalAgeMs < 2000 && sample.satellites >= 6 &&
+      isfinite(sample.hdop) && sample.hdop <= 3;
+  bool changed = false;
+  if (diagnostic_store::healthy()) changed = diagnosticPlan.observe(now, usable);
+  else if (strcmp(diagnostic_store::stateName(), "scanning") && diagnosticPlan.phase() != 6) {
+    diagnosticPlan.abort(); changed = true;
+  }
+  if (changed) {
+    // RF gate stops NEW transmissions; an in-flight packet completes normally.
+    // SD off drains/closes asynchronously before card power is removed.
+    if (diagnosticPlan.sd()) sd_log::start(); else sd_log::stop();
+    recordDiagnosticPhase(now);
+  }
+#endif
+  m.phase = diagnosticPlan.phase(); m.rf = diagnosticPlan.rf(); m.sd = diagnosticPlan.sd();
+  m.tx = clientTxCount; m.txErrors = clientTxErrors;
+#else
+  m.phase = 255; m.rf = true; m.sd = true; // Station keeps receiving throughout.
+#endif
+  static uint32_t nextRaw = 0;
+  if (loop_metrics::due(now, nextRaw)) {
+    nextRaw = now + 1000;
+    if (diagnosticRawLength) {
+#if defined(CLIENT_TRIP_LOG)
+      recordTripRaw(diagnosticRawKind, diagnosticRaw, diagnosticRawLength, now);
+#else
+    diagnostic_store::submit(diagnosticRawKind, diagnosticRaw, diagnosticRawLength, now);
+#endif
+    diagnosticRawLength = 0; // preserve even an unterminated/noisy UART tail
+    }
+  }
+  static uint32_t next = 0;
+  if (!loop_metrics::due(now, next)) return;
+#if defined(CLIENT_TRIP_LOG)
+  next = now + trip_log::kSnapshotMs;
+#else
+  next = now + 1000;
+#endif
+  m.battery = cachedBatteryMv; m.heap = ESP.getFreeHeap(); m.backlog = gpsBacklogDrops;
+  m.rawSplits = diagnosticRawSplits; m.loopGap = diagnosticLoopGap.maxMs;
+  uint8_t bytes[80];
+  field_diagnostic::encode(bytes, gnssCollector, diagnosticUtc, now, m);
+  diagnostic_store::submit(3, bytes, sizeof(bytes), now);
+  static uint32_t nextStatus = 0;
+  if (loop_metrics::due(now, nextStatus)) {
+#if defined(CLIENT_TRIP_LOG)
+    nextStatus = now + trip_log::kSdStatusMs;
+#else
+    nextStatus = now + 10000;
+#endif
+    char health[144];
+    snprintf(health, sizeof(health), "{\"event\":\"recorder_health\",\"write_max_us\":%lu,\"dropped\":%lu}",
+        (unsigned long)diagnostic_store::writeMaxUs(), (unsigned long)diagnostic_store::dropped());
+    diagnostic_store::submit(5, health, strlen(health), now);
+    // Actual SD state, not merely the phase target (a card operation may fail).
+    const String status = sd_log::statusJson();
+    // Preserve the full status in ordered chunks; kind 8 is UTF-8 JSON stream.
+    for (size_t i = 0; i < status.length(); i += 400)
+      diagnostic_store::submit(8, status.c_str()+i, std::min(size_t(400), status.length()-i), now);
+    const char end = '\n'; diagnostic_store::submit(8, &end, 1, now);
+  }
+}
+#endif
+
+static void configureGps() {
+  pinMode(GPS_EN_PIN, OUTPUT);
+  digitalWrite(GPS_EN_PIN, HIGH);
+  GPSSerial.setRxBufferSize(GPS_RX_BUFFER_BYTES);
+  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  delay(1000); // boot only, before control starts; allow the GNSS command parser to start
+  GPSSerial.print("$PCAS01,5*19\r\n");
+  GPSSerial.flush();
+  delay(100);
+  GPSSerial.updateBaudRate(GPS_BAUD);
+  // Handles an MCU reboot while the powered GNSS already remains at 115200.
+  GPSSerial.print("$PCAS01,5*19\r\n");
+  GPSSerial.flush();
+  delay(100);
+  GPSSerial.print("$PCAS03,1,0,0,0,1,0,0,0,0,0,,,0,0*02\r\n");
+#if defined(FIELD_DIAGNOSTIC)
+  GPSSerial.print("$PCAS02,1000*2E\r\n");
+#else
+  GPSSerial.print("$PCAS02,500*1A\r\n");
+#endif
+  GPSSerial.flush();
+  gnssCollector.reset(millis());
+  gpsServiceStarted = false;
+#if defined(FIELD_DIAGNOSTIC)
+  Log.println(F("[GNSS] diagnostic baseline: requested 115200 baud, 1 Hz RMC+GGA"));
+#else
+  Log.println(F("[GNSS] requested 115200 baud, 2 Hz RMC+GGA verification configuration"));
+#endif
+  Log.println(F("[GNSS] command writes are not verification; observed rates follow every 5 s"));
+}
+
 static void serviceGps() {
   const uint32_t now = millis();
   if (!gpsServiceStarted || now - gpsLastServiceMs > GPS_BACKLOG_GUARD_MS) {
     // Discard bytes accumulated while blocked (including the boot screen).
     // The collector waits for a new '$' and a newer epoch after this reset.
     gnssCollector.invalidate(now);
-    while (GPSSerial.available() > 0) GPSSerial.read();
+#if defined(FIELD_DIAGNOSTIC)
+    diagnosticUtc.invalidate();
+#endif
+    while (GPSSerial.available() > 0) {
+      const char discarded = static_cast<char>(GPSSerial.read());
+#if defined(FIELD_DIAGNOSTIC)
+      diagnosticByte(discarded, millis(), true);
+#else
+      (void)discarded;
+#endif
+    }
     if (gpsServiceStarted) ++gpsBacklogDrops;
     gpsServiceStarted = true;
   }
   gpsLastServiceMs = now;
   while (GPSSerial.available() > 0) {
     const char c = static_cast<char>(GPSSerial.read());
+#if defined(FIELD_DIAGNOSTIC)
+    diagnosticByte(c, millis());
+#endif
     gps.encode(c);  // retained for UTC date and legacy display metadata
     gnssCollector.feed(c, millis());
   }
+  const auto &g = gnssCollector.stats();
+  if (gpsRate.observe(now, g.snapshots, g.rmcSentences, g.ggaSentences)) {
+    Log.print(F("[GNSS] ")); Log.print(gpsRate.state());
+    Log.print(F(" epoch_hz=")); Log.print(gpsRate.hz(), 2);
+    Log.print(F(" rmc_hz=")); Log.print(gpsRate.rmcHz(), 2);
+    Log.print(F(" gga_hz=")); Log.println(gpsRate.ggaHz(), 2);
+  }
+#if defined(ROLE_STATION)
+  gnss_snapshot::Snapshot station;
+  const bool sampled = gnssCollector.sample(now, station);
+  stationAverage.observe(now, sampled && station.fix &&
+      station.arrivalAgeMs < GPS_FIX_MAX_AGE_MS,
+      station.epochMsOfDay, station.lat, station.lon);
+#endif
 }
 
 // 「現在真的有定位」。見 GPS_FIX_MAX_AGE_MS —— isValid() 單獨用是不夠的。
 static bool gpsFixFresh() {
   gnss_snapshot::Snapshot sample;
   return gnssCollector.sample(millis(), sample) && sample.fix &&
-         sample.sourceAgeMs < GPS_FIX_MAX_AGE_MS &&
-         sample.sourceAgeMs + sample.ageUncertaintyMs < GPS_FIX_MAX_AGE_MS;
+         sample.arrivalAgeMs < GPS_FIX_MAX_AGE_MS;
 }
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 static double stationLatitude() {
+  if (stationAverage.count()) return stationAverage.latitude();
   gnss_snapshot::Snapshot sample; gnssCollector.sample(millis(), sample); return sample.lat;
 }
 static double stationLongitude() {
+  if (stationAverage.count()) return stationAverage.longitude();
   gnss_snapshot::Snapshot sample; gnssCollector.sample(millis(), sample); return sample.lon;
 }
 #endif
 
 // OLED address detection must remain independent of the removed magnetometer.
 // On the N board the OLED is 0x3D and 0x3C belongs to the unused QMC sensor.
-static void detectOledAddress() {
+[[maybe_unused]] static void detectOledAddress() {
   Wire.beginTransmission(OLED_ADDR_ALT);
   oledI2CAddr = Wire.endTransmission() == 0 ? OLED_ADDR_ALT : OLED_ADDR_DEFAULT;
 }
+
+#if defined(ROLE_STATION)
+static bool initStationDisplay() {
+  const bool powered = pmuOnline && pmu.setALDO1Voltage(3300) && pmu.enableALDO1() &&
+      pmu.isEnableALDO1() && pmu.getALDO1Voltage() == 3300;
+  Log.print(F("[OLED] ALDO1 3300 mV readback=")); Log.println(powered ? "ok" : "failed");
+  if (!powered) return false;
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    if (attempt) { Wire.end(); delay(10); }
+    Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN, 100000);
+    Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
+    bool found = false;
+    for (uint8_t addr : {OLED_ADDR_ALT, OLED_ADDR_DEFAULT}) {
+      Wire.beginTransmission(addr);
+      const uint8_t result = Wire.endTransmission();
+      Log.print(F("[OLED] probe addr=")); Log.print(addr, HEX);
+      Log.print(F(" result=")); Log.println(result);
+      if (result == 0) { oledI2CAddr = addr; found = true; break; }
+    }
+    if (found) {
+      display.setI2CAddress(oledI2CAddr << 1);
+      display.setBusClock(100000);
+      if (!display.begin()) continue;
+      display.setPowerSave(0);
+      display.setContrast(255);
+      Log.println(F("[OLED] initialized; panel visibility requires visual confirmation"));
+      return true;
+    }
+  }
+  Log.print(F("[OLED] unavailable; SDA=")); Log.print(digitalRead(OLED_SDA_PIN));
+  Log.print(F(" SCL=")); Log.println(digitalRead(OLED_SCL_PIN));
+  Log.println(F("[OLED] display writes disabled; LoRa and SD continue"));
+  return false;
+}
+#endif
 
 static bool initEnvSensor() {
   // BME280 is common and simple; try both default addresses.
@@ -635,7 +969,7 @@ static bool initEnvSensor() {
 }
 
 static void sampleEnvSensor() {
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
   MeasureDuration timing(envDuration);
 #endif
   if (!envSensorOnline) {
@@ -653,9 +987,9 @@ static void sampleEnvSensor() {
   cachedTempC10 = static_cast<int16_t>(lround(t * 10.0f));
   float hc = constrain(h, 0.0f, 100.0f);
   cachedHumidityPct = static_cast<uint8_t>(lround(hc));
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
   // 第一筆有效讀數當成基準，之後用「上升幅度」而不是絕對值判斷受潮（見 alerts.h）。
-  if (serverHumBaselinePct < 0) serverHumBaselinePct = (int)cachedHumidityPct;
+  if (stationHumBaselinePct < 0) stationHumBaselinePct = (int)cachedHumidityPct;
 #endif
 }
 
@@ -663,8 +997,16 @@ static void sampleEnvSensor() {
 // is on external/USB power.
 static const uint8_t ICON_BOLT_8[] = {0x38,0x0C,0x06,0x1F,0x1C,0x0C,0x06,0x03};
 
-#if defined(ROLE_SERVER)
-static SigLevel serverGpsState() {
+#if defined(ROLE_STATION)
+static uint32_t boundRfAgeMs() {
+  const uint32_t now = millis();
+  uint32_t age = havePkt ? uint32_t(now-lastRxMs) : UINT32_MAX;
+  if (haveTelemetry) age = std::min(age, uint32_t(now-lastTelemetryRxMs));
+  if (haveClientDiagnostic) age = std::min(age, uint32_t(now-lastClientDiagnosticMs));
+  if (clientGnssDiagnostic.received()) age = std::min(age, clientGnssDiagnostic.rxAgeMs(now));
+  return age;
+}
+static SigLevel stationGpsState() {
   bool  fix  = gpsFixFresh();
   int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
   float hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
@@ -689,105 +1031,45 @@ static void loadGpsClientBinding() {
   }
 }
 
-static void loadServerSettings() {
+static void loadStationSettings() {
   prefs.begin("shorespotter", false);
   loadGpsClientBinding();
   double speed=servo_motion::kDefaultSpeed;
   servo_motion::decodeSpeed(prefs.getUInt(servo_motion::kSpeedKey,0),speed);
   servoMotion.setSpeed(speed);
-  const uint32_t prediction = prefs.getUInt(GPS_PREDICTION_KEY, 1);
-  gpsPredictionEnabled = prediction <= 1 ? prediction == 1 : true;
+  const uint32_t prediction = prefs.getUInt(GPS_PREDICTION_KEY, 0);
+  gpsPredictionEnabled = prediction <= 1 ? prediction == 1 : false;
   // Old acceleration/jerk/deadband profiles are deliberately ignored.
-  // Old mount* and mag* NVS keys are ignored. No calibration is persisted.
-  mountOffsetDeg = 0.0f;
-  mountCalibrated = false;
+  // Old mount* and mag* NVS keys are ignored. Boot uses a valid 90-degree
+  // reference; manual calibration replaces it in RAM until the next boot.
+  mountOffsetDeg = 90.0f;
+  mountCalibrated = true;
 }
 
-static size_t buildAckPacket(uint8_t *buf, uint16_t dstId, uint16_t ackSeq,
-                             float rssi, float snr) {
-  const PacketHeader hdr{dstId, ackSeq, MSG_ACK};
-  AckPayload ack{}; ack.ackSeq = ackSeq;
-  ack.rssiDbm10 = static_cast<int16_t>(constrain(lroundf(rssi * 10), -32768L, 32767L));
-  ack.snrQuarterDb = static_cast<int8_t>(constrain(lroundf(snr * 4), -128L, 127L));
-  return protocol::encodeAck(buf, ACK_PACKET_LEN, hdr, ack);
-}
+
 #endif
 
 #if defined(ROLE_CLIENT)
-static bool parseAckPacket(const uint8_t *buf, size_t n, AckPayload &out) {
-  PacketHeader hdr{};
-  return protocol::decodeAck(buf, n, hdr, out) && hdr.clientId == nodeId &&
-         expectedAck.accept(out.ackSeq, millis());
+static bool clientFixUsable(const gnss_snapshot::Snapshot &sample) {
+  return sample.fix && isfinite(sample.lat) && isfinite(sample.lon) &&
+      sample.arrivalAgeMs < GPS_FIX_MAX_AGE_MS &&
+      sample.lat >= -90 && sample.lat <= 90 && sample.lon >= -180 && sample.lon <= 180 &&
+      protocol::coordinatesFit(static_cast<int32_t>(lround(sample.lat * 1e7)),
+                               static_cast<int32_t>(lround(sample.lon * 1e7)));
 }
 
-static void saveClientSettings() {
-  prefs.putChar("txpwr", currentTxPowerDbm);
-  prefs.putBool("atpc", atpcEnabled);
-}
-
-static void loadClientSettings() {
-  prefs.begin("shorespt_client", false);
-  int8_t p = prefs.getChar("txpwr", TX_POWER_DBM);
-  currentTxPowerDbm = constrain(p, TX_POWER_MIN_DBM, TX_POWER_MAX_DBM);
-  atpcEnabled = prefs.getBool("atpc", true);
-}
-
-static void applyTxPower(int8_t pwrDbm) {
-  int8_t target = constrain(pwrDbm, TX_POWER_MIN_DBM, TX_POWER_MAX_DBM);
-  if (target == currentTxPowerDbm) return;
-  // SetPaConfig / SetTxParams are configuration commands: drop out of the
-  // continuous RX armed by loop() before issuing them, then re-arm.
-  radio.standby();
-  int st = radio.setOutputPower(target);
-  clientRxFlag = false;
-  clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
-  if (!clientRxReady) nextClientRxRetryMs = millis() + 100;
-  if (st == RADIOLIB_ERR_NONE) {
-    currentTxPowerDbm = target;
-    saveClientSettings();
-    Log.print(F("[CLIENT] TX power set to "));
-    Log.print(currentTxPowerDbm);
-    Log.println(F(" dBm"));
-  }
-}
-
-static void evaluateAtpc() {
-  if (!atpcEnabled) return;
-  if (!loop_metrics::due(millis(), nextAtpcEvalMs)) return;
-  nextAtpcEvalMs = millis() + ATPC_EVAL_MS;
-
-  // No ACK for a while: push one step up.
-  if (millis() - lastAckRxMs > ATPC_NO_ACK_MS) {
-    applyTxPower(currentTxPowerDbm + 1);
-    return;
-  }
-
-  // Strong link -> step down, weak link -> step up.
-  // lastAckRssiDbm10 is negative dBm * 10.
-  if (lastAckRssiDbm10 > -700 && lastAckSnrQuarterDb > 32) {
-    applyTxPower(currentTxPowerDbm - 1);
-  } else if (lastAckRssiDbm10 < -980 || lastAckSnrQuarterDb < 8) {
-    applyTxPower(currentTxPowerDbm + 1);
-  }
-}
-#endif
-
-#if defined(ROLE_CLIENT)
-static size_t buildDataPacket(uint8_t *buf) {
+static size_t buildDataPacket(uint8_t *buf, const gnss_snapshot::Snapshot *chosen = nullptr) {
   const PacketHeader hdr{nodeId, txSeq++, MSG_DATA};
   PositionPayload pos{};
   pos.speedDmS = 255; pos.courseDeg10 = 4095;
-  pos.hdop10 = 255; pos.age10ms = 255;
+  pos.hdop10 = 255;
   gnss_snapshot::Snapshot sample;
-  if (gnssCollector.sample(millis(), sample)) {
-    pos.age10ms = protocol::quantizeAge(sample.sourceAgeMs);
-    const bool fresh = sample.sourceAgeMs < tracking_policy::kGpsFreshMs &&
-        sample.sourceAgeMs + sample.ageUncertaintyMs < tracking_policy::kGpsFreshMs;
-    pos.fix = sample.fix && fresh && isfinite(sample.lat) && isfinite(sample.lon);
+  if (chosen ? (sample = *chosen, true) : gnssCollector.sample(millis(), sample)) {
+    const bool fresh = sample.arrivalAgeMs < tracking_policy::kGpsFreshMs;
+    pos.fix = clientFixUsable(sample);
     if (pos.fix) {
-      pos.latE6 = static_cast<int32_t>(lround(sample.lat * 1e6));
-      pos.lonE6 = static_cast<int32_t>(lround(sample.lon * 1e6));
-      if (!protocol::coordinatesFit(pos.latE6, pos.lonE6)) pos.fix = false;
+      pos.latE7 = static_cast<int32_t>(lround(sample.lat * 1e7));
+      pos.lonE7 = static_cast<int32_t>(lround(sample.lon * 1e7));
     }
     pos.satelliteClass = fresh ? protocol::satClass(sample.satellites) : 0;
     pos.hdop10 = fresh ? protocol::quantizeHdop(sample.hdop) : 255;
@@ -811,7 +1093,7 @@ static size_t buildTelemetryPacket(uint8_t *buf) {
   tel.humidityPct = cachedHumidityPct;
   gnss_snapshot::Snapshot sample;
   tel.satellites = gnssCollector.sample(millis(), sample) && sample.haveGga &&
-      sample.sourceAgeMs + sample.ageUncertaintyMs < tracking_policy::kGpsFreshMs ? sample.satellites : 255;
+      sample.arrivalAgeMs < tracking_policy::kGpsFreshMs ? sample.satellites : 255;
   return protocol::encodeTelemetry(buf, TELEMETRY_PACKET_LEN, hdr, tel);
 }
 #endif
@@ -835,11 +1117,39 @@ static size_t buildDiagnosticPacket(uint8_t *buf) {
     diag.status = 1 | (fresh ? 2 : 0) | (vector ? 4 : 0) |
         (sample.haveGga ? 8 : 0) | (sample.haveRmc ? 16 : 0) | 32;
   }
+  // v5 DIAG rate flags in the two high bits: observed rates,
+  // not a claim that receiver configuration commands were acknowledged.
+  if (gpsRate.ready()) diag.status |= 64;
+  if (strcmp(gpsRate.state(), "observed_2hz") == 0) diag.status |= 128;
   return protocol::encodeDiagnostic(buf, DIAGNOSTIC_PACKET_LEN, hdr, diag);
+}
+
+static size_t buildGnssDiagnosticPacket(uint8_t *buf) {
+  const PacketHeader hdr{nodeId, gnssDiagnosticSeq++, MSG_GNSS_DIAGNOSTIC};
+  return gnss_diagnostics::encode(buf, GNSS_DIAGNOSTIC_PACKET_LEN, hdr,
+                                  gnss_diagnostics::capture(gnssCollector, millis()));
 }
 #endif
 
+// ALDO3 supplies the SX1262. Reapply and read back before boot/recovery SPI access.
+// Readback proves the PMU configuration, not the measured voltage/RF output.
+static bool prepareRadioPower() {
+#if defined(ROLE_CLIENT)
+  ClientRailGuard guard;
+  if (!guard.held) { Log.println(F("[LoRa] PMU busy; defer radio recovery")); return false; }
+#endif
+  if (!pmuOnline || !pmu.setALDO3Voltage(3300) || !pmu.enableALDO3() ||
+      !pmu.isEnableALDO3() || pmu.getALDO3Voltage() != 3300) {
+    Log.println(F("[LoRa] ERROR: ALDO3 3300 mV configuration/readback failed"));
+    return false;
+  }
+  delay(10);  // rail settling before the radio reset/SPI sequence
+  Log.println(F("[LoRa] ALDO3 configured 3300 mV, enabled (readback verified)"));
+  return true;
+}
+
 static bool initRadio() {
+  if (!prepareRadioPower()) return false;
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   int state = radio.begin(RF_FREQUENCY, RF_BW, RF_SF, RF_CR, RF_SYNC_WORD, TX_POWER_DBM);
   if (state != RADIOLIB_ERR_NONE) {
@@ -847,6 +1157,15 @@ static bool initRadio() {
     Log.println(state);
     return false;
   }
+#if defined(ROLE_STATION)
+  state = radio.setRxBoostedGainMode(true);
+  if (state != RADIOLIB_ERR_NONE) {
+    Log.print(F("[LoRa] RX boosted gain failed, code="));
+    Log.println(state);
+    return false;
+  }
+  Log.println(F("[LoRa] RX boosted gain enabled"));
+#endif
   Log.println(F("[LoRa] init ok"));
   return true;
 }
@@ -858,28 +1177,30 @@ static bool initRadio() {
 // Call after initRadio(), which is what configures SF/CR/BW.
 static void computeAirtimeBudget() {
   dataAirtimeMs = (radio.getTimeOnAir(DATA_PACKET_LEN) + 999) / 1000;
-  ackAirtimeMs = (radio.getTimeOnAir(ACK_PACKET_LEN) + 999) / 1000;
   telemetryAirtimeMs = (radio.getTimeOnAir(TELEMETRY_PACKET_LEN) + 999) / 1000;
   diagnosticAirtimeMs = (radio.getTimeOnAir(DIAGNOSTIC_PACKET_LEN) + 999) / 1000;
+  gnssDiagnosticAirtimeMs = (radio.getTimeOnAir(GNSS_DIAGNOSTIC_PACKET_LEN) + 999) / 1000;
   telemetrySlotMinMs = dataAirtimeMs + TELEMETRY_SLOT_GUARD_MS;
   telemetrySlotMaxMs = SEND_INTERVAL_MS > telemetryAirtimeMs + TELEMETRY_SLOT_GUARD_MS ?
       SEND_INTERVAL_MS - telemetryAirtimeMs - TELEMETRY_SLOT_GUARD_MS : 0;
-  Log.print(F("[LoRa] v4 bytes DATA/ACK/TEL="));
-  Log.print(DATA_PACKET_LEN); Log.print('/'); Log.print(ACK_PACKET_LEN); Log.print('/'); Log.println(TELEMETRY_PACKET_LEN);
-  Log.print(F("[LoRa] airtime_ms DATA/ACK/TEL="));
-  Log.print(dataAirtimeMs); Log.print('/'); Log.print(ackAirtimeMs); Log.print('/'); Log.println(telemetryAirtimeMs);
-  Log.print(F("[LoRa] RF interval_ms=")); Log.print(SEND_INTERVAL_MS);
-  Log.print(F(" ACK every DATA=")); Log.println(ACK_EVERY_N);
+  Log.print(F("[LoRa] SF=")); Log.print(RF_SF);
+  Log.println(F(" uplink only (ACK disabled)"));
+  Log.print(F("[LoRa] airtime_ms DATA/TEL/DIAG/GNSS="));
+  Log.print(dataAirtimeMs); Log.print('/'); Log.print(telemetryAirtimeMs);
+  Log.print('/'); Log.print(diagnosticAirtimeMs); Log.print('/'); Log.println(gnssDiagnosticAirtimeMs);
+  Log.print(F("[LoRa] requested GNSS interval_ms=")); Log.print(SEND_INTERVAL_MS);
+  Log.println(F(" latest valid fix, no periodic DATA heartbeat/retry"));
+  Log.print(F("[LoRa] diagnostics interval_ms=")); Log.println(TELEMETRY_INTERVAL_MS);
   if (telemetrySlotMaxMs < telemetrySlotMinMs)
-    Log.println(F("[LoRa] no telemetry slot: defer, never cross DATA deadline"));
+    Log.println(F("[LoRa] diagnostics use dedicated slots, alternating with DATA"));
 }
 
 // --- 無線電回復 ------------------------------------------------------------
 // SX1262 若因為 SPI 干擾或狀態機卡住而停止工作，原本兩端都只會印一行 log 然後
-// 安靜地永遠壞下去。CLIENT 平時螢幕是關的，沒有任何外部徵兆；SERVER 則是站在
+// 安靜地永遠壞下去。CLIENT 平時螢幕是關的，沒有任何外部徵兆；STATION 則是站在
 // 沙灘上的人完全不知道為什麼鏡頭不動了。這裡在連續失敗到一定次數後重新初始化。
 constexpr uint8_t RADIO_TX_FAIL_LIMIT = 5;    // client：連續 5 次 TX／RX 恢復失敗
-constexpr uint16_t RADIO_RX_ERR_LIMIT = 30;   // server：連續 30 次讀取錯誤
+constexpr uint16_t RADIO_RX_ERR_LIMIT = 30;   // station：連續 30 次讀取錯誤
 constexpr uint32_t RADIO_RECOVER_MIN_MS = 30000;  // 兩次重建之間的最短間隔
 
 static uint16_t radioFailStreak = 0;
@@ -904,107 +1225,168 @@ static bool recoverRadio() {
     return false;
   }
 #if defined(ROLE_CLIENT)
-  // initRadio() 會把功率設回 TX_POWER_DBM，要把 ATPC 收斂到的值放回去。
-  radio.setOutputPower(currentTxPowerDbm);
   radio.setDio1Action(onClientDio1);
-  clientRxFlag = false;
+  clientTxFlag = false;
+  if (radio.standby() != RADIOLIB_ERR_NONE) {
+    Log.println(F("[LoRa] ERROR: standby failed after re-init"));
+    return false;
+  }
 #else
   radio.setDio1Action(onLoRaDio1);
-  serverRadioIrq = false;
-#endif
+  stationRadioIrq = false;
   if (radio.startReceive() != RADIOLIB_ERR_NONE) {
     Log.println(F("[LoRa] ERROR: RX restart failed after re-init"));
     return false;
   }
+#endif
   radioFailStreak = 0;
   Log.println(F("[LoRa] radio re-init ok"));
   return true;
 }
 
 #if defined(ROLE_CLIENT)
-static void handleClientTxResult(const async_lora_ack::Result &result) {
-  using async_lora_ack::Event;
+static void serviceClientSd(const gnss_snapshot::Snapshot &sample) {
+  const uint32_t now = millis();
+#if defined(CLIENT_TRIP_LOG)
+  const bool allowed = true; // trip-only: preserve cold start and lost-fix data
+#else
+  const bool allowed = clientLogGate.observe(now, sample);
+#endif
+  static bool wasAllowed = false, haveRecordedEpoch = false;
+  static uint32_t recordedEpoch = 0, nextCheck = 0;
+  // Policy is cheap; detailed copies happen only on an epoch/transition or a
+  // 100 ms resume check while the worker finishes draining the previous part.
+  const bool newEpoch = allowed && sample.haveRmc && sample.haveGga &&
+      (!haveRecordedEpoch || sample.epochMsOfDay != recordedEpoch);
+  if (allowed == wasAllowed && !newEpoch && !loop_metrics::due(now, nextCheck)) return;
+  nextCheck = now + 100; wasAllowed = allowed;
+  sd_log::ClientRecord r;
+  r.ms = now; r.nodeId = nodeId; r.gps = sample; r.gnss = gnssCollector.stats();
+  r.byteAgeMs = gnssCollector.byteAgeMs(now); r.sentenceAgeMs = gnssCollector.sentenceAgeMs(now);
+  r.recovering = gnssCollector.recovering(); r.backlogDrops = gpsBacklogDrops;
+  r.txCount = clientTxCount; r.txErrors = clientTxErrors; r.skipped = dataSkippedSlots;
+  r.radioRestarts = radioRecoverCount; r.batteryMv = cachedBatteryMv;
+  r.heapFree = ESP.getFreeHeap(); r.loopGapMaxMs = clientLoopGap.maxMs; r.loopOver250 = clientLoopGap.over250ms;
+  r.epochHz = gpsRate.hz(); r.rmcHz = gpsRate.rmcHz(); r.ggaHz = gpsRate.ggaHz();
+  sd_log::clientGps(allowed, r);
+  if (newEpoch) {
+    sd_log::clientEvent(r); recordedEpoch = sample.epochMsOfDay; haveRecordedEpoch = true;
+  }
+  if (!allowed) haveRecordedEpoch = false;
+}
+static void recordClientTx(const async_lora_tx::Result &result) {
+  using async_lora_tx::Event;
+  if (result.event == Event::None) return;
+  sd_log::ClientRecord r;
+  switch (result.event) {
+    case Event::Started: r.kind = sd_log::ClientKind::TxStarted; break;
+    case Event::Sent: r.kind = sd_log::ClientKind::TxSent; break;
+    case Event::Timeout: r.kind = sd_log::ClientKind::TxTimeout; break;
+    case Event::Cancelled: r.kind = sd_log::ClientKind::TxCancelled; break;
+    default: r.kind = sd_log::ClientKind::TxFailed; break;
+  }
+  r.ms = millis(); r.txStartedMs = clientLogTxStarted; r.nodeId = nodeId; r.txStatus = result.txStatus;
+  r.length = clientLogTxLength; memcpy(r.raw, clientTxBuffer, r.length);
+  sd_log::clientEvent(r);
+#if defined(FIELD_DIAGNOSTIC) && !defined(CLIENT_TRIP_LOG)
+  uint8_t record[MAX_PACKET_LEN + 3];
+  record[0] = uint8_t(result.event); record[1] = uint8_t(result.txStatus);
+  record[2] = uint8_t(uint16_t(result.txStatus) >> 8);
+  memcpy(record+3, r.raw, r.length);
+  diagnostic_store::submit(7, record, r.length+3, r.ms);
+#endif
+}
+static void handleClientTxResult(const async_lora_tx::Result &result) {
+  using async_lora_tx::Event;
+  recordClientTx(result);
   if (result.event == Event::None || result.event == Event::Started) return;
-  clientRxReady = result.rxStatus == RADIOLIB_ERR_NONE;
-  if (!clientRxReady) nextClientRxRetryMs = millis() + 100;
+  nextClientTxMs = millis() + TELEMETRY_SLOT_GUARD_MS;
+  clientRadioReady = result.txStatus == RADIOLIB_ERR_NONE;
+  if (!clientRadioReady) nextClientRadioRetryMs = millis() + 100;
   if (result.event == Event::Sent) {
     radioFailStreak = 0;
     if (clientSendingData) { ++clientTxCount; haveDataSent = true; }
   } else {
     ++clientTxErrors;
-    if (clientSendingData) { expectedAck.clear(); haveDataSent = false; }
+    haveDataSent = false;
     Log.print(F("[CLIENT] TX error=")); Log.println(result.txStatus);
-    if (++radioFailStreak >= RADIO_TX_FAIL_LIMIT) clientRxReady = recoverRadio();
+    if (++radioFailStreak >= RADIO_TX_FAIL_LIMIT) clientRadioReady = recoverRadio();
   }
 }
 
 static void serviceClientRadio() {
   handleClientTxResult(clientTransmitter.service(millis()));
   if (clientTransmitter.active()) return;
-  if (!clientRxReady && loop_metrics::due(millis(), nextClientRxRetryMs)) {
-    clientRxFlag = false;
-    clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
-    nextClientRxRetryMs = millis() + 100;
-    if (!clientRxReady && ++radioFailStreak >= RADIO_TX_FAIL_LIMIT) clientRxReady = recoverRadio();
+  if (!clientRadioReady && loop_metrics::due(millis(), nextClientRadioRetryMs)) {
+    clientTxFlag = false;
+    clientRadioReady = radio.standby() == RADIOLIB_ERR_NONE;
+    nextClientRadioRetryMs = millis() + 100;
+    if (!clientRadioReady && ++radioFailStreak >= RADIO_TX_FAIL_LIMIT) clientRadioReady = recoverRadio();
   }
-  if (!clientRxReady || !clientRxFlag) return;
-  clientRxFlag = false;
-  uint8_t buf[255];
-  const size_t actualLength = radio.getPacketLength();
-  const int state = radio.readData(buf, actualLength <= sizeof(buf) ? actualLength : sizeof(buf));
-  AckPayload ack{};
-  if (state == RADIOLIB_ERR_NONE && actualLength == ACK_PACKET_LEN &&
-      parseAckPacket(buf, actualLength, ack)) {
-    lastAckRxMs = millis(); ++ackRxCount;
-    lastAckRssiDbm10 = ack.rssiDbm10; lastAckSnrQuarterDb = ack.snrQuarterDb;
-  } else ++ackRejectedCount;
-  clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
-  if (!clientRxReady) nextClientRxRetryMs = millis() + 100;
+}
+
+static void sendClientDiagnostic(bool sendDiagnostic, bool sendGnss, uint32_t extraMs) {
+  const size_t length = sendGnss ? buildGnssDiagnosticPacket(clientTxBuffer) :
+      sendDiagnostic ? buildDiagnosticPacket(clientTxBuffer) : buildTelemetryPacket(clientTxBuffer);
+  if (!length) { ++clientTxErrors; return; }
+  const uint32_t now = millis();
+  if (sendGnss) nextGnssDiagnosticMs = now + TELEMETRY_INTERVAL_MS;
+  else if (sendDiagnostic) nextDiagnosticMs = now + TELEMETRY_INTERVAL_MS;
+  else nextTelemetryMs = now + TELEMETRY_INTERVAL_MS;
+  // Diagnostics also run without GPS; at most one extra per second.
+  haveDataSent = false; clientSendingData = false; clientRadioReady = false;
+  nextClientTxMs = now + extraMs + TELEMETRY_SLOT_GUARD_MS;
+  nextClientExtraMs = now + 1000;
+  ++diagnosticTxCount;
+  clientLogTxLength = length; clientLogTxStarted = now;
+  handleClientTxResult(clientTransmitter.start(clientTxBuffer, length, now,
+                                              extraMs + TELEMETRY_SLOT_GUARD_MS));
 }
 
 static void serviceClientTransmit() {
   serviceClientRadio();
+  serviceGps();  // drain UART before choosing the newest coherent sample
   const uint32_t now = millis();
-  if (lora_schedule::claim(now, SEND_INTERVAL_MS, nextSendMs, dataSkippedSlots)) {
-    if (clientTransmitter.active() || !clientRxReady) { ++dataSkippedSlots; return; }
-    serviceGps();  // never package bytes still waiting in the UART queue
-    sendingDataSeq = txSeq;
-    lastDataAckCycle = sendingDataSeq % ACK_EVERY_N == 0;
-    if (!lora_schedule::dataFits(millis(), nextSendMs, dataAirtimeMs, ackAirtimeMs,
-                                TELEMETRY_SLOT_GUARD_MS, lastDataAckCycle)) {
-      ++dataSkippedSlots; return;
-    }
-    const size_t length = buildDataPacket(clientTxBuffer);
-    if (!length) { ++clientTxErrors; return; }
-    lastSendMs = millis(); haveDataSent = false;
-    clientSendingData = true; clientRxReady = false;
-    if (lastDataAckCycle) expectedAck.expect(sendingDataSeq, lastSendMs,
-        dataAirtimeMs + ackAirtimeMs + TELEMETRY_SLOT_GUARD_MS);
-    else expectedAck.clear();
-    handleClientTxResult(clientTransmitter.start(clientTxBuffer, length, lastSendMs,
-                                                dataAirtimeMs + TELEMETRY_SLOT_GUARD_MS));
+  gnss_snapshot::Snapshot sample;
+  const bool haveSample = gnssCollector.sample(now, sample);
+  serviceClientSd(sample);
+#if defined(FIELD_DIAGNOSTIC)
+  if (!diagnosticPlan.rf()) return; // completed TX is serviced above; no new RF
+#endif
+  const bool validFix = haveSample && clientFixUsable(sample);
+  const bool dataDue = clientCadence.due(now, validFix, sample.epochMsOfDay,
+                                       sample.haveRmc && sample.haveGga);
+  if (clientTransmitter.active() || !clientRadioReady || !loop_metrics::due(now, nextClientTxMs)) {
+    if (dataDue && !clientDataDeferred) { ++dataSkippedSlots; clientDataDeferred = true; }
     return;
   }
-  if (!clientTransmitter.active() && clientRxReady) {
-    const bool telemetryDue = loop_metrics::due(now, nextTelemetryMs);
-    const bool diagnosticDue = loop_metrics::due(now, nextDiagnosticMs);
-    const bool sendDiagnostic = diagnosticDue && !telemetryDue;
-    const uint32_t extraMs = sendDiagnostic ? diagnosticAirtimeMs : telemetryAirtimeMs;
-    if ((telemetryDue || diagnosticDue) && lora_schedule::telemetryFits(now, lastSendMs,
-        nextSendMs, dataAirtimeMs, extraMs, TELEMETRY_SLOT_GUARD_MS, haveDataSent, lastDataAckCycle)) {
-      const size_t length = sendDiagnostic ? buildDiagnosticPacket(clientTxBuffer) : buildTelemetryPacket(clientTxBuffer);
-      if (!length) return;
-      if (sendDiagnostic) nextDiagnosticMs = now + TELEMETRY_INTERVAL_MS;
-      else nextTelemetryMs = now + TELEMETRY_INTERVAL_MS;
-      clientSendingData = false; clientRxReady = false;
-      handleClientTxResult(clientTransmitter.start(clientTxBuffer, length, now,
-                                                  extraMs + TELEMETRY_SLOT_GUARD_MS));
-    }
+  const bool telemetryDue = loop_metrics::due(now, nextTelemetryMs);
+  const bool diagnosticDue = loop_metrics::due(now, nextDiagnosticMs);
+  const bool gnssDue = loop_metrics::due(now, nextGnssDiagnosticMs);
+  const bool sendDiagnostic = diagnosticDue && !telemetryDue;
+  const bool sendGnss = gnssDue && !telemetryDue && !diagnosticDue;
+  const uint32_t extraMs = sendGnss ? gnssDiagnosticAirtimeMs : sendDiagnostic ? diagnosticAirtimeMs : telemetryAirtimeMs;
+  if ((telemetryDue || diagnosticDue || gnssDue) && loop_metrics::due(now, nextClientExtraMs) &&
+      (!dataDue || (validFix && haveDataSent))) {
+    sendClientDiagnostic(sendDiagnostic, sendGnss, extraMs);
+    return;
   }
+  if (!dataDue) { clientDataDeferred = false; return; }
+  clientDataDeferred = false;
+  clientCadence.attempted(now, validFix, sample.epochMsOfDay);
+  const size_t length = buildDataPacket(clientTxBuffer, haveSample ? &sample : nullptr);
+  if (!length) { ++clientTxErrors; return; }
+  lastSendMs = millis(); haveDataSent = false;
+  nextClientTxMs = lastSendMs + dataAirtimeMs + TELEMETRY_SLOT_GUARD_MS;
+  clientSendingData = true; clientRadioReady = false;
+  clientLogTxLength = length; clientLogTxStarted = lastSendMs;
+  handleClientTxResult(clientTransmitter.start(clientTxBuffer, length, lastSendMs,
+                                              dataAirtimeMs + TELEMETRY_SLOT_GUARD_MS));
 }
+
 #endif
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 static void recordPacketEvent(packet_diagnostics::Kind kind, uint32_t ms,
                               const uint8_t *raw = nullptr, size_t length = 0,
                               const DecodedData *data = nullptr, int16_t code = 0) {
@@ -1022,49 +1404,32 @@ static void recordPacketEvent(packet_diagnostics::Kind kind, uint32_t ms,
   }
   if (data) {
     event.clientId = data->srcId; event.seq = data->seq;
-    event.sourceAgeMs = data->age10ms == 255 ? UINT16_MAX : uint16_t(data->age10ms) * 10;
+    event.sourceAgeMs = UINT16_MAX;  // v5 DATA carries no source-age estimate
     event.flags = (data->fix ? 1 : 0) | (data->velocityValid ? 2 : 0);
   }
   packetEvents.push(event);
+  event.id = packetEvents.total();
+  sd_log::packet(event, raw, length);
 }
 
-static void handleAckResult(const async_lora_ack::Result &result) {
-  using async_lora_ack::Event;
-  if (result.event == Event::None || result.event == Event::Started) return;
-  if (result.event == Event::Sent) {
-    ++ackTxCount;
-    ++rxWinAck;
-  } else if (result.event == Event::Failed || result.event == Event::Timeout) {
-    ++ackErrorCount;
-    lastAckError = result.txStatus;
-    recordPacketEvent(packet_diagnostics::Kind::AckError, millis(), nullptr, 0, nullptr, result.txStatus);
-  }
-  serverRxReady = result.rxStatus == RADIOLIB_ERR_NONE;
-  if (!serverRxReady) {
-    ++rxErrorCount;
-    ++rxWinErr;
-    rxWinLastErr = result.rxStatus;
-    nextServerRxRetryMs = millis() + 100;
-  }
-}
 
-static void serviceServerRadio() {
+
+static void serviceStationRadio() {
   MeasureDuration timing(loraDuration);
-  handleAckResult(ackTransmitter.service(millis()));
-  if (!ackTransmitter.active() && !serverRxReady &&
-      loop_metrics::due(millis(), nextServerRxRetryMs)) {
-    serverRadioIrq = false;
+  if (!stationRxReady &&
+      loop_metrics::due(millis(), nextStationRxRetryMs)) {
+    stationRadioIrq = false;
     const int16_t status = radio.startReceive();
-    serverRxReady = status == RADIOLIB_ERR_NONE;
-    nextServerRxRetryMs = millis() + 100;
-    if (!serverRxReady && ++radioFailStreak >= RADIO_RX_ERR_LIMIT) {
-      serverRxReady = recoverRadio();
+    stationRxReady = status == RADIOLIB_ERR_NONE;
+    nextStationRxRetryMs = millis() + 100;
+    if (!stationRxReady && ++radioFailStreak >= RADIO_RX_ERR_LIMIT) {
+      stationRxReady = recoverRadio();
     }
   }
 }
 #endif
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 static const char *trackModeStr(TrackMode mode) {
   switch (mode) {
     case TrackMode::Gps: return "gps";
@@ -1100,6 +1465,7 @@ static bool setServoAngle(float deg) {
 }
 
 static void enterManual() {
+  gpsFinishingTarget = false;
   uartServoMode.leave();
   sourceSelector.reset();
   controlSource = tracking_policy::Source::Hold;
@@ -1114,16 +1480,16 @@ static bool setGpsClientBinding(uint16_t id) {
   if (prefs.putUShort("gpsclient", id) != sizeof(uint16_t)) return false;
   if (id == gpsClientId) return true;
   enterManual();
-  handleAckResult(ackTransmitter.cancel());
   gpsClientId = id;
   gpsClient = ClientState{};
   gpsSequence = command_freshness::RadioSequence{};
-  haveClientDiagnostic = false; haveSourceEstimate = false;
-  lastDataIntervalMs = lastSourceEpochIntervalMs = 0;
+  haveClientDiagnostic = false;
+  clientGnssDiagnostic = gnss_diagnostics::Latest{};
+  lastDataIntervalMs = 0;
   rssiRingIdx = rssiRingCount = 0;
   pktsThisWindow = pktWindowStartMs = 0;
   cachedPktRate = 0.0f;
-  rxWinData = rxWinTelem = rxWinDrop = rxWinErr = rxWinAck = rxWinMissing = 0;
+  rxWinData = rxWinTelem = rxWinDrop = rxWinErr = rxWinMissing = 0;
   rxWinHaveSeq = false;
   rxWinRssiSum = rxWinSnrSum = 0;
   return true;
@@ -1138,8 +1504,11 @@ static void serviceControl() {
       servoPwmReady && trackMode == TrackMode::Gps && gpsTrackingUsable(),
       servoPwmReady && trackMode == TrackMode::Uart && uartServoMode.ready());
   if (next != controlSource) {
+    const bool finishGps = trackMode == TrackMode::Gps &&
+        controlSource == tracking_policy::Source::Gps && next == tracking_policy::Source::Hold;
+    gpsFinishingTarget = finishGps;
     controlSource = next;
-    servoMotion.holdUs(micros());
+    if (!finishGps) servoMotion.holdUs(micros());
     Log.print(F("[SERVO] source -> "));
     Log.println(tracking_policy::sourceName(controlSource));
   }
@@ -1148,8 +1517,10 @@ static void serviceControl() {
   }
   const bool permitted = servoPwmReady && (trackMode == TrackMode::Manual ||
       controlSource == tracking_policy::Source::Gps ||
+      (trackMode == TrackMode::Gps && gpsFinishingTarget) ||
       controlSource == tracking_policy::Source::Uart);
   if (!permitted) servoMotion.holdUs(micros());
+  if (gpsFinishingTarget && !servoMotion.moving()) gpsFinishingTarget = false;
   if(gpsCadence.poll(now)) updateTracking();
   const uint32_t nowUs = micros();
   {
@@ -1170,7 +1541,11 @@ static void serviceControl() {
 
 static bool initServo() {
   // Diagnostics must distinguish reboots even if PWM initialization fails.
+#if defined(FIELD_DIAGNOSTIC)
+  controlBootId = diagnosticBootId;
+#else
   controlBootId = esp_random();
+#endif
   if (controlBootId == 0) controlBootId = 1;
   commandGate.reset(esp_random());
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -1206,13 +1581,11 @@ static bool initServo() {
 }
 
 static uint32_t clientSampleAgeMs() {
-  if (!havePkt || lastData.age10ms == 255) return UINT32_MAX;
-  const uint64_t age = uint64_t(lastData.age10ms) * 10 + dataAirtimeMs + uint32_t(millis() - lastRxMs);
-  return age > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(age);
+  // This is reception age only; the Client's GNSS internal latency is unknown.
+  return havePkt ? uint32_t(millis() - lastRxMs) : UINT32_MAX;
 }
 static bool clientFixFresh() {
-  return havePkt && lastData.fix && clientSampleAgeMs() <
-      tracking_policy::kGpsFreshMs - GPS_BACKLOG_GUARD_MS;
+  return havePkt && lastData.fix && clientSampleAgeMs() < tracking_policy::kGpsFreshMs;
 }
 static bool haveBearingFix() { return clientFixFresh() && gpsFixFresh(); }
 
@@ -1234,17 +1607,16 @@ static void updateDeclination() {
           stationLatitude(), stationLongitude(), year, declinationDeg);
 }
 
-// Both ends must have fresh Good or OK fixes; Bad/Miss cannot select GPS.
-static bool gpsModeAvailable() {
-  if (!haveBearingFix()) return false;
+// Valid current positions permit tracking; poor quality only blocks prediction.
+static bool gpsModeAvailable() { return haveBearingFix(); }
+static bool gpsPredictionAllowed() {
   gnss_snapshot::Snapshot sample;
-  if (!gnssCollector.sample(millis(), sample) || sample.satellites == 255 ||
-      lastData.satellites == 255 || lastData.hdop10 == 255) return false;
-  return tracking_policy::usableGps(sample.fix, sample.satellites, sample.hdop,
-                                    sample.sourceAgeMs + sample.ageUncertaintyMs) &&
-         tracking_policy::usableGps(lastData.fix, lastData.satellites,
-                                    lastData.hdop10 / 10.0f,
-                                    clientSampleAgeMs() + GPS_BACKLOG_GUARD_MS);
+  return gpsModeAvailable() && gnssCollector.sample(millis(), sample) &&
+      tracking_policy::predictionQuality(sample.satellites, sample.hdop) &&
+      tracking_policy::predictionQuality(lastData.satellites,
+                                        lastData.hdop10 == 255 ? NAN : lastData.hdop10 / 10.0f) &&
+      lastData.velocityValid && lastData.speedCmS != UINT16_MAX &&
+      lastData.speedCmS >= DR_MIN_SPEED_CMS && lastData.courseDeg10 < 3600;
 }
 static bool gpsTrackingUsable() {
   return mountCalibrated && declinationReady && gpsModeAvailable();
@@ -1252,17 +1624,12 @@ static bool gpsTrackingUsable() {
 
 // Project the last received client position forward along its velocity vector.
 //
-// Alpha ON projects between packets; OFF uses the received position. The age
-// includes the source epoch estimate, RF airtime and time since reception.
-// GNSS internal latency is not measured; the additional local uncertainty guard
-// affects expiry only, never inflates the projection time.
+// Optional prediction uses only elapsed time since RX, not unverified GNSS age.
+// It starts from the received position and is blocked by poor/unknown quality.
 static void predictClientPos(double &lat, double &lon) {
   lat = lastData.lat;
   lon = lastData.lon;
-  if (!gpsPredictionEnabled) return;  // alpha = 0: retain the last GPS position
-  if (!lastData.velocityValid || lastData.speedCmS == UINT16_MAX ||
-      lastData.courseDeg10 >= 3600 || lastData.speedCmS < DR_MIN_SPEED_CMS) return;  // course is noise when idle
-  if (!clientFixFresh()) return;
+  if (!gpsPredictionEnabled || !gpsPredictionAllowed()) return;
   float ageS = clientSampleAgeMs() / 1000.0f;
   if (ageS <= 0.0f) return;
   // Cap the projection instead of letting it run away when the link drops: the
@@ -1347,7 +1714,7 @@ static void logRxSummary() {
   // resynchronization and the independent telemetry/diagnostic sequences.
   uint32_t expected = rxWinData + rxWinMissing;
   if (expected < rxWinData || expected > 600) expected = 0;
-  Log.print(F("[SERVER] RX 60s | pkt="));
+  Log.print(F("[STATION] RX 60s | pkt="));
   Log.print(rxWinData);
   if (expected > 0) {
     Log.print('/');
@@ -1358,8 +1725,6 @@ static void logRxSummary() {
   }
   Log.print(F(" tlm="));
   Log.print(rxWinTelem);
-  Log.print(F(" ack="));
-  Log.print(rxWinAck);
   Log.print(F(" drop="));
   Log.print(rxWinDrop);
   Log.print(F(" err="));
@@ -1410,28 +1775,29 @@ static void logRxSummary() {
   Log.print(' ');
   Log.println(trackModeStr(trackMode));
 
-  rxWinData = rxWinTelem = rxWinDrop = rxWinErr = rxWinAck = rxWinMissing = 0;
+  rxWinData = rxWinTelem = rxWinDrop = rxWinErr = rxWinMissing = 0;
   rxWinHaveSeq = false;
   rxWinRssiSum = rxWinSnrSum = 0;
 }
 
-static void renderServerDisplay() {
+static void renderStationDisplay() {
+  if (!oledOnline) return;
   MeasureDuration timing(oledDuration);
   // Centre label column ("V" / T/H / GPS / BAT) is framed by two vertical lines;
-  // Server values sit left of it, client values right of it. The 15 px labels get
+  // Station values sit left of it, client values right of it. The 15 px labels get
   // a 1 px gap to each line; the odd rounding pixel is biased to the right.
   const int leftLineX = 55;
   const int rightLineX = 73;
-  const int leftCx = 27;   // centre of the Server (left) region
+  const int leftCx = 27;   // centre of the Station (left) region
   const int rightCx = 100; // centre of the Client (right) region
   const int midCx = 64;    // centre of the label column
 
-  SigLevel sGps = serverGpsState();
+  SigLevel sGps = stationGpsState();
 
   const uint16_t selectedId = gpsClientId;
   bool selectedOnline = havePkt && (lastData.srcId == selectedId) &&
                         ((millis() - lastRxMs) <= LINK_WARN_MS);
-  bool selectedTelemetry = haveTelemetry && (lastTelemetry.srcId == selectedId);
+  bool selectedTelemetry = haveTelemetry && (lastTelemetry.srcId == selectedId) && millis()-lastTelemetryRxMs < 90000;
 
   SigLevel loraState = selectedOnline ? loraSignal(lastRssi, lastSnr) : SIG_MISS;
   SigLevel cGps;
@@ -1460,7 +1826,7 @@ static void renderServerDisplay() {
   display.drawVLine(rightLineX, 0, 45);
 
   // --- Title row ---
-  drawLeft(8, "Server");
+  drawLeft(8, "Station");
   drawMid(8, "V");
   if (gpsClientId != 0) snprintf(buf, sizeof(buf), "Client %04X", gpsClientId);
   else snprintf(buf, sizeof(buf), "Unbound");
@@ -1509,8 +1875,12 @@ static void renderServerDisplay() {
   if (batteryCharging()) display.drawXBMP(2, 34, 8, 8, ICON_BOLT_8);  // ⚡ on USB
 
   // --- LoRa link state (right side, below the label column) ---
-  snprintf(buf, sizeof(buf), "LoRa:%s", sig4Text(loraState));
+  snprintf(buf, sizeof(buf), "LoRa:%s", !selectedOnline && boundRfAgeMs() < 90000 ? "TEL" : sig4Text(loraState));
   drawAt(96, 52, buf);
+#if defined(FIELD_DIAGNOSTIC)
+  snprintf(buf, sizeof(buf), "F:%s", diagnostic_store::stateName());
+  drawAt(30, 52, buf);
+#endif
 
   // --- Bottom full-width WiFi status line (not split into halves) ---
   char wifiBuf[64];
@@ -1529,7 +1899,8 @@ static void renderServerDisplay() {
 
   oledNextRow=0;
 }
-static void serviceServerDisplay() {
+static void serviceStationDisplay() {
+  if (!oledOnline) return;
   if(oledNextRow>=8)return;
   MeasureDuration timing(oledDuration);
   display.updateDisplayArea(0,oledNextRow++,16,1);
@@ -1538,7 +1909,7 @@ static void serviceServerDisplay() {
 
 #endif
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
 // Shared Servo status for track and status endpoints.
 static void appendCommandContext(String &js) {
   js += F("\"control_boot_id\":"); js += String(controlBootId);
@@ -1564,7 +1935,7 @@ static String gpsPredictionJson() {
   String js = F("{\"ok\":true,\"enabled\":");
   js += gpsPredictionEnabled ? F("true") : F("false");
   js += F(",\"alpha\":"); js += gpsPredictionEnabled ? '1' : '0';
-  js += F(",\"default_enabled\":true,");
+  js += F(",\"default_enabled\":false,");
   appendCommandContext(js); js += '}'; return js;
 }
 
@@ -1595,10 +1966,17 @@ static bool requestTrackingMode(TrackMode mode) {
     return false;
   }
   if(mode==TrackMode::Gps && !gpsModeAvailable()) {
-    httpServer.send(409,"application/json","{\"ok\":false,\"error\":\"GPS requires fresh Good or OK signals from Server and Client\"}");
+    httpServer.send(409,"application/json","{\"ok\":false,\"error\":\"GPS requires current valid positions from Station and Client\"}");
     return false;
   }
   return selectTrackingMode(mode);
+}
+
+// Exact commanded centre, with no pending movement. There is no physical
+// position feedback; the operator must also wait for the camera to settle.
+static bool compassCalibrationReady() {
+  return servoAngleDeg == 90.0f && servoMotion.position() == 90.0 &&
+         servoMotion.requested() == 90.0 && !servoMotion.moving();
 }
 
 static void appendServoJson(String &js) {
@@ -1607,9 +1985,11 @@ static void appendServoJson(String &js) {
   js += F(",\"target\":");
   js += String(servoTargetDeg, 1);
   js += F(",\"moving\":"); js += servoMotion.moving() ? F("true") : F("false");
+  js += F(",\"finishing_last_gps_target\":"); js += gpsFinishingTarget ? F("true") : F("false");
   js += F(",\"speed_limit_deg_s\":"); js += String(servoMotion.speed(),3);
   js += F(",\"prediction_enabled\":"); js += gpsPredictionEnabled ? F("true") : F("false");
   js += F(",\"prediction_alpha\":"); js += gpsPredictionEnabled ? '1' : '0';
+  js += F(",\"prediction_active\":"); js += gpsPredictionEnabled && trackMode == TrackMode::Gps && gpsTrackingUsable() && gpsPredictionAllowed() ? F("true") : F("false");
   js += F(",\"velocity_deg_s\":"); js += String(servoMotion.velocity(), 3);
   js += F(",\"motion_fault\":"); js += servoMotion.faulted() ? F("true") : F("false");
   js += F(",\"rejected_commands\":"); js += String(rejectedMotionCommands);
@@ -1627,6 +2007,8 @@ static void appendServoJson(String &js) {
   js += sourceSelector.gpsReady() ? F("true") : F("false");
   js += F(",\"calibrated\":");
   js += mountCalibrated ? F("true") : F("false");
+  js += F(",\"calibration_ready\":");
+  js += compassCalibrationReady() ? F("true") : F("false");
   js += F(",\"pwm_ok\":");
   js += servoPwmReady ? F("true") : F("false");
   js += F(",\"uart_state\":\"");
@@ -1640,6 +2022,19 @@ static void appendServoJson(String &js) {
   js += '}';
 }
 
+static void appendStationAverageJson(String &js) {
+  gnss_snapshot::Snapshot raw;
+  const bool haveRaw = gnssCollector.sample(millis(), raw);
+  js += F("\"station_average\":{\"window_ms\":30000,\"samples\":"); js += String(stationAverage.count());
+  js += F(",\"raw_lat\":"); js += haveRaw && raw.fix ? String(raw.lat, 7) : F("null");
+  js += F(",\"raw_lon\":"); js += haveRaw && raw.fix ? String(raw.lon, 7) : F("null");
+  js += F(",\"mean_lat\":"); js += stationAverage.count() ? String(stationAverage.latitude(), 7) : F("null");
+  js += F(",\"mean_lon\":"); js += stationAverage.count() ? String(stationAverage.longitude(), 7) : F("null");
+  js += F(",\"rms_m\":"); js += stationAverage.count() ? String(stationAverage.rmsM(), 2) : F("null");
+  js += F(",\"warning\":"); js += stationAverage.warning() ? F("true") : F("false");
+  js += F(",\"warning_rms_m\":3}");
+}
+
 static String buildTrackJson() {
   bool linked = havePkt && ((millis() - lastRxMs) <= LINK_TIMEOUT_MS);
   uint32_t sinceRx = havePkt ? (uint32_t)((millis() - lastRxMs) / 1000) : UINT32_MAX;
@@ -1648,6 +2043,12 @@ static String buildTrackJson() {
   js.reserve(900);
   js += F("{\"linked\":");
   js += linked ? F("true") : F("false");
+  js += F(",\"data_fresh\":"); js += linked ? F("true") : F("false");
+  const uint32_t rfAge = boundRfAgeMs();
+  js += F(",\"rf_alive\":"); js += rfAge < 90000 ? F("true") : F("false");
+  js += F(",\"rf_age_ms\":"); js += rfAge == UINT32_MAX ? F("null") : String(rfAge);
+  js += F(",\"lora_fps_10s\":");
+  js += String(loraDataRate.fps(millis()), 2);
   js += F(",\"bearing\":");
   if (haveBearingFix()) {
     js += String(computeBearing(stationLatitude(), stationLongitude(),
@@ -1656,9 +2057,9 @@ static String buildTrackJson() {
     js += F("-1");
   }
   js += F(",\"client\":{\"lat\":");
-  js += havePkt ? String(lastData.lat, 6) : F("0");
+  js += havePkt ? String(lastData.lat, 7) : F("0");
   js += F(",\"lon\":");
-  js += havePkt ? String(lastData.lon, 6) : F("0");
+  js += havePkt ? String(lastData.lon, 7) : F("0");
   js += F(",\"fix\":");
   js += clientFixFresh() ? F("1") : F("0");
   js += F(",\"velocity_valid\":");
@@ -1676,12 +2077,12 @@ static String buildTrackJson() {
   js += F(",\"hdop\":");
   js += havePkt && lastData.hdop10 != 255 ? String(lastData.hdop10 / 10.0f, 1) : F("null");
   js += F(",\"rx_age_ms\":"); js += havePkt ? String(uint32_t(millis() - lastRxMs)) : F("null");
-  js += F(",\"source_age_ms\":"); js += havePkt && lastData.age10ms != 255 ? String(uint32_t(lastData.age10ms) * 10) : F("null");
-  js += F(",\"sample_age_ms\":"); js += clientSampleAgeMs() != UINT32_MAX ? String(clientSampleAgeMs()) : F("null");
-  js += F(",\"age_basis\":\"nmea_epoch_aligned_arrival\"");
+  js += F(",\"source_age_ms\":"); js += F("null");
+  js += F(",\"sample_age_ms\":"); js += F("null");
+  js += F(",\"age_basis\":\"rx_elapsed_only\"");
   js += F(",\"last_rx_sec\":");
   js += (havePkt && sinceRx != UINT32_MAX) ? String(sinceRx) : F("-1");
-  js += F("},\"server\":{\"lat\":");
+  js += F("},\"station\":{\"lat\":");
   js += gpsFixFresh() ? String(stationLatitude(), 6) : F("0");
   js += F(",\"lon\":");
   js += gpsFixFresh() ? String(stationLongitude(), 6) : F("0");
@@ -1720,6 +2121,7 @@ static String buildTrackJson() {
             ? String((uint32_t)((millis() - lastTelemetryRxMs) / 1000))
             : F("-1");
   js += F("},");
+  appendStationAverageJson(js); js += ',';
   appendServoJson(js);
   js += '}';
   return js;
@@ -1771,20 +2173,31 @@ static void appendAlertsJson(String &js) {
   };
 
   // --- 下水端：連線 -------------------------------------------------------
+  if (stationAverage.warning()) {
+    add(alerts::WARN, "station_scatter", "岸端 GPS 座標散布偏大",
+        String("30 秒 RMS ") + String(stationAverage.rmsM(), 1) +
+        " 公尺；追蹤使用移動平均，原始資料保留。這是散布，不是真實定位誤差。");
+  }
+  if (gpsRate.ready() && strcmp(gpsRate.state(), gnss_rate::kTargetIntervalMs == 1000 ? "observed_1hz" : "observed_2hz") != 0) {
+    add(alerts::WARN, "station_gnss_rate", "岸端 GPS 實測頻率未達設定值",
+        String("最近 5 秒：epoch ") + String(gpsRate.hz(), 2) + " / RMC " +
+        String(gpsRate.rmcHz(), 2) + " / GGA " + String(gpsRate.ggaHz(), 2) + " Hz。請看除錯紀錄。");
+  }
   int32_t sinceRx = havePkt ? (int32_t)((millis() - lastRxMs) / 1000) : -1;
   if (trackMode == TrackMode::Gps && !havePkt) {
-    add(alerts::WARN, "client_never", "還沒收到追蹤器的訊號",
+    add(alerts::WARN, "client_never", boundRfAgeMs() < 90000 ? "已收到遙測，尚無定位封包" : "還沒收到追蹤器的訊號",
+        boundRfAgeMs() < 90000 ? "RF 有收到綁定 Client 的封包，尚未收到 DATA；請看 Client GPS 狀態。" :
         "請確認追蹤器已經開機（長按電源鍵），而且攝影站已綁定它的 ID。");
   } else if (trackMode == TrackMode::Gps) {
     alerts::Level l = alerts::linkLevel(sinceRx);
     if (l == alerts::ERROR) {
-      add(l, "client_link", "和追蹤器失去連線",
-          String("已經 ") + sinceRx +
-          " 秒沒有收到訊號，鏡頭已經停止追蹤。可能是距離太遠、追蹤器沒電，"
-          "或裝置泡在水面下。");
+      add(l, "client_link", boundRfAgeMs() < 90000 ? "追蹤器定位資料停止更新" : "和追蹤器失去連線",
+          String("已經 ") + sinceRx + " 秒沒有收到 DATA，鏡頭已停止追蹤。" +
+          (boundRfAgeMs() < 90000 ? "近期仍收到遙測；請檢查 Client GPS。" :
+          "近期也沒有遙測；請檢查距離、電量或裝置是否在水面下。"));
     } else if (l == alerts::WARN) {
-      add(l, "client_link", "追蹤器訊號斷斷續續",
-          String("已經 ") + sinceRx + " 秒沒有收到訊號，鏡頭暫時停在原地等訊號回來。");
+      add(l, "client_link", "追蹤器定位資料暫停更新",
+          String("已經 ") + sinceRx + " 秒沒有收到 DATA，鏡頭暫時停在原地等定位資料回來。");
     }
   }
 
@@ -1854,7 +2267,7 @@ static void appendAlertsJson(String &js) {
 
   if (cachedHumidityPct != 0xFF) {
     int hum = cachedHumidityPct;
-    if (alerts::humidityLevel(hum, serverHumBaselinePct) != alerts::NONE) {
+    if (alerts::humidityLevel(hum, stationHumBaselinePct) != alerts::NONE) {
       add(alerts::WARN, "srv_water", "攝影站可能受潮",
           String("機殼內濕度 ") + hum + "%。請確認沒有被浪打到或淋到雨，必要時先收起來。");
     }
@@ -1873,7 +2286,7 @@ static void appendAlertsJson(String &js) {
   }
 
   if (trackMode == TrackMode::Gps &&
-      (serverGpsState() == SIG_BAD || serverGpsState() == SIG_MISS)) {
+      (stationGpsState() == SIG_BAD || stationGpsState() == SIG_MISS)) {
     add(alerts::WARN, "srv_gps", "攝影站自己的定位不穩",
         "算出來的方位會有偏差，鏡頭容易追偏。請把攝影站移到天空開闊、沒有建築物"
         "或大樹遮住的地方。");
@@ -1894,7 +2307,7 @@ static void appendAlertsJson(String &js) {
   }
   if (trackMode == TrackMode::Gps && !mountCalibrated) {
     add(alerts::WARN, "mount_uncal", "還沒設定鏡頭的方向",
-        "請先切到手動，再到「資訊」分頁輸入鏡頭指南針角度。");
+        "請到「資訊」分頁輸入鏡頭指南針角度並校正；方向不準時可重新校正。");
   }
   js += F("\"alerts\":[");
   bool first = true;
@@ -1980,8 +2393,8 @@ static String buildStatusJson() {
   String js;
   js.reserve(3072);  // 含 alerts 與 HTTP 分段計時，減少回覆組裝時 realloc
 
-  // Server GPS quality
-  js += F("{\"server_gps\":{\"fix\":");
+  // Station GPS quality
+  js += F("{\"station_gps\":{\"fix\":");
   js += gpsFixFresh() ? F("1") : F("0");
   js += F(",\"satellites\":");
   js += gps.satellites.isValid() ? String(gps.satellites.value()) : F("-1");
@@ -2004,26 +2417,19 @@ static String buildStatusJson() {
   js += rssiRingCount ? String(snrAvg, 1) : F("null");
   js += F(",\"pkt_rate\":");
   js += String(havePkt && millis() - lastRxMs < 5000 ? cachedPktRate : 0.0f, 2);
-  uint32_t rxTotal = rxDataCount + rxTelemetryCount + rxDiagnosticCount + rxDropCount;
+  uint32_t rxTotal = rxDataCount + rxTelemetryCount + rxDiagnosticCount + rxGnssDiagnosticCount + rxDropCount;
   js += F(",\"rx_data\":");
   js += String(rxDataCount);
   js += F(",\"rx_telemetry\":");
   js += String(rxTelemetryCount);
   js += F(",\"rx_diagnostic\":"); js += String(rxDiagnosticCount);
+  js += F(",\"rx_gnss_diagnostic\":"); js += String(rxGnssDiagnosticCount);
   js += F(",\"rx_drop\":");
   js += String(rxDropCount);
   js += F(",\"drop_rate\":");
   js += rxTotal ? String((float)rxDropCount / rxTotal, 3) : F("0");
-  js += F(",\"ack_tx\":");
-  js += String(ackTxCount);
-  js += F(",\"ack_busy\":");
-  js += ackTransmitter.active() ? F("true") : F("false");
-  js += F(",\"ack_errors\":");
-  js += String(ackErrorCount);
-  js += F(",\"ack_skipped\":");
-  js += String(ackSkippedCount);
-  js += F(",\"ack_last_error\":");
-  js += String(lastAckError);
+  // Deprecated fields remain explicitly unavailable for older API consumers.
+  js += F(",\"ack_enabled\":false,\"ack_tx\":null,\"ack_busy\":false,\"ack_errors\":null,\"ack_skipped\":null,\"ack_last_error\":null");
   js += F("},");
 
   js += F("\"env\":{\"temp_c\":");
@@ -2038,7 +2444,7 @@ static String buildStatusJson() {
 
   js += F("\"health\":{\"firmware_version\":\"" SHORE_SPOTTER_VERSION "\",\"uptime_s\":");
   js += String((millis() - bootMs) / 1000);
-  js += F(",\"protocol_version\":4");
+  js += F(",\"protocol_version\":"); js += String(PROTO_VERSION);
   js += F(",\"heap_free\":");
   js += String(ESP.getFreeHeap());
   js += F(",\"heap_min\":");
@@ -2063,31 +2469,69 @@ static String buildStatusJson() {
 
 
 // A fixed-size page of new events. The browser owns history across requests.
+
+static void appendGnssReportJson(String &js, const gnss_diagnostics::Report &r) {
+  js += F("{\"state\":\""); js += gnss_diagnostics::state(r); js += '"';
+  js += F(",\"source_age_ms\":"); js += r.sourceAgeMs == UINT32_MAX ? F("null") : String(r.sourceAgeMs);
+  js += F(",\"epoch_ms_of_day\":"); js += r.utcMs == UINT32_MAX ? F("null") : String(r.utcMs);
+  js += F(",\"last_byte_age_ms\":"); js += r.byteAgeMs == 65535 ? F("null") : String(r.byteAgeMs);
+  js += F(",\"last_sentence_age_ms\":"); js += r.sentenceAgeMs == 65535 ? F("null") : String(r.sentenceAgeMs);
+  js += F(",\"last_advance_age_ms\":"); js += r.advanceAgeMs == 65535 ? F("null") : String(r.advanceAgeMs);
+  js += F(",\"raw_fix\":"); js += (r.flags & 1) ? ((r.flags & 2) ? F("true") : F("false")) : F("null");
+  js += F(",\"recovering\":"); js += (r.flags & 16) ? F("true") : F("false");
+  js += F(",\"satellites\":"); js += r.satellites == 255 ? F("null") : String(r.satellites);
+  js += F(",\"status_bits\":"); js += String(r.flags);
+  js += F(",\"epochs\":"); js += String(r.epochs);
+  js += F(",\"time_resyncs\":"); js += String(r.resyncs);
+  js += F(",\"missing_or_invalid_time\":"); js += String(r.missingTime);
+  js += F(",\"backwards_epochs\":"); js += String(r.backwards);
+  js += F(",\"duplicate_epochs\":"); js += String(r.duplicates);
+  js += F(",\"rejected_sentences\":"); js += String(r.rejected);
+  js += F(",\"checksum_errors\":"); js += String(r.checksum);
+  js += F(",\"age16_saturation_ms\":65534,\"counter_max\":65535}");
+}
+
 static String buildDebugJson(const packet_diagnostics::Selection &selection) {
-  String js; js.reserve(4500);
+  String js; js.reserve(5600);
   const uint32_t now = millis();
   const auto &g = gnssCollector.stats();
   gnss_snapshot::Snapshot sample;
   const bool sampled = gnssCollector.sample(now, sample);
-  js = F("{\"schema_version\":2,\"firmware_version\":\"" SHORE_SPOTTER_VERSION
-         "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"protocol_version\":4,\"boot_id\":");
+  js = F("{\"schema_version\":3,\"firmware_version\":\"" SHORE_SPOTTER_VERSION
+         "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"protocol_version\":");
+  js += String(PROTO_VERSION); js += F(",\"boot_id\":");
   js += String(controlBootId); js += F(",\"clock_ms\":"); js += String(now);
   js += F(",\"config\":{\"rf_frequency_mhz\":"); js += String(RF_FREQUENCY, 3);
   js += F(",\"bw_khz\":"); js += String(RF_BW, 1);
   js += F(",\"sf\":"); js += String(RF_SF); js += F(",\"cr\":"); js += String(RF_CR);
-  js += F(",\"data_bytes\":17,\"ack_bytes\":11,\"telemetry_bytes\":11,\"diagnostic_bytes\":17");
+  js += F(",\"data_bytes\":"); js += String(DATA_PACKET_LEN);
+  js += F(",\"ack_enabled\":false,\"ack_bytes\":0,\"telemetry_bytes\":"); js += String(TELEMETRY_PACKET_LEN);
+  js += F(",\"diagnostic_bytes\":"); js += String(DIAGNOSTIC_PACKET_LEN);
+  js += F(",\"gnss_diagnostic_bytes\":"); js += String(GNSS_DIAGNOSTIC_PACKET_LEN);
+  js += F(",\"gnss_diagnostic_pages\":1");
   js += F(",\"send_interval_ms\":"); js += String(SEND_INTERVAL_MS);
-  js += F(",\"ack_every_n\":"); js += String(ACK_EVERY_N);
+  js += F(",\"send_mode\":\"latest_valid_fix\",\"status_heartbeat_ms\":0,\"rx_boosted_gain\":true");
+  js += F(",\"diagnostic_interval_ms\":"); js += String(TELEMETRY_INTERVAL_MS);
+  js += F(",\"ack_every_n\":0");
   js += F(",\"gnss_baud\":"); js += String(GPS_BAUD);
   js += F(",\"bound_client_id\":"); js += String(gpsClientId);
   js += F(",\"gnss_age_uncertainty_ms\":"); js += String(GPS_BACKLOG_GUARD_MS);
   js += F(",\"data_airtime_ms\":"); js += String(dataAirtimeMs);
-  js += F(",\"ack_airtime_ms\":"); js += String(ackAirtimeMs);
+  js += F(",\"ack_airtime_ms\":0");
   js += F(",\"telemetry_airtime_ms\":"); js += String(telemetryAirtimeMs);
   js += F(",\"diagnostic_airtime_ms\":"); js += String(diagnosticAirtimeMs);
-  js += F("},\"gps\":{\"age_basis\":\"nmea_epoch_aligned_arrival\",\"measurement_clock_synchronized\":false");
-  js += F(",\"scope\":\"server_local\",\"last_epoch_interval_ms\":"); js += String(g.lastEpochIntervalMs);
+  js += F(",\"gnss_diagnostic_airtime_ms\":"); js += String(gnssDiagnosticAirtimeMs);
+  js += F("},"); appendStationAverageJson(js);
+  js += F(",\"gps\":{\"age_basis\":\"nmea_epoch_aligned_arrival\",\"measurement_clock_synchronized\":false");
+  js += F(",\"requested_hz\":"); js += String(1000 / gnss_rate::kTargetIntervalMs);
+  js += F(",\"rate_state\":\""); js += gpsRate.state(); js += '"';
+  js += F(",\"observed_hz\":"); js += gpsRate.ready() ? String(gpsRate.hz(), 2) : F("null");
+  js += F(",\"rmc_hz\":"); js += gpsRate.ready() ? String(gpsRate.rmcHz(), 2) : F("null");
+  js += F(",\"gga_hz\":"); js += gpsRate.ready() ? String(gpsRate.ggaHz(), 2) : F("null");
+  js += F(",\"scope\":\"station_local\",\"last_epoch_interval_ms\":"); js += String(g.lastEpochIntervalMs);
   js += F(",\"source_age_ms\":"); js += sampled ? String(sample.sourceAgeMs) : F("null");
+  js += F(",\"arrival_age_ms\":"); js += sampled ? String(sample.arrivalAgeMs) : F("null");
+  js += F(",\"freshness_basis\":\"new_epoch_arrival\"");
   js += F(",\"epoch_ms_of_day\":"); js += sampled ? String(sample.epochMsOfDay) : F("null");
   js += F(",\"fix\":"); js += gpsFixFresh() ? F("true") : F("false");
   js += F(",\"have_rmc\":"); js += sampled && sample.haveRmc ? F("true") : F("false");
@@ -2100,6 +2544,15 @@ static String buildDebugJson(const packet_diagnostics::Selection &selection) {
   js += F(",\"backwards_epochs\":"); js += String(g.backwardEpochs);
   js += F(",\"duplicate_epochs\":"); js += String(g.duplicateEpochs);
   js += F(",\"backlog_drops\":"); js += String(gpsBacklogDrops);
+  js += F(",\"stream\":");
+  appendGnssReportJson(js, gnss_diagnostics::capture(gnssCollector, now));
+  js += F("},\"client_gnss\":{\"received\":"); js += clientGnssDiagnostic.received() ? F("true") : F("false");
+  js += F(",\"fresh\":"); js += clientGnssDiagnostic.received() && clientGnssDiagnostic.rxAgeMs(now) < gnss_diagnostics::kFreshMs ? F("true") : F("false");
+  js += F(",\"rx_age_ms\":"); js += clientGnssDiagnostic.received() ? String(clientGnssDiagnostic.rxAgeMs(now)) : F("null");
+  js += F(",\"pages_mask\":"); js += F("null");
+  js += F(",\"snapshot\":");
+  if (clientGnssDiagnostic.received()) appendGnssReportJson(js, clientGnssDiagnostic.report());
+  else js += F("null");
   js += F("},\"client_diagnostic\":{\"received\":"); js += haveClientDiagnostic ? F("true") : F("false");
   js += F(",\"rx_age_ms\":"); js += haveClientDiagnostic ? String(uint32_t(now - lastClientDiagnosticMs)) : F("null");
   js += F(",\"fresh\":"); js += haveClientDiagnostic && now - lastClientDiagnosticMs < 90000 ? F("true") : F("false");
@@ -2113,6 +2566,7 @@ static String buildDebugJson(const packet_diagnostics::Selection &selection) {
   js += F(",\"counters\":{\"rx_data\":"); js += String(rxDataCount);
   js += F(",\"rx_telemetry\":"); js += String(rxTelemetryCount);
   js += F(",\"rx_diagnostic\":"); js += String(rxDiagnosticCount);
+  js += F(",\"rx_gnss_diagnostic\":"); js += String(rxGnssDiagnosticCount);
   js += F(",\"radio_errors\":"); js += String(rxErrorCount);
   js += F(",\"rejected_length\":"); js += String(rejectedLength);
   js += F(",\"rejected_format\":"); js += String(rejectedFormat);
@@ -2122,14 +2576,12 @@ static String buildDebugJson(const packet_diagnostics::Selection &selection) {
   js += F(",\"sequence_resyncs\":"); js += String(sequenceResyncs);
   js += F(",\"invalid_fix_packets\":"); js += String(invalidFixPackets);
   js += F(",\"invalid_velocity_packets\":"); js += String(invalidVelocityPackets);
-  js += F(",\"ack_sent\":"); js += String(ackTxCount);
-  js += F(",\"ack_errors\":"); js += String(ackErrorCount);
-  js += F(",\"ack_skipped\":"); js += String(ackSkippedCount);
+  js += F(",\"ack_sent\":null,\"ack_errors\":null,\"ack_skipped\":null");
   js += F(",\"radio_recoveries\":"); js += String(radioRecoverCount);
   js += F(",\"last_data_interval_ms\":"); js += String(lastDataIntervalMs);
   js += F(",\"max_data_interval_ms\":"); js += String(maxDataIntervalMs);
-  js += F(",\"inferred_source_updates\":"); js += String(sourceEpochUpdates);
-  js += F(",\"inferred_source_interval_ms\":"); js += String(lastSourceEpochIntervalMs);
+  js += F(",\"inferred_source_updates\":"); js += F("null");
+  js += F(",\"inferred_source_interval_ms\":"); js += F("null");
   js += F("},\"events\":{\"capacity\":64,\"total\":"); js += String(packetEvents.total());
   js += F(",\"overwritten\":"); js += String(packetEvents.overwritten());
   js += F(",\"next_id\":"); js += String(selection.nextId);
@@ -2211,13 +2663,134 @@ static bool acceptMotionRequest() {
   return true;
 }
 
+static void serviceAxiomLog() {
+  const uint32_t now = millis();
+  const bool busy = stationRadioIrq || loopDuration.lastUs > 20000;
+  const bool cloudDue = axiom_log::captureDue(now, busy);
+  const bool sdDue = sd_log::captureDue(now, busy);
+  if (!cloudDue && !sdDue) return;
+  const uint32_t started = micros();
+  axiom_log::Sample s;
+  strcpy(s.build, __DATE__ " " __TIME__);
+  s.bootId = controlBootId; s.ms = now; s.nodeId = nodeId; s.clientId = gpsClientId;
+  s.heapFree = ESP.getFreeHeap(); s.heapMin = ESP.getMinFreeHeap();
+  s.heapLargest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  s.resetReason = esp_reset_reason(); s.wifiRssi = WiFi.RSSI();
+  s.batteryMv = cachedBatteryMv; s.clientBatteryMv = haveTelemetry ? lastTelemetry.batteryMv : 0;
+  gnssCollector.sample(now, s.gps); s.gpsFresh = gpsFixFresh();
+  s.gnssCounters = gnssCollector.stats(); s.gpsBacklogDrops = gpsBacklogDrops;
+  s.stationGnss = gnss_diagnostics::capture(gnssCollector, now);
+  if (clientGnssDiagnostic.received()) {
+    s.clientGnss = clientGnssDiagnostic.report(); s.clientGnssAge = clientGnssDiagnostic.rxAgeMs(now);
+  }
+  if (haveClientDiagnostic) { s.clientDiag = lastClientDiagnostic; s.clientDiagAge = now - lastClientDiagnosticMs; }
+  s.clientPresent = havePkt;
+  if (havePkt) {
+    s.clientLat = lastData.lat; s.clientLon = lastData.lon;
+    s.clientRxAge = now - lastRxMs;
+    s.clientSourceAge = UINT32_MAX;
+    s.clientSeq = lastData.seq; s.clientFix = lastData.fix;
+    s.clientSpeedCmS = lastData.speedCmS; s.clientCourseDeg10 = lastData.courseDeg10;
+    s.clientSatClass = lastData.satelliteClass; s.clientHdop10 = lastData.hdop10;
+  }
+  s.rssi = lastRssi; s.snr = lastSnr;
+  s.angle = servoAngleDeg; s.target = servoTargetDeg; s.speed = servoMotion.speed(); s.velocity = servoMotion.velocity();
+  snprintf(s.mode, sizeof(s.mode), "%s", trackModeStr(trackMode));
+  snprintf(s.source, sizeof(s.source), "%s", tracking_policy::sourceName(controlSource));
+  snprintf(s.uartState, sizeof(s.uartState), "%s", uartServoMode.stateName());
+  s.pwmOk = servoPwmReady; s.motionFault = servoMotion.faulted(); s.calibrated = mountCalibrated;
+  s.declinationReady = declinationReady; s.declination = declinationDeg; s.mountOffset = mountOffsetDeg;
+  s.prediction = gpsPredictionEnabled; s.predictionActive = gpsPredictionEnabled && trackMode == TrackMode::Gps && gpsTrackingUsable() && gpsPredictionAllowed(); s.gpsUsable = gpsTrackingUsable();
+  s.finishingGpsTarget = gpsFinishingTarget;
+  s.stationSamples = stationAverage.count(); s.stationLat = stationAverage.latitude();
+  s.stationLon = stationAverage.longitude(); s.stationRmsM = stationAverage.rmsM();
+  s.stationWarning = stationAverage.warning();
+  if (gpsRate.ready()) { s.gpsHz = gpsRate.hz(); s.gpsRmcHz = gpsRate.rmcHz(); s.gpsGgaHz = gpsRate.ggaHz(); }
+  s.uartLate = uartServoMode.latePolls(); s.uartDiscarded = uartServoMode.discardedBytes();
+  s.uartRejected = uartServoMode.rejectedCommands(); s.motionRejected = rejectedMotionCommands;
+  s.controlGapMax = controlGap.maxMs; s.controlGapOver250 = controlGap.over250ms;
+  const loop_metrics::Duration durations[] = {loopDuration, httpDuration, loraDuration, motionDuration,
+    envDuration, pmuDuration, oledDuration, otaDuration};
+  for (size_t i = 0; i < 8; ++i) s.durations[i] = durations[i];
+  s.httpSlowest = httpServer.timing().slowest;
+  s.httpRequests = httpServer.timing().requests; s.httpSlowRequests = httpServer.timing().slowRequests;
+  const uint32_t counters[] = {rxDataCount, rxTelemetryCount, rxDiagnosticCount, rxGnssDiagnosticCount,
+    rxErrorCount, rejectedLength, rejectedFormat, rejectedBinding, rejectedGpsSequence, sequenceMissing,
+    sequenceResyncs, invalidFixPackets, invalidVelocityPackets, 0, 0, 0, // reserved legacy ACK counters
+    radioRecoverCount, lastDataIntervalMs, maxDataIntervalMs};
+  for (size_t i = 0; i < 19; ++i) s.counters[i] = counters[i];
+  // SD packet capture has its own direct queue, independent of the 64-event ring.
+  if (sdDue) sd_log::submit(s, started);
+  if (!cloudDue) return;
+  // Independent cursor: web debug reads neither consume nor duplicate cloud events.
+  static bool haveCursor = false;
+  static uint32_t cursor = 0, lost = 0;
+  const auto window = packetEvents.select(haveCursor, true, cursor);
+  if (window.dropped) lost += packetEvents.total() - cursor - packetEvents.size();
+  s.eventTotal = packetEvents.total(); s.eventLost = lost; s.eventCount = window.count;
+  for (size_t i = 0; i < window.count; ++i) s.events[i] = packetEvents.at(window.start + i);
+  cursor = window.nextId; haveCursor = true;
+  axiom_log::submit(s, started);
+}
+
+static void handleAxiomSettings() {
+  // Credentials are accepted only inside a JSON POST body, never URL parameters.
+  httpServer.sendHeader("Cache-Control", "no-store");
+  const String body = httpServer.arg("plain");
+  if (body.length() == 0 || body.length() > 768 || httpServer.args() != 1 ||
+      httpServer.header("Content-Type") != "application/json" ||
+      httpServer.header("Content-Length") != String(body.length())) {
+    httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"JSON body required (max 768 bytes); no query parameters\"}"); return;
+  }
+  cJSON *json = cJSON_ParseWithLengthOpts(body.c_str(), body.length() + 1, nullptr, true);
+  const auto *enabled = cJSON_GetObjectItemCaseSensitive(json, "enabled");
+  const auto *dataset = cJSON_GetObjectItemCaseSensitive(json, "dataset");
+  const auto *region = cJSON_GetObjectItemCaseSensitive(json, "region");
+  const auto *token = cJSON_GetObjectItemCaseSensitive(json, "token");
+  const auto *clear = cJSON_GetObjectItemCaseSensitive(json, "clear_token");
+  axiom_log::Config config;
+  bool valid = cJSON_IsObject(json) && cJSON_IsBool(enabled) && cJSON_IsString(dataset) &&
+      cJSON_IsString(region) && (!token || cJSON_IsString(token)) && (!clear || cJSON_IsBool(clear));
+  if (valid && !axiom_log::getConfig(config)) {
+    cJSON_Delete(json);
+    httpServer.send(409, "application/json", "{\"ok\":false,\"error\":\"Settings are still being saved\"}"); return;
+  }
+  if (valid) {
+    valid = strlen(dataset->valuestring) < sizeof(config.dataset) &&
+        (!strcmp(region->valuestring, "us") || !strcmp(region->valuestring, "eu")) &&
+        (!token || strlen(token->valuestring) < sizeof(config.token));
+    if (valid) {
+      config.enabled = cJSON_IsTrue(enabled); config.region = !strcmp(region->valuestring, "eu");
+      strcpy(config.dataset, dataset->valuestring);
+      if (token && token->valuestring[0]) strcpy(config.token, token->valuestring);
+      if (cJSON_IsTrue(clear)) config.token[0] = 0;
+      valid = axiom_log::validConfig(config);
+    }
+  }
+  cJSON_Delete(json);
+  if (!valid) {
+    httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid Axiom settings; enabled upload requires a dataset and API token\"}"); return;
+  }
+  if (!axiom_log::configure(config)) {
+    httpServer.send(503, "application/json", "{\"ok\":false,\"error\":\"Uploader busy or insufficient memory\"}"); return;
+  }
+  httpServer.send(202, "application/json", axiom_log::statusJson());
+}
+
 static void initWebServer() {
+  const char *axiomHeaders[] = {"Content-Type", "Content-Length"};
+  httpServer.collectHeaders(axiomHeaders, 2);
+  httpServer.on("/api/axiom", HTTP_GET, []() {
+    httpServer.sendHeader("Cache-Control", "no-store");
+    httpServer.send(200, "application/json", axiom_log::statusJson());
+  });
+  httpServer.on("/api/axiom", HTTP_POST, handleAxiomSettings);
   // send() 的 const char* 多載會先 `String passStr = content` 把整份 44 KB 複製到
   // heap（arduino-esp32 WebServer.cpp 裡自己的 log_e 就寫著 "Use send_P for long
   // arrays"）。send_P 分塊送出，不做這份複製。
   httpServer.on("/", HTTP_GET, []() {
     httpServer.sendHeader("Cache-Control", "no-store");
-    httpServer.send_P(200, PSTR("text/html"), WEB_UI_HTML);
+    httpServer.send_P(200, PSTR("text/html; charset=utf-8"), WEB_UI_HTML);
   });
   // Standalone log viewer. The 資訊 page opens this in a separate browser tab so
   // watching the log no longer costs you the radar view.
@@ -2273,8 +2846,7 @@ static void initWebServer() {
     }
     httpServer.send(200, "application/json", buildWhitelistJson());
   });
-  // The camera-mounted compass is the reference; neither GPS fix nor a
-  // landmark is needed. Hold Manual while reading the compass and submitting.
+  // Record a replaceable RAM reference only at the settled 90-degree command.
   httpServer.on("/api/track/calibrate", HTTP_POST, []() {
     if (!acceptMotionRequest()) return;
     float bearing = 0.0f;
@@ -2283,19 +2855,9 @@ static void initWebServer() {
                       "{\"ok\":false,\"error\":\"bearing must be 0 <= degrees < 360\"}");
       return;
     }
-  if (!servoPwmReady) {
-      httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
-      return;
-    }
-    if (trackMode == TrackMode::Gps || trackMode == TrackMode::Uart) {
+    if (!compassCalibrationReady()) {
       httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"select Manual before compass calibration\"}");
-      return;
-    }
-    if (servoMotion.moving()) {
-      httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"wait for servo motion to finish before compass calibration\"}");
+                      "{\"ok\":false,\"error\":\"請先回到 90° 並等鏡頭停穩，再按校正\"}");
       return;
     }
     lockMountOffset(bearing, servoAngleDeg);
@@ -2369,6 +2931,20 @@ static void initWebServer() {
                       "{\"ok\":false,\"error\":\"mode must be manual, gps or uart\"}");
       return;
     }
+    httpServer.send(200, "application/json", controlReply());
+  });
+  // One fresh command cancels tracking and requests centre through the common
+  // limiter. Do not write PWM here or restore the previous automatic mode.
+  httpServer.on("/api/servo/center", HTTP_POST, []() {
+    if (!acceptMotionRequest()) return;
+    if (!servoPwmReady || servoMotion.faulted()) {
+      httpServer.send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"servo PWM unavailable or motion fault\"}");
+      return;
+    }
+    enterManual();
+    servoMotion.target(90.0);
+    servoTargetDeg = static_cast<float>(servoMotion.requested());
     httpServer.send(200, "application/json", controlReply());
   });
   httpServer.on("/api/servo", HTTP_POST, []() {
@@ -2489,21 +3065,24 @@ static void initWebServer() {
 static void initArduinoOta() {
   if (otaReady || WiFi.status() != WL_CONNECTED) return;
 
-  ArduinoOTA.setHostname("shore-spotter-server");
+  ArduinoOTA.setHostname("shore-spotter-station");
   ArduinoOTA
       .onStart([]() {
+        sd_log::stop(); // asynchronous drain; user can restart recording after an OTA error
+        axiom_log::pauseForOta(true);
         enterManual();
         trackMode = TrackMode::Paused;
         Log.println(F("[OTA] update started; Servo control paused"));
       })
       .onEnd([]() { Log.println(F("[OTA] update complete; rebooting")); })
       .onError([](ota_error_t error) {
+        axiom_log::pauseForOta(false);
         Log.print(F("[OTA] ERROR code="));
         Log.println((unsigned int)error);
       });
   ArduinoOTA.begin();
   otaReady = true;
-  Log.print(F("[OTA] ready: shore-spotter-server.local / "));
+  Log.print(F("[OTA] ready: shore-spotter-station.local / "));
   Log.println(WiFi.localIP());
 }
 #endif
@@ -2512,11 +3091,67 @@ static void initArduinoOta() {
 // Shutdown: show message on OLED then power off via PMU.
 // For CLIENT role the OLED bus is normally off; we power it briefly here.
 // ---------------------------------------------------------------------------
+static void recordPowerEvent(const char *event, const char *reason) {
+  const uint32_t now = millis();
+  uint32_t boot = powerBootId;
+#if defined(ROLE_STATION)
+  if (controlBootId) boot = controlBootId;
+#endif
+  char line[464];
+  snprintf(line, sizeof(line),
+      "{\"event\":\"%s\",\"reason\":\"%s\",\"boot_id\":%lu,\"ms\":%lu,\"battery_mv\":%u,"
+      "\"irq_ms\":%lu,\"irq_raw\":[%d,%d,%d],\"irq_clear\":[%d,%d,%d],\"read_fail\":%u,\"clear_fail\":%u,"
+      "\"suppressed\":%u,\"read_errors\":%lu,\"clear_errors\":%lu,\"suppressed_keys\":%lu,"
+      "\"vbus_raw\":[%d,%d],\"vbus_read_errors\":%lu}",
+      event, reason, (unsigned long)boot, (unsigned long)now, cachedBatteryMv,
+      (unsigned long)powerIrqMs, powerIrqSample.raw[0], powerIrqSample.raw[1], powerIrqSample.raw[2],
+      powerIrqSample.clear[0], powerIrqSample.clear[1], powerIrqSample.clear[2],
+      powerIrqSample.readFailed, powerIrqSample.clearFailed, powerIrqSample.suppressed,
+      (unsigned long)powerIrqState.readErrors, (unsigned long)powerIrqState.clearErrors,
+      (unsigned long)powerIrqState.suppressedKeys, powerVbusRaw[0], powerVbusRaw[1],
+      (unsigned long)powerVbusReadErrors);
+#if defined(FIELD_DIAGNOSTIC)
+  // Queue before OLED wake / drain / delays. This remains a bounded asynchronous
+  // submission: full Flash or a lost supply can still prevent persistence.
+  diagnostic_store::submit(2, line, strlen(line), now);
+  if (!strcmp(event, "shutdown") && diagnosticRawLength) {
+#if defined(CLIENT_TRIP_LOG)
+    recordTripRaw(diagnosticRawKind, diagnosticRaw, diagnosticRawLength, now);
+#else
+    diagnostic_store::submit(diagnosticRawKind, diagnosticRaw, diagnosticRawLength, now);
+#endif
+    diagnosticRawLength = 0;
+  }
+#endif
+  Log.println(line); // USB plus SD text when recording is active
+}
+
+static void recordPowerIrq() {
+  static uint8_t lastReadFailure = 0, lastClearFailure = 0;
+  static uint32_t nextErrorLogMs = 0;
+  const bool failure = powerIrqSample.readFailed || powerIrqSample.clearFailed;
+  const bool changed = powerIrqSample.readFailed != lastReadFailure ||
+      powerIrqSample.clearFailed != lastClearFailure;
+  const bool key = powerIrqSample.shortPress || powerIrqSample.longPress;
+  if (key || changed || (failure && loop_metrics::due(millis(), nextErrorLogMs))) {
+    recordPowerEvent("pmu_irq", key ? "key" : (failure ? "bus_error" : "bus_recovered"));
+    nextErrorLogMs = millis() + 10000;
+  }
+  lastReadFailure = powerIrqSample.readFailed;
+  lastClearFailure = powerIrqSample.clearFailed;
+}
+
 static void showShutdownAndPowerOff() {
-#if defined(ROLE_SERVER)
+  recordPowerEvent("shutdown", "pwr_long_press");
+#if defined(ROLE_STATION)
   enterManual();
 #endif
+  sd_log::stop();
+  const uint32_t stopStarted = millis();
+  while (!sd_log::stopped() && millis() - stopStarted < 2000) delay(10);
+  if (!sd_log::stopped()) Log.println(F("[SD] shutdown drain timed out; unsynced tail may be lost"));
 #if defined(ROLE_CLIENT)
+  ClientRailGuard guard(true); // shutdown only; SD drain above has completed
   if (pmuOnline) {
     pmu.setALDO1Voltage(3300);
     pmu.enableALDO1();
@@ -2541,20 +3176,46 @@ static void showShutdownAndPowerOff() {
 // Critically-low battery handling. Skipped while on USB (charging) or when no /
 // implausible battery is detected, so it never bricks a USB-powered board.
 static bool batteryCriticallyLow() {
+#if defined(ROLE_CLIENT)
+  ClientRailGuard guard;
+  if (!guard.held) return false;
+#endif
   if (!pmuOnline) return false;
   uint16_t mv = cachedBatteryMv;
   if (mv < BATT_PRESENT_MIN_MV) return false;  // no / implausible battery reading
-  if (pmu.isVbusIn()) return false;            // on USB -> charging, don't cut
+  powerVbusRaw[0] = pmu.readRegister(XPOWERS_AXP2101_STATUS1);
+  powerVbusRaw[1] = pmu.readRegister(XPOWERS_AXP2101_STATUS2);
+  static uint8_t lastFailure = 0;
+  static uint32_t nextErrorLogMs = 0;
+  const uint8_t failure = (powerVbusRaw[0] < 0 || powerVbusRaw[0] > 255 ? 1 : 0) |
+      (powerVbusRaw[1] < 0 || powerVbusRaw[1] > 255 ? 2 : 0);
+  if (failure) {
+    ++powerVbusReadErrors;
+    if (failure != lastFailure || loop_metrics::due(millis(), nextErrorLogMs)) {
+      recordPowerEvent("pmu_vbus", "read_error");
+      nextErrorLogMs = millis() + 10000;
+    }
+    lastFailure = failure;
+    return false; // unknown external power is not evidence of a battery-only low state
+  }
+  if (lastFailure) recordPowerEvent("pmu_vbus", "bus_recovered");
+  lastFailure = 0;
+  if (power_irq::vbusPresent(powerVbusRaw[0], powerVbusRaw[1])) return false;
   return mv < BATT_SHUTDOWN_MV;
 }
 
 // Show a low-battery notice, then cut power. Used at boot and at runtime so a
 // dead battery can neither keep running nor power the board back on.
 static void showLowBatteryAndPowerOff() {
-#if defined(ROLE_SERVER)
+  recordPowerEvent("shutdown", "low_battery");
+#if defined(ROLE_STATION)
   enterManual();
 #endif
+  sd_log::stop();
+  const uint32_t sdStopStarted = millis();
+  while (!sd_log::stopped() && millis() - sdStopStarted < 2000) delay(10);
 #if defined(ROLE_CLIENT)
+  ClientRailGuard guard(true); // shutdown only
   if (pmuOnline) {
     pmu.setALDO1Voltage(3300);
     pmu.enableALDO1();
@@ -2625,6 +3286,13 @@ static void drawClientInfoScreen() {
   display.drawStr(0, 28, line1);
   display.drawStr(0, 40, line2);
   if (batteryCharging()) display.drawXBMP(70, 31, 8, 8, ICON_BOLT_8);  // ⚡ on USB
+#if defined(CLIENT_TRIP_LOG)
+  snprintf(line3, sizeof(line3), "TRIP SD:%s", sd_log::stateName());
+  snprintf(line4, sizeof(line4), "PowerLog:%s", diagnostic_store::stateName());
+#elif defined(FIELD_DIAGNOSTIC)
+  snprintf(line3, sizeof(line3), "DIAG P%u RF%u SD%u", diagnosticPlan.phase(), diagnosticPlan.rf(), diagnosticPlan.sd());
+  snprintf(line4, sizeof(line4), "Flash:%s", diagnostic_store::stateName());
+#endif
   display.drawStr(0, 52, line3);
   display.drawStr(0, 64, line4);
   display.sendBuffer();
@@ -2645,6 +3313,8 @@ static void sleepClientOled() {
 
 // Power up the OLED rail and bring up the SH1106. Returns false if it fails.
 static bool enableClientOled() {
+  ClientRailGuard guard; // skip this wake if a background SD rail change is active
+  if (!guard.held) return false;
   if (!pmuOnline) return false;
   pmu.setALDO1Voltage(3300);
   pmu.enableALDO1();
@@ -2657,14 +3327,59 @@ static bool enableClientOled() {
   return true;
 }
 
-// 顯示 10 秒的開機資訊頁，然後讓面板睡眠（電源軌維持供電，見 sleepClientOled）。
+// Three seconds of animation, ten seconds of status, then panel sleep.
+// GPS and key handling keep running throughout both display phases. The
+// starting gesture is guarded; a fresh press after its cleared baseline works.
 static void showClientBootScreen() {
-  if (!enableClientOled()) return;
-  drawClientInfoScreen();
-
-  delay(10000);
-
-  sleepClientOled();
+  const uint32_t initStarted = millis();
+  uint32_t started = initStarted;
+  uint32_t nextDraw = initStarted;
+  bool ready = false;
+  while (millis() - (ready ? started : initStarted) < client_boot_animation::kDurationMs + 10000) {
+    serviceGps();
+#if defined(FIELD_DIAGNOSTIC)
+    sd_log::serviceUsb(); // DIAG works before SD init; trip SD is already active
+    serviceFieldDiagnostic();
+#endif
+    serviceClientPowerKey();
+    // A USB-powered MCU may still return from the PMU shutdown request.
+    // Leave the last shutdown frame alone instead of resuming the boot page.
+    if (powerIrqSample.longPress) return;
+    if (loop_metrics::due(millis(), nextDraw)) {
+      if (!ready) {
+        ready = enableClientOled();
+        // Initialization is outside the visible animation. Reset this clock
+        // only once, after success; failed retries retain the bounded window.
+        if (ready) started = millis();
+      }
+      const uint32_t elapsed = millis() - started;
+      const bool animation = elapsed < client_boot_animation::kDurationMs;
+      nextDraw = millis() + (ready && animation ? client_boot_animation::kFrameMs : 1000);
+      if (ready) {
+        if (animation) {
+          client_boot_animation::draw(display, elapsed);
+          display.sendBuffer();
+        } else {
+          drawClientInfoScreen();
+        }
+      }
+    }
+    delay(1);
+  }
+  // A short press near the end owns the normal ten-second wake deadline.
+  // Hand that visible screen to loop() instead of sleeping it prematurely.
+  if (ready && (!clientOledAwake || loop_metrics::due(millis(), clientOledOffMs))) {
+    sleepClientOled();
+    clientOledAwake = false;
+  }
+  serviceGps();
+#if defined(FIELD_DIAGNOSTIC)
+  sd_log::serviceUsb();
+  serviceFieldDiagnostic();
+#endif
+  // Poll once at the display boundary; do not reset an already armed guard.
+  nextPmuKeyMs = millis();
+  serviceClientPowerKey();
 }
 
 // Short-press PWR wakes the screen for CLIENT_SCREEN_WAKE_MS (non-blocking).
@@ -2675,20 +3390,56 @@ static void wakeClientScreen() {
   clientOledOffMs = millis() + CLIENT_SCREEN_WAKE_MS;
   nextClientOledRefreshMs = millis();  // force an immediate redraw
 }
+
+static void serviceClientPowerKey() {
+  if (!pmuOnline || !loop_metrics::due(millis(), nextPmuKeyMs)) return;
+  power_irq::ClientBootGuard::Change change = power_irq::ClientBootGuard::None;
+  {
+    ClientRailGuard guard;
+    if (!guard.held) return;
+    nextPmuKeyMs = millis() + PMU_KEY_POLL_MS;
+    powerIrqMs = millis();
+    powerIrqSample = power_irq::read(pmu, powerIrqState, power_irq::kAllKeys);
+    // Preserve the original startup latch BEFORE acknowledging it. Repeated
+    // clear failures are rate-limited; a changed latch is always recorded.
+    static int lastStartupRaw[3] = {-1, -1, -1};
+    static uint32_t nextStartupLogMs = 0;
+    const bool key = !powerIrqSample.readFailed &&
+        (powerIrqSample.raw[1] & power_irq::kAllKeys);
+    const bool changed = memcmp(lastStartupRaw, powerIrqSample.raw, sizeof(lastStartupRaw)) != 0;
+    if (!clientPowerKeys.armed && key &&
+        (changed || loop_metrics::due(millis(), nextStartupLogMs))) {
+      recordPowerEvent("pmu_startup", "captured_before_clear");
+      nextStartupLogMs = millis() + 10000;
+    }
+    memcpy(lastStartupRaw, powerIrqSample.raw, sizeof(lastStartupRaw));
+    power_irq::clear(pmu, powerIrqState, powerIrqSample);
+    change = clientPowerKeys.filter(powerIrqSample);
+  }
+  if (change == power_irq::ClientBootGuard::BaselineReady)
+    recordPowerEvent("pmu_startup", "wait_new_press");
+  else if (change == power_irq::ClientBootGuard::Armed)
+    recordPowerEvent("pmu_startup", "new_press_armed");
+  recordPowerIrq();
+  // The baseline latch is never actionable. A fresh later press is accepted
+  // during both the boot display and runtime, with the same clear recovery.
+  if (powerIrqSample.longPress) showShutdownAndPowerOff();
+  else if (powerIrqSample.shortPress) wakeClientScreen();
+}
 #endif
 
-#if defined(ROLE_SERVER)
-// Returns true if ACK start (including its recovery path) already owns RX.
-static bool acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtMs) {
+#if defined(ROLE_STATION)
+// Parse uplink only; the main loop restarts RX after every frame.
+static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtMs) {
   using packet_diagnostics::Kind;
   PacketHeader hdr{};
   auto reject = [&](Kind kind) {
     ++rxDropCount; ++rxWinDrop;
     recordPacketEvent(kind, receivedAtMs, buf, n);
-    return false;
+    return;
   };
-  if (n != DATA_PACKET_LEN && n != ACK_PACKET_LEN &&
-      n != TELEMETRY_PACKET_LEN && n != DIAGNOSTIC_PACKET_LEN) {
+  if (n != DATA_PACKET_LEN &&
+      n != TELEMETRY_PACKET_LEN && n != DIAGNOSTIC_PACKET_LEN && n != GNSS_DIAGNOSTIC_PACKET_LEN) {
     ++rejectedLength; return reject(Kind::Length);
   }
   if (!protocol::decodeHeader(buf, n, hdr)) {
@@ -2702,7 +3453,7 @@ static bool acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
     ++rxTelemetryCount; ++rxWinTelem;
     if (clientHumBaselinePct < 0 && tel.humidityPct != 255) clientHumBaselinePct = tel.humidityPct;
     recordPacketEvent(Kind::Telemetry, receivedAtMs, buf, n);
-    return false;
+    return;
   }
   if (hdr.msgType == MSG_DIAGNOSTIC) {
     DiagnosticPayload diag{};
@@ -2710,32 +3461,39 @@ static bool acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
     lastClientDiagnostic = diag; haveClientDiagnostic = true;
     lastClientDiagnosticMs = receivedAtMs; ++rxDiagnosticCount;
     recordPacketEvent(Kind::Diagnostic, receivedAtMs, buf, n);
-    return false;
+    return;
+  }
+  if (hdr.msgType == MSG_GNSS_DIAGNOSTIC) {
+    gnss_diagnostics::Report report{};
+    if (!gnss_diagnostics::decode(buf, n, hdr, report)) {
+      ++rejectedFormat; return reject(Kind::Format);
+    }
+    clientGnssDiagnostic.accept(hdr, report, receivedAtMs);
+    ++rxGnssDiagnosticCount;
+    recordPacketEvent(Kind::GnssDiagnostic, receivedAtMs, buf, n);
+    return;
   }
   DecodedData data{};
   if (!parseDataPacket(buf, n, data)) { ++rejectedFormat; return reject(Kind::Format); }
-  if (!gpsSequence.accept(data.seq, receivedAtMs)) {
+  if (!gpsSequence.accept(data.seq, receivedAtMs, data.fix)) {
     ++rejectedGpsSequence;
     recordPacketEvent(Kind::Sequence, receivedAtMs, buf, n, &data);
-    return false;
+    return;
   }
   if (havePkt) {
     lastDataIntervalMs = receivedAtMs - lastRxMs;
     if (lastDataIntervalMs > maxDataIntervalMs) maxDataIntervalMs = lastDataIntervalMs;
     const uint16_t delta = data.seq - lastData.seq;
-    if (lastDataIntervalMs < 2500 && delta > 0 && delta < 0x8000) {
+    if (!gpsSequence.resetAfterGap() && delta > 0 && delta < 0x8000) {
       sequenceMissing += delta - 1; rxWinMissing += delta - 1;
-    } else ++sequenceResyncs;
-  }
-  if (data.age10ms != 255) {
-    const uint32_t estimate = receivedAtMs - dataAirtimeMs - uint32_t(data.age10ms) * 10;
-    const int32_t delta = static_cast<int32_t>(estimate - lastEstimatedSourceMs);
-    if (!haveSourceEstimate || delta > 100) {
-      if (haveSourceEstimate) lastSourceEpochIntervalMs = delta;
-      ++sourceEpochUpdates; lastEstimatedSourceMs = estimate; haveSourceEstimate = true;
+    } else {
+      ++sequenceResyncs;
+      Log.print(F("[LoRa] DATA sequence baseline reset after gap_ms="));
+      Log.print(lastDataIntervalMs); Log.print(F(" seq=")); Log.println(data.seq);
     }
   }
   lastData = data; lastRxMs = receivedAtMs; havePkt = true; ++rxDataCount;
+  loraDataRate.record(receivedAtMs);
   lastRssi = receivedPacketRssi; lastSnr = receivedPacketSnr;
   if (!data.fix) ++invalidFixPackets;
   if (!data.velocityValid) ++invalidVelocityPackets;
@@ -2760,16 +3518,7 @@ static bool acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
     if (lastSnr > rxWinSnrMax) rxWinSnrMax = lastSnr;
   }
   rxWinLastSeq = data.seq; rxWinRssiSum += lastRssi; rxWinSnrSum += lastSnr;
-  if (data.seq % ACK_EVERY_N != 0) return false;
-  if (millis() - receivedAtMs > ACK_START_MAX_AGE_MS) {
-    ++ackSkippedCount; recordPacketEvent(Kind::AckSkipped, receivedAtMs, nullptr, 0, &data);
-    return false;
-  }
-  const size_t length = buildAckPacket(ackPacketBuffer, data.srcId, data.seq, lastRssi, lastSnr);
-  serverRxReady = false;
-  handleAckResult(ackTransmitter.start(ackPacketBuffer, length, millis(),
-                                      ackAirtimeMs + TELEMETRY_SLOT_GUARD_MS));
-  return true;
+  return;  // reception remains owned by the main loop; no downlink
 }
 #endif
 
@@ -2782,35 +3531,63 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   delay(1200);
   bootMs = millis();
+  powerBootId = esp_random();
+  if (!powerBootId) powerBootId = 1;
   nodeId = derivedNodeId();
   Log.println(F("[BOOT] Shore Spotter v" SHORE_SPOTTER_VERSION));
 
+#if defined(FIELD_DIAGNOSTIC)
+  diagnosticBootId = powerBootId;
+  diagnostic_store::begin(diagnosticBootId);
+  char bootRecord[320];
+  snprintf(bootRecord, sizeof(bootRecord),
+      "{\"event\":\"boot\",\"diagnostic\":true,\"firmware\":\"%s\",\"node_id\":%u,\"reset_reason\":%d,\"gnss_interval_ms\":1000,\"gnss_baud\":115200,\"plan_resumed\":false}",
+      SHORE_SPOTTER_VERSION, nodeId, int(esp_reset_reason()));
+  diagnostic_store::submit(2, bootRecord, strlen(bootRecord), millis());
+#if defined(CLIENT_TRIP_LOG)
+  const char tripRecord[] = "{\"event\":\"trip_profile\",\"profile\":\"client-trip-1hz\",\"raw_target\":\"sd\",\"sd_policy\":\"always\",\"flash_snapshot_ms\":60000,\"flash_sd_status_ms\":300000}";
+  diagnostic_store::submit(2, tripRecord, sizeof(tripRecord)-1, millis());
+#endif
+#endif
+  pmuOnline = initPmu();
+#if defined(FIELD_DIAGNOSTIC)
+  snprintf(bootRecord, sizeof(bootRecord),
+      "{\"event\":\"pmu_boot\",\"online\":%s,\"power_on_source\":%d,\"power_off_source\":%d}",
+      pmuOnline ? "true" : "false", pmuOnline ? int(pmu.getPowerOnSource()) : -1,
+      pmuOnline ? int(pmu.getPowerOffSource()) : -1);
+  diagnostic_store::submit(2, bootRecord, strlen(bootRecord), millis());
+#endif
+#if defined(ROLE_CLIENT) && defined(FIELD_DIAGNOSTIC)
+  recordClientBatteryDiagnostic("init");
+#endif
   if (!initRadio()) {
+#if defined(FIELD_DIAGNOSTIC)
+    const char failure[] = "{\"event\":\"radio_init_failed\"}";
+    diagnostic_store::submit(2, failure, sizeof(failure)-1, millis());
+#endif
     while (true) {
+#if defined(FIELD_DIAGNOSTIC)
+      sd_log::serviceUsb(); // DIAG export remains available even before SD init
+      delay(1);
+#else
       delay(1000);
+#endif
     }
   }
   computeAirtimeBudget();
 
 #if defined(ROLE_CLIENT)
-  loadClientSettings();
-  radio.setOutputPower(currentTxPowerDbm);
-  nextAtpcEvalMs = millis() + ATPC_EVAL_MS;
+  configureGps();
 
-  pinMode(GPS_EN_PIN, OUTPUT);
-  digitalWrite(GPS_EN_PIN, HIGH);
-
-  GPSSerial.setRxBufferSize(GPS_RX_BUFFER_BYTES);  // must precede begin()
-  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-
-  pmuOnline = initPmu();
   if (pmuOnline) {
     pmu.setALDO1Voltage(3300);
     pmu.enableALDO1();
     // short-press = wake screen 10 s, long-press = shutdown
-    pmu.enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ | XPOWERS_AXP2101_PKEY_LONG_IRQ);
+    pmu.enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ | XPOWERS_AXP2101_PKEY_LONG_IRQ |
+                  XPOWERS_AXP2101_PKEY_NEGATIVE_IRQ | XPOWERS_AXP2101_PKEY_POSITIVE_IRQ);
     delay(100);
   }
+  serviceClientPowerKey();
   cachedBatteryMv = readBatteryMilliVolts();
   if (batteryCriticallyLow()) showLowBatteryAndPowerOff();  // refuse to boot empty
   nextBatteryMs = millis() + BATTERY_UPDATE_MS;
@@ -2820,29 +3597,51 @@ void setup() {
   envSensorOnline = initEnvSensor();
   sampleEnvSensor();
 
-  showClientBootScreen();  // show MAC / batt / temp for 10 s then turn off OLED
+#if defined(CLIENT_TRIP_LOG)
+  // Start the background SD recorder before the 10-second boot display.
+  // It remains active with no fix; the normal/phase-test policies stay below.
+  const bool sdReady = pmuOnline && pmu.disableBLDO1() && !pmu.isEnableBLDO1();
+  pinMode(36, INPUT); pinMode(35, INPUT); pinMode(47, INPUT);
+  sd_log::begin(diagnosticBootId, sdReady, clientSdPower);
+  sd_log::ClientRecord initialRecord;
+  initialRecord.ms = millis(); initialRecord.nodeId = nodeId;
+  sd_log::clientGps(true, initialRecord);
+  recordDiagnosticPhase(millis());
+  Log.println(F("[CLIENT] profile=client-trip-1hz raw=SD sd_policy=always flash_snapshot_ms=60000"));
+#endif
+  showClientBootScreen();  // animation 3 s + status 10 s, then panel sleep
+#if !defined(CLIENT_TRIP_LOG)
+  // No GPS => SD stays physically off. The worker powers it only for a usable
+  // GPS session or an explicit USB read/list operation.
+  const bool sdReady = pmuOnline && pmu.disableBLDO1() && !pmu.isEnableBLDO1();
+  pinMode(36, INPUT); pinMode(35, INPUT); pinMode(47, INPUT);
+#if defined(FIELD_DIAGNOSTIC)
+  sd_log::begin(diagnosticBootId, sdReady, clientSdPower);
+  sd_log::stop(); // baseline starts with the physical card off
+  recordDiagnosticPhase(millis());
+#else
+  sd_log::begin(powerBootId, sdReady, clientSdPower);
+#endif
+#endif
 
   Log.println(F("[CLIENT] mode active: send position packets"));
+  Log.print(F("[CLIENT] protocol=")); Log.println(PROTO_VERSION);
   Log.print(F("[CLIENT] node id (chip MAC last 2 bytes) = 0x"));
   Log.println(nodeId, HEX);
-  Log.println(F("[CLIENT] Bind this id on SERVER using /api/whitelist action=set."));
+  Log.println(F("[CLIENT] Bind this id on STATION using /api/whitelist action=set."));
   Log.print(F("[CLIENT] GPS UART baud="));
   Log.println(GPS_BAUD);
   Log.print(F("[CLIENT] TX power="));
-  Log.print(currentTxPowerDbm);
-  Log.print(F(" dBm (ATPC="));
-  Log.print(atpcEnabled ? F("on") : F("off"));
-  Log.println(F(")"));
+  Log.print(TX_POWER_DBM);
+  Log.println(F(" dBm (fixed, ATPC=off)"));
 
-  // Arm non-blocking ACK reception (see onClientDio1) and start the position
-  // cadence from now, so the 10 s boot screen does not count as a missed slot.
+  // Arm TX completion and start the cadence after the boot screen.
   radio.setDio1Action(onClientDio1);
-  clientRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
-  nextSendMs = millis();
+  clientRadioReady = radio.standby() == RADIOLIB_ERR_NONE;
+  clientCadence.reset(millis());
 #endif
 
-#if defined(ROLE_SERVER)
-  pmuOnline = initPmu();
+#if defined(ROLE_STATION)
   if (pmuOnline) {
     pmu.setALDO1Voltage(3300);
     pmu.enableALDO1();  // power the OLED / I2C bus-0 peripherals
@@ -2850,11 +3649,8 @@ void setup() {
     delay(100);
   }
 
-  // Server also reads its own GPS so it can compute bearing to the client.
-  pinMode(GPS_EN_PIN, OUTPUT);
-  digitalWrite(GPS_EN_PIN, HIGH);
-  GPSSerial.setRxBufferSize(GPS_RX_BUFFER_BYTES);  // must precede begin()
-  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  // Station also reads its own GPS so it can compute bearing to the client.
+  configureGps();
 
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
   Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
@@ -2862,39 +3658,60 @@ void setup() {
   sampleEnvSensor();
   nextEnvMs = millis() + ENV_UPDATE_MS;
   initServo();                     // restore boot centre at 90 degrees
-  detectOledAddress();
-  display.setI2CAddress(oledI2CAddr << 1);
-  display.begin();
+  oledOnline = initStationDisplay();
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
   display.drawStr(0, 12, "SHORE SPOTTER v" SHORE_SPOTTER_VERSION);
-  display.drawStr(0, 30, "SERVER booting...");
-  display.sendBuffer();
+  display.drawStr(0, 30, "STATION booting...");
+  if (oledOnline) display.sendBuffer();
+
+  // A CPU/USB reset does not remove SD power. Start with a real card power cycle
+  // so an interrupted write/format cannot leave the next boot's SPI card busy.
+  const bool sdWasOff = pmuOnline && pmu.disableBLDO1() && !pmu.isEnableBLDO1();
+  delay(100);
+  const bool sdPowered = sdWasOff && pmu.setBLDO1Voltage(3300) && pmu.enableBLDO1() &&
+      pmu.isEnableBLDO1() && pmu.getBLDO1Voltage() == 3300;
+  delay(10);
+  sd_log::begin(controlBootId, sdPowered);
+  // Replay bounded early boot text once, then LogTee supplies new text directly.
+  const size_t bootLogLength = logWrapped ? LOG_BUF_BYTES : logHead;
+  const size_t bootLogStart = logWrapped ? logHead : 0;
+  for (size_t i = 0; i < bootLogLength; i += 256) {
+    uint8_t chunk[256];
+    const size_t n = bootLogLength - i < sizeof(chunk) ? bootLogLength - i : sizeof(chunk);
+    for (size_t j = 0; j < n; ++j) chunk[j] = logBuf[(bootLogStart + i + j) % LOG_BUF_BYTES];
+    sd_log::text(chunk, n, millis());
+  }
+  Log.print(F("[SD] BLDO1 3300 mV readback=")); Log.println(sdPowered ? "ok" : "failed");
 
   cachedBatteryMv = readBatteryMilliVolts();
   if (batteryCriticallyLow()) showLowBatteryAndPowerOff();  // refuse to boot empty
 
-  nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
+  nextStationIdleLogMs = millis() + STATION_IDLE_LOG_MS;
   nextRxSummaryMs = millis() + RX_SUMMARY_MS;
   nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
-  Log.println(F("[SERVER] mode active: receive position packets"));
-  loadServerSettings();
-  Log.print(F("[SERVER] GPS client: "));
+  Log.println(F("[STATION] mode active: receive position packets"));
+  loadStationSettings();
+  Log.print(F("[STATION] GPS client: "));
   if (gpsClientId != 0) Log.println(gpsClientId, HEX);
   else Log.println(F("unbound"));
 
   // Connect to the phone-provided hotspot in station mode.
   // Credentials come from include/wifi_config.h (WIFI_SSID / WIFI_PASSWORD).
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname("shore-spotter-server");
+  WiFi.setHostname("shore-spotter-station");
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Log.print(F("[WiFi] Connecting to configured hotspot "));
   uint32_t wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED &&
          millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
+#if defined(FIELD_DIAGNOSTIC)
+    serviceGps(); serviceFieldDiagnostic(); delay(1);
+#else
     delay(250);
     Log.print('.');
+#endif
   }
   Log.println();
 
@@ -2916,23 +3733,34 @@ void setup() {
     display.drawStr(0, 32, "WiFi FAILED");
     display.drawStr(0, 48, "see wifi_config.h");
   }
-  display.sendBuffer();
+  if (oledOnline) display.sendBuffer();
+#if defined(FIELD_DIAGNOSTIC)
+  const uint32_t screenStarted = millis();
+  while (millis()-screenStarted < 2000) { serviceGps(); serviceFieldDiagnostic(); delay(1); }
+#else
   delay(2000);
+#endif
 
+  axiom_log::begin(controlBootId);
   initWebServer();
   initArduinoOta();
 
   // Arm non-blocking, interrupt-driven reception.
   radio.setDio1Action(onLoRaDio1);
-  serverRadioIrq = false;
-  serverRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
-  if (!serverRxReady) nextServerRxRetryMs = millis() + 100;
-  selectTrackingMode(TrackMode::Uart);  // default source; wait for fresh UART input
+  stationRadioIrq = false;
+  stationRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+  if (!stationRxReady) nextStationRxRetryMs = millis() + 100;
+  enterManual();  // boot in Manual; LoRa reception and SD recording remain active
 #endif
 }
 
 void loop() {
+#if defined(FIELD_DIAGNOSTIC)
+  serviceFieldDiagnostic();
+#endif
 #if defined(ROLE_CLIENT)
+  clientLoopGap.observe(millis());
+  sd_log::serviceUsb();
   serviceGps();
 
   serviceClientTransmit();
@@ -2945,6 +3773,16 @@ void loop() {
     checkLowBatteryAndMaybeShutdown();
   }
 
+#if defined(FIELD_DIAGNOSTIC)
+  // One post-startup read, then five-minute evidence; keep long-trip Flash use
+  // bounded. Early init ADC values alone need not represent settled voltage.
+  static uint32_t nextBatteryDiagnosticMs = 0;
+  if (loop_metrics::due(millis(), nextBatteryDiagnosticMs)) {
+    recordClientBatteryDiagnostic("runtime");
+    nextBatteryDiagnosticMs = millis() + 300000;
+  }
+#endif
+
   if (loop_metrics::due(millis(), nextEnvMs)) {
     nextEnvMs = millis() + ENV_UPDATE_MS;
     sampleEnvSensor();
@@ -2952,38 +3790,22 @@ void loop() {
 
   serviceGps();
   serviceClientTransmit();
-  if (clientTxCount > 5 && millis() - lastAckRxMs > ACK_STALE_MS &&
-      millis() - lastAckMissMarkMs > 5000) {
-    ++ackMissCount; lastAckMissMarkMs = millis();
-  }
-  if (!clientTransmitter.active() && !expectedAck.pending(millis())) evaluateAtpc();
   static uint32_t nextClientSummaryMs = 0;
   if (loop_metrics::due(millis(), nextClientSummaryMs)) {
     nextClientSummaryMs = millis() + 10000;
     Log.print(F("[CLIENT] tx=")); Log.print(clientTxCount);
     Log.print(F(" errors=")); Log.print(clientTxErrors);
     Log.print(F(" skipped=")); Log.print(dataSkippedSlots);
-    Log.print(F(" ACK=")); Log.print(ackRxCount);
-    Log.print(F(" rejected=")); Log.print(ackRejectedCount);
+    Log.print(F(" diagnostic_tx=")); Log.print(diagnosticTxCount);
     Log.print(F(" GNSS_epoch_ms=")); Log.print(gnssCollector.stats().lastEpochIntervalMs);
     Log.print(F(" backlog_drops=")); Log.println(gpsBacklogDrops);
+    Log.print(F("[SD] ")); Log.println(sd_log::statusJson());
   }
 
   // PWR key: short-press wakes the screen 10 s, long-press shuts down.
   // Polled on a timer (see PMU_KEY_POLL_MS) — loop() no longer blocks, so every
   // pass would otherwise cost two I2C transactions on the PMU bus.
-  if (pmuOnline && loop_metrics::due(millis(), nextPmuKeyMs)) {
-    nextPmuKeyMs = millis() + PMU_KEY_POLL_MS;
-    pmu.getIrqStatus();
-    if (pmu.isPekeyShortPressIrq()) {
-      wakeClientScreen();
-    }
-    if (pmu.isPekeyLongPressIrq()) {
-      pmu.clearIrqStatus();
-      showShutdownAndPowerOff();
-    }
-    pmu.clearIrqStatus();
-  }
+  serviceClientPowerKey();
 
   // Keep the woken screen refreshed, then put the panel back to sleep.
   if (clientOledAwake) {
@@ -3000,13 +3822,14 @@ void loop() {
   // would spin at full CPU and never let the core's idle task run — wasted
   // battery on a device that has to last a session in the water. At
   // CONFIG_FREERTOS_HZ=1000 this is a 1 ms tick, far finer than anything above.
-  // (The server gets the same yield for free from WebServer::handleClient().)
+  // (The station gets the same yield for free from WebServer::handleClient().)
   delay(1);
 #endif
 
-#if defined(ROLE_SERVER)
+#if defined(ROLE_STATION)
   MeasureDuration loopTiming(loopDuration);
-  serviceServerRadio();
+  sd_log::serviceUsb();
+  serviceStationRadio();
   updateDeclination();
   serviceControl();
   if (otaReady && WiFi.status() == WL_CONNECTED) {
@@ -3018,9 +3841,9 @@ void loop() {
     MeasureDuration timing(httpDuration);
     httpServer.handleClient();
   }
-  serviceServerRadio();
+  serviceStationRadio();
   serviceControl();
-  serviceGps();  // keep the server's own GPS position fresh
+  serviceGps();  // keep the station's own GPS position fresh
   updateDeclination();
 
   if (loop_metrics::due(millis(), nextEnvMs)) {
@@ -3069,45 +3892,46 @@ void loop() {
   if (pmuOnline && loop_metrics::due(millis(), nextPmuKeyMs)) {
     MeasureDuration timing(pmuDuration);
     nextPmuKeyMs = millis() + PMU_KEY_POLL_MS;
-    pmu.getIrqStatus();
-    if (pmu.isPekeyLongPressIrq()) {
-      pmu.clearIrqStatus();
-      showShutdownAndPowerOff();
-    }
-    pmu.clearIrqStatus();  // don't let unrelated latched IRQs accumulate
+    powerIrqMs = millis();
+    powerIrqSample = power_irq::poll(pmu, powerIrqState);
+    recordPowerIrq();
+    if (powerIrqSample.longPress) showShutdownAndPowerOff();
   }
 
   serviceControl();
-  // DIO1 drives RX / TX completion; HTTP and I2C calls are measured separately.
-  serviceServerRadio();
-  if (!ackTransmitter.active() && serverRxReady && serverRadioIrq) {
+  // DIO1 drives Station RX completion; HTTP and I2C are measured separately.
+  serviceStationRadio();
+  if (stationRxReady && stationRadioIrq) {
     MeasureDuration timing(loraDuration);
-    const uint32_t receivedAtMs = serverRadioIrqMs;
-    serverRadioIrq = false;
-    bool ackHandledRx = false;
+    const uint32_t receivedAtMs = stationRadioIrqMs;
+    stationRadioIrq = false;
+    bool rxRestarted = false;
     uint8_t buf[255];
     // Preserve the real RF length. Never truncate a long frame into a valid one.
     const size_t n = radio.getPacketLength();
     const int state = radio.readData(buf, n <= sizeof(buf) ? n : sizeof(buf));
+    // RadioLib returns CRC mismatch only after it has copied the received bytes.
+    // Keep those bytes for diagnosis, but never parse them as valid control data.
+    const bool rawAvailable = (state == RADIOLIB_ERR_NONE || state == RADIOLIB_ERR_CRC_MISMATCH) && n <= sizeof(buf);
+    if (rawAvailable) { receivedPacketRssi = radio.getRSSI(); receivedPacketSnr = radio.getSNR(); }
     if (state == RADIOLIB_ERR_NONE && n <= sizeof(buf)) {
       radioFailStreak = 0;
-      receivedPacketRssi = radio.getRSSI(); receivedPacketSnr = radio.getSNR();
-      ackHandledRx = acceptRadioPacket(buf, n, receivedAtMs);
+      acceptRadioPacket(buf, n, receivedAtMs);
     } else {
       ++rxErrorCount; ++rxWinErr; rxWinLastErr = state;
-      recordPacketEvent(packet_diagnostics::Kind::RadioError, receivedAtMs, nullptr, n, nullptr, state);
+      recordPacketEvent(packet_diagnostics::Kind::RadioError, receivedAtMs, rawAvailable ? buf : nullptr, n, nullptr, state);
       if (++radioFailStreak >= RADIO_RX_ERR_LIMIT && recoverRadio()) {
-        ackHandledRx = true; serverRxReady = true;
+        rxRestarted = true; stationRxReady = true;
       }
     }
-    if (!ackHandledRx) {
+    if (!rxRestarted) {
       // Do not clear the software IRQ after restarting RX: preserve a new packet.
-      serverRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
-      if (!serverRxReady) nextServerRxRetryMs = millis() + 100;
+      stationRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+      if (!stationRxReady) nextStationRxRetryMs = millis() + 100;
     }
   }
 
-  serviceServerRadio();
+  serviceStationRadio();
 
   serviceControl();
 
@@ -3118,10 +3942,10 @@ void loop() {
 
   // Advance even while the link is healthy, so this deadline never lies dormant
   // for longer than half the millis range before the next disconnection.
-  if (loop_metrics::due(millis(), nextServerIdleLogMs)) {
-    nextServerIdleLogMs = millis() + SERVER_IDLE_LOG_MS;
+  if (loop_metrics::due(millis(), nextStationIdleLogMs)) {
+    nextStationIdleLogMs = millis() + STATION_IDLE_LOG_MS;
     if (!havePkt || millis() - lastRxMs > 2500) {
-      Log.print(F("[SERVER] idle | mode="));
+      Log.print(F("[STATION] idle | mode="));
       Log.print(trackModeStr(trackMode));
       Log.print(F(" SRV-GPS fix="));
       Log.print(gpsFixFresh() ? 1 : 0);
@@ -3138,10 +3962,16 @@ void loop() {
 
   if (oledNextRow>=8 && loop_metrics::due(millis(), nextDisplayMs)) {
     nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
-    renderServerDisplay();
+    renderStationDisplay();
   }
   serviceControl();
-  serviceServerDisplay();
+  serviceStationDisplay();
   serviceControl();
+  serviceAxiomLog();
+  static uint32_t nextSdStatusMs = 0;
+  if (loop_metrics::due(millis(), nextSdStatusMs)) {
+    nextSdStatusMs = millis() + 10000;
+    Log.print(F("[SD] ")); Log.println(sd_log::statusJson());
+  }
 #endif
 }

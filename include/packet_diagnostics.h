@@ -3,13 +3,15 @@
 #include <stdint.h>
 
 namespace packet_diagnostics {
+// AckError/AckSkipped retain historical event IDs; current firmware never emits them.
 enum class Kind : uint8_t { Data, Telemetry, Diagnostic, Length, Format, Binding, Sequence,
-                            RadioError, AckError, AckSkipped };
+                            RadioError, AckError, AckSkipped, GnssDiagnostic };
 inline const char *name(Kind kind) {
   switch (kind) {
     case Kind::Data: return "data";
     case Kind::Telemetry: return "telemetry";
     case Kind::Diagnostic: return "diagnostic";
+    case Kind::GnssDiagnostic: return "gnss_diagnostic";
     case Kind::Length: return "length";
     case Kind::Format: return "format";
     case Kind::Binding: return "binding";
@@ -28,7 +30,7 @@ struct Event {
   int16_t rssiDbm10 = 0, snrQuarterDb = 0, code = 0;
   uint8_t flags = 0;
   // Copy bounded raw radio data to make decoder defects reviewable offline.
-  uint8_t raw[17]{};
+  uint8_t raw[36]{};
   uint8_t rawLength = 0;
 };
 

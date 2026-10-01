@@ -78,29 +78,30 @@ void test_epoch_mismatch_never_reuses_old_velocity_or_quality() {
   TEST_ASSERT_FALSE(s.velocityValid);
   feed(c, rmc("120002.000"), 3000);
   s = sample(c, 3000);
-  TEST_ASSERT_FALSE(s.velocityValid);
-  TEST_ASSERT_EQUAL_UINT32(43201000, s.epochMsOfDay);
-  TEST_ASSERT_EQUAL_UINT8(8, s.satellites);
-  feed(c, rmc("120001.000"), 3100);  // interleaved older RMC
+  TEST_ASSERT_TRUE(s.velocityValid);
+  TEST_ASSERT_FALSE(s.haveGga);
+  TEST_ASSERT_EQUAL_UINT32(43202000, s.epochMsOfDay);
+  TEST_ASSERT_EQUAL_UINT8(255, s.satellites);
+  feed(c, rmc("120001.000"), 3100);  // interleaved older RMC never replaces latest
   s = sample(c, 3100);
-  TEST_ASSERT_EQUAL_UINT32(43201000, s.epochMsOfDay);
+  TEST_ASSERT_EQUAL_UINT32(43202000, s.epochMsOfDay);
+  TEST_ASSERT_EQUAL_UINT32(100, s.arrivalAgeMs);
   feed(c, rmc("120003.000"), 4000);  // GGA still absent, no timeless cached quality
   s = sample(c, 4000);
   TEST_ASSERT_EQUAL_UINT32(43203000, s.epochMsOfDay);
   TEST_ASSERT_EQUAL_UINT8(255, s.satellites);
 }
 
-void test_rmc_gga_gap_keeps_aged_coherent_quality_and_invalidity_wins() {
+void test_rmc_gga_gap_exposes_latest_without_old_quality_and_invalidity_wins() {
   Collector c;
   feed(c, rmc(), 1000);
   feed(c, gga(), 1100);
-  const uint32_t initialAge = sample(c, 1100).sourceAgeMs;
   feed(c, rmc("120001.000"), 2000);
   Snapshot s = sample(c, 2000);  // 2 Hz TX happens during the RMC/GGA gap
-  TEST_ASSERT_TRUE(s.fix && s.velocityValid && s.haveRmc && s.haveGga);
-  TEST_ASSERT_EQUAL_UINT32(43200000, s.epochMsOfDay);
-  TEST_ASSERT_EQUAL_UINT8(8, s.satellites);
-  TEST_ASSERT_EQUAL_UINT32(initialAge + 900, s.sourceAgeMs);
+  TEST_ASSERT_TRUE(s.fix && s.velocityValid && s.haveRmc && !s.haveGga);
+  TEST_ASSERT_EQUAL_UINT32(43201000, s.epochMsOfDay);
+  TEST_ASSERT_EQUAL_UINT8(255, s.satellites);
+  TEST_ASSERT_EQUAL_UINT32(0, s.arrivalAgeMs);
   feed(c, gga("120001.000"), 2100);
   TEST_ASSERT_EQUAL_UINT32(43201000, sample(c, 2100).epochMsOfDay);
   feed(c, rmc("120002.000", "V"), 3000);
@@ -219,7 +220,7 @@ void test_invalidate_discards_partial_and_prevents_duplicate_resurrection() {
   TEST_ASSERT_FALSE(s.velocityValid);
 }
 
-void test_backwards_utc_requires_explicit_reset() {
+void test_single_backwards_epoch_is_rejected_until_explicit_reset() {
   Collector c;
   feed(c, rmc("120005.000"), 1000);
   feed(c, rmc("120004.000"), 1500);
@@ -269,12 +270,144 @@ void test_other_nmea_types_are_not_reported_as_decode_errors() {
   TEST_ASSERT_FALSE(c.sample(1000, s));
 }
 
+
+void test_stalled_clock_recovers_only_after_three_paced_fixes() {
+  Collector c;
+  feed(c, gga("120000.000", "0", "00"), 1000);
+  for (uint32_t now = 2000; now <= 6000; now += 1000)
+    feed(c, gga("120000.000", "0", "00"), now);
+  feed(c, gga("120001.000"), 7000);
+  TEST_ASSERT_TRUE(sample(c, 7000).sourceAgeMs >= 5000);
+  TEST_ASSERT_TRUE(c.recovering());
+  feed(c, gga("120002.000"), 8000);
+  TEST_ASSERT_TRUE(sample(c, 8000).sourceAgeMs >= 5000);
+  feed(c, gga("120003.000"), 9000);
+  TEST_ASSERT_TRUE(sample(c, 9000).sourceAgeMs < 200);
+  TEST_ASSERT_EQUAL_UINT32(1, c.stats().timeResyncs);
+  TEST_ASSERT_FALSE(c.recovering());
+  feed(c, gga("120004.000"), 10000);
+  TEST_ASSERT_TRUE(sample(c, 10000).fix);
+  TEST_ASSERT_TRUE(sample(c, 10000).sourceAgeMs < 200);
+}
+
+void test_backward_clock_recovery_quarantines_candidates_and_drops_old_pair() {
+  Collector c;
+  feed(c, rmc("130000.000"), 1000);
+  feed(c, gga("130000.000"), 1100);
+  feed(c, gga("120001.000"), 7000);
+  feed(c, gga("120002.000"), 8000);
+  TEST_ASSERT_EQUAL_UINT32(46800000, sample(c, 8000).epochMsOfDay);
+  feed(c, gga("120003.000"), 9000);
+  const auto s = sample(c, 9000);
+  TEST_ASSERT_EQUAL_UINT32(43203000, s.epochMsOfDay);
+  TEST_ASSERT_TRUE(s.fix && s.haveGga);
+  TEST_ASSERT_FALSE(s.haveRmc || s.velocityValid);
+  TEST_ASSERT_EQUAL_UINT32(1000, c.stats().lastEpochIntervalMs);
+  TEST_ASSERT_EQUAL_UINT32(1, c.stats().timeResyncs);
+}
+
+void test_recovery_rejects_burst_duplicate_and_invalid_fixes() {
+  Collector c;
+  feed(c, gga(), 1000);
+  feed(c, gga("120001.000"), 7000);
+  feed(c, gga("120002.000"), 7000);
+  feed(c, gga("120003.000"), 7000);
+  TEST_ASSERT_EQUAL_UINT32(0, c.stats().timeResyncs);
+  for (uint32_t now = 8000; now <= 11000; now += 1000)
+    feed(c, gga("120003.000"), now);
+  TEST_ASSERT_EQUAL_UINT32(0, c.stats().timeResyncs);
+  feed(c, gga("120004.000"), 12000);
+  feed(c, gga("120005.000", "0"), 13000);
+  TEST_ASSERT_FALSE(c.recovering());
+  feed(c, gga("120006.000"), 14000);
+  feed(c, gga("120007.000"), 15000);
+  TEST_ASSERT_EQUAL_UINT32(0, c.stats().timeResyncs);
+  feed(c, gga("120008.000"), 16000);
+  TEST_ASSERT_EQUAL_UINT32(1, c.stats().timeResyncs);
+}
+
+void test_uart_gap_and_invalid_counterpart_restart_recovery() {
+  Collector c;
+  feed(c, gga(), 1000);
+  feed(c, gga("120001.000"), 7000);
+  feed(c, gga("120002.000"), 8000);
+  c.invalidate(8100);
+  feed(c, gga("120003.000"), 9000);
+  feed(c, rmc("120003.000", "V"), 9100);
+  feed(c, gga("120004.000"), 10000);
+  feed(c, gga("120005.000"), 11000);
+  TEST_ASSERT_EQUAL_UINT32(0, c.stats().timeResyncs);
+  feed(c, gga("120006.000"), 12000);
+  TEST_ASSERT_EQUAL_UINT32(1, c.stats().timeResyncs);
+}
+
+void test_recovery_spans_midnight_and_local_clock_wrap() {
+  Collector c;
+  const uint32_t start = UINT32_MAX - 7500;
+  feed(c, gga("235957.000"), start);
+  feed(c, gga("235958.000"), start + 6000);
+  feed(c, gga("235959.000"), start + 7000);
+  feed(c, gga("000000.000"), start + 8000);
+  TEST_ASSERT_EQUAL_UINT32(1, c.stats().timeResyncs);
+  TEST_ASSERT_TRUE(sample(c, start + 8000).sourceAgeMs < 200);
+}
+
+void test_stream_diagnostics_separate_bytes_sentences_and_progress() {
+  Collector c;
+  TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, c.byteAgeMs(100));
+  feed(c, gga(), 1000);
+  feed(c, gga(), 2000);
+  TEST_ASSERT_EQUAL_UINT32(1000, c.advanceAgeMs(2000));
+  TEST_ASSERT_EQUAL_UINT32(0, c.sentenceAgeMs(2000));
+  feed(c, gga(""), 3000);
+  TEST_ASSERT_EQUAL_UINT32(1, c.stats().missingTime);
+  TEST_ASSERT_EQUAL_UINT32(0, c.sentenceAgeMs(3000));
+  c.feed('x', 3100);
+  TEST_ASSERT_EQUAL_UINT32(0, c.byteAgeMs(3100));
+  TEST_ASSERT_EQUAL_UINT32(100, c.sentenceAgeMs(3100));
+  TEST_ASSERT_EQUAL_UINT32(2100, c.advanceAgeMs(3100));
+}
+
+
+void test_recovery_requires_full_span_and_checksum_continuity() {
+  Collector c;
+  feed(c, gga(), 1000);
+  feed(c, gga("120001.000"), 7000);
+  feed(c, gga("120001.500"), 7500);
+  feed(c, gga("120002.000"), 8000);
+  TEST_ASSERT_EQUAL_UINT32(0, c.stats().timeResyncs); // Three samples, only one second.
+  auto bad = sentence(gga("120002.000")); bad[bad.size() - 4] = '?';
+  for (char ch : bad) c.feed(ch, 8050);
+  TEST_ASSERT_FALSE(c.recovering());
+  feed(c, gga("120002.500"), 8500);
+  feed(c, gga("120003.000"), 9000);
+  feed(c, gga("120003.500"), 9500);
+  feed(c, gga("120004.000"), 10000);
+  TEST_ASSERT_EQUAL_UINT32(0, c.stats().timeResyncs);
+  feed(c, gga("120004.500"), 10500);
+  TEST_ASSERT_EQUAL_UINT32(1, c.stats().timeResyncs);
+  TEST_ASSERT_TRUE(sample(c, 10500).sourceAgeMs < 200);
+}
+
+void test_slow_sentence_cannot_confirm_a_new_time_baseline() {
+  Collector c;
+  feed(c, gga(), 1000);
+  feed(c, gga("120001.000"), 7000);
+  feed(c, gga("120002.000"), 8000);
+  const auto wire = sentence(gga("120003.000"));
+  uint32_t now = 8700;
+  for (char ch : wire) { c.feed(ch, now); now += 5; }
+  TEST_ASSERT_EQUAL_UINT32(0, c.stats().timeResyncs);
+  TEST_ASSERT_FALSE(c.recovering());
+  TEST_ASSERT_TRUE(sample(c, now).sourceAgeMs >= 5000);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_matching_epoch_joins_rmc_and_gga_in_both_orders);
   RUN_TEST(test_rmc_only_and_gga_only_do_not_invent_missing_fields);
   RUN_TEST(test_epoch_mismatch_never_reuses_old_velocity_or_quality);
-  RUN_TEST(test_rmc_gga_gap_keeps_aged_coherent_quality_and_invalidity_wins);
+  RUN_TEST(test_rmc_gga_gap_exposes_latest_without_old_quality_and_invalidity_wins);
   RUN_TEST(test_repeated_epoch_does_not_refresh_age);
   RUN_TEST(test_source_age_includes_serialization_but_not_uncertainty);
   RUN_TEST(test_utc_anchor_keeps_late_delivery_old);
@@ -283,9 +416,17 @@ int main(int, char **) {
   RUN_TEST(test_missing_quality_does_not_reuse_previous_epoch_quality);
   RUN_TEST(test_checksum_overflow_and_junk_do_not_create_snapshot);
   RUN_TEST(test_invalidate_discards_partial_and_prevents_duplicate_resurrection);
-  RUN_TEST(test_backwards_utc_requires_explicit_reset);
+  RUN_TEST(test_single_backwards_epoch_is_rejected_until_explicit_reset);
   RUN_TEST(test_midnight_and_local_millis_wrap);
   RUN_TEST(test_gp_talker_and_coordinate_time_range_validation);
   RUN_TEST(test_other_nmea_types_are_not_reported_as_decode_errors);
+  RUN_TEST(test_stalled_clock_recovers_only_after_three_paced_fixes);
+  RUN_TEST(test_backward_clock_recovery_quarantines_candidates_and_drops_old_pair);
+  RUN_TEST(test_recovery_rejects_burst_duplicate_and_invalid_fixes);
+  RUN_TEST(test_uart_gap_and_invalid_counterpart_restart_recovery);
+  RUN_TEST(test_recovery_spans_midnight_and_local_clock_wrap);
+  RUN_TEST(test_stream_diagnostics_separate_bytes_sentences_and_progress);
+  RUN_TEST(test_recovery_requires_full_span_and_checksum_continuity);
+  RUN_TEST(test_slow_sentence_cannot_confirm_a_new_time_baseline);
   return UNITY_END();
 }

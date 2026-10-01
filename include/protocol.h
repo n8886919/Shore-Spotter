@@ -1,5 +1,5 @@
 #pragma once
-// Shared LoRa v4 wire contract. Logical structs are NOT the wire format.
+// Shared LoRa v5 wire contract. Logical structs are NOT the wire format.
 // Only the explicit little-endian codecs below define transmitted bytes.
 // Arduino-free; see docs/interface.md and native packet tests.
 #include <math.h>
@@ -7,19 +7,20 @@
 #include <stdint.h>
 
 constexpr uint8_t PROTO_MAGIC = 0x53;
-constexpr uint8_t PROTO_VERSION = 4;
+constexpr uint8_t PROTO_VERSION = 5;
 constexpr uint16_t ID_BROADCAST = 0xFFFF;
-// Legacy client-binding reservation only, never sent as a Server ID.
-constexpr uint16_t SERVER_ID = 0x0010;
+// Legacy client-binding reservation only, never sent as a Station ID.
+constexpr uint16_t STATION_ID = 0x0010;
 enum MsgType : uint8_t {
-  MSG_DATA = 1, MSG_ACK = 2, MSG_TELEMETRY = 4, MSG_DIAGNOSTIC = 5
+  MSG_DATA = 1, /* 2: removed ACK, 3: reserved */ MSG_TELEMETRY = 4, MSG_DIAGNOSTIC = 5,
+  MSG_GNSS_DIAGNOSTIC = 6
 };
 constexpr size_t PACKET_HEADER_LEN = 6;
-constexpr size_t DATA_PACKET_LEN = 17;
+constexpr size_t DATA_PACKET_LEN = 18;
 constexpr size_t TELEMETRY_PACKET_LEN = 11;
-constexpr size_t ACK_PACKET_LEN = 11;
 constexpr size_t DIAGNOSTIC_PACKET_LEN = 17;
-constexpr size_t MAX_PACKET_LEN = DATA_PACKET_LEN;
+constexpr size_t GNSS_DIAGNOSTIC_PACKET_LEN = 36;
+constexpr size_t MAX_PACKET_LEN = GNSS_DIAGNOSTIC_PACKET_LEN;
 
 struct PacketHeader {
   uint16_t clientId;
@@ -27,26 +28,20 @@ struct PacketHeader {
   uint8_t msgType;
 };
 struct PositionPayload {
-  int32_t latE6;  // absolute coordinates; wire carries signed24 fixed offsets
-  int32_t lonE6;
+  int32_t latE7;  // absolute degrees * 1e7; full signed32 little-endian
+  int32_t lonE7;
   uint8_t speedDmS;  // 0.1 m/s, 0..254; 255 unknown/out of range
   uint16_t courseDeg10;  // 0..3599; 4095 unknown
   uint8_t satelliteClass;  // 0 unknown, 1 <=5, 2 6..7, 3 >=8
   bool fix;
   bool velocityValid;
   uint8_t hdop10;  // HDOP * 10, rounded UP; 255 unknown
-  uint8_t age10ms;  // source age rounded UP to 10 ms; 255 unusable
 };
 struct TelemetryPayload {
   uint16_t batteryMv;  // 0 unknown
   int8_t tempC;  // INT8_MIN unknown
   uint8_t humidityPct;  // 0..100; 255 unknown
   uint8_t satellites;  // exact diagnostic count; 255 unknown
-};
-struct AckPayload {
-  uint16_t ackSeq;
-  int16_t rssiDbm10;
-  int8_t snrQuarterDb;  // SX126x native 0.25 dB units, -32..31.75 dB
 };
 // Separate low-rate diagnostics; no raw NMEA and no extra DATA bytes.
 struct DiagnosticPayload {
@@ -56,25 +51,21 @@ struct DiagnosticPayload {
   uint16_t txErrors;
   uint16_t skippedSlots;
   // bits 0..5: haveEpoch, fix, velocityValid, haveGga, haveRmc,
-  // ageUncertaintySet. Bits 6..7 are reserved and must be zero.
+  // ageUncertaintySet; bit6 rateMeasured, bit7 observed2Hz (requires bit6).
   uint8_t status;
 };
 
 namespace protocol {
 using Header = PacketHeader;
-constexpr int32_t kLatitudeOriginE6 = 24000000;
-constexpr int32_t kLongitudeOriginE6 = 121000000;
-constexpr int32_t kSigned24Min = -8388608;
-constexpr int32_t kSigned24Max = 8388607;
 constexpr uint8_t kUnknown = 255;
 constexpr uint16_t kUnknownCourse = 4095;
 inline bool validClientId(uint16_t id) { return id != 0 && id != ID_BROADCAST; }
 inline size_t packetLength(uint8_t type) {
   switch (type) {
     case MSG_DATA: return DATA_PACKET_LEN;
-    case MSG_ACK: return ACK_PACKET_LEN;
     case MSG_TELEMETRY: return TELEMETRY_PACKET_LEN;
     case MSG_DIAGNOSTIC: return DIAGNOSTIC_PACKET_LEN;
+    case MSG_GNSS_DIAGNOSTIC: return GNSS_DIAGNOSTIC_PACKET_LEN;
     default: return 0;
   }
 }
@@ -108,16 +99,9 @@ inline uint8_t quantizeHdop(double hdop) {
   const double roundedUp = ceil(hdop * 10.0);
   return roundedUp <= 254.0 ? static_cast<uint8_t>(roundedUp) : kUnknown;
 }
-inline uint8_t quantizeAge(uint32_t ageMs) {
-  if (ageMs > 2540) return kUnknown;
-  return static_cast<uint8_t>((ageMs + 9) / 10);
-}
-inline bool signed24Fits(int64_t value) {
-  return value >= kSigned24Min && value <= kSigned24Max;
-}
-inline bool coordinatesFit(int32_t latE6, int32_t lonE6) {
-  return signed24Fits(static_cast<int64_t>(latE6) - kLatitudeOriginE6) &&
-         signed24Fits(static_cast<int64_t>(lonE6) - kLongitudeOriginE6);
+inline bool coordinatesFit(int32_t latE7, int32_t lonE7) {
+  return latE7 >= -900000000 && latE7 <= 900000000 &&
+         lonE7 >= -1800000000 && lonE7 <= 1800000000;
 }
 inline void putU16(uint8_t *out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value);
@@ -127,22 +111,20 @@ inline uint16_t getU16(const uint8_t *in) {
   return static_cast<uint16_t>(in[0]) |
          static_cast<uint16_t>(static_cast<uint16_t>(in[1]) << 8);
 }
-inline void putI24(uint8_t *out, int32_t value) {
+inline void putI32(uint8_t *out, int32_t value) {
   const uint32_t bits = static_cast<uint32_t>(value);
-  out[0] = static_cast<uint8_t>(bits);
-  out[1] = static_cast<uint8_t>(bits >> 8);
-  out[2] = static_cast<uint8_t>(bits >> 16);
+  for (unsigned i = 0; i < 4; ++i) out[i] = static_cast<uint8_t>(bits >> (8 * i));
 }
-inline int32_t getI24(const uint8_t *in) {
-  const uint32_t bits = static_cast<uint32_t>(in[0]) |
-      (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16);
-  return bits & 0x800000U ? static_cast<int32_t>(bits) - 0x1000000
+inline int32_t getI32(const uint8_t *in) {
+  const uint32_t bits = uint32_t(in[0]) | (uint32_t(in[1]) << 8) |
+      (uint32_t(in[2]) << 16) | (uint32_t(in[3]) << 24);
+  return bits & 0x80000000U ? static_cast<int32_t>(int64_t(bits) - 0x100000000LL)
                           : static_cast<int32_t>(bits);
 }
 inline bool validPosition(const PositionPayload &p) {
   if (p.satelliteClass > 3 ||
       (p.courseDeg10 > 3599 && p.courseDeg10 != kUnknownCourse)) return false;
-  if (p.fix && (p.age10ms == kUnknown || !coordinatesFit(p.latE6, p.lonE6)))
+  if (!coordinatesFit(p.latE7, p.lonE7) && p.fix)
     return false;
   // Bad vectors can retain usable positions, but contradictory flags reject.
   if (p.velocityValid && (!p.fix || p.speedDmS == kUnknown || p.speedDmS < 3 ||
@@ -173,31 +155,28 @@ inline size_t encodeData(uint8_t *buf, size_t capacity, const Header &h,
                          const PositionPayload &p) {
   if (!canEncode(buf, capacity, h, MSG_DATA) || !validPosition(p)) return 0;
   encodeHeader(buf, h);
-  // Invalid/out-of-range coordinates may report fix=false, never wrap into
-  // a plausible target. Zero offsets with fix=false have no position meaning.
-  const bool inRange = coordinatesFit(p.latE6, p.lonE6);
-  putI24(buf + 6, inRange ? p.latE6 - kLatitudeOriginE6 : 0);
-  putI24(buf + 9, inRange ? p.lonE6 - kLongitudeOriginE6 : 0);
-  buf[12] = p.speedDmS;
+  // No-fix packets carry canonical zero coordinates; they never move a target.
+  putI32(buf + 6, p.fix ? p.latE7 : 0);
+  putI32(buf + 10, p.fix ? p.lonE7 : 0);
+  buf[14] = p.speedDmS;
   const uint16_t courseFlags = p.courseDeg10 |
       (static_cast<uint16_t>(p.satelliteClass) << 12) |
       (static_cast<uint16_t>(p.fix) << 14) |
       (static_cast<uint16_t>(p.velocityValid) << 15);
-  putU16(buf + 13, courseFlags);
-  buf[15] = p.hdop10;
-  buf[16] = p.age10ms;
+  putU16(buf + 15, courseFlags);
+  buf[17] = p.hdop10;
   return DATA_PACKET_LEN;
 }
 inline bool decodeData(const uint8_t *buf, size_t n, Header &header,
                         PositionPayload &out) {
   Header h{};
   if (!decodeHeader(buf, n, h) || h.msgType != MSG_DATA) return false;
-  const uint16_t flags = getU16(buf + 13);
+  const uint16_t flags = getU16(buf + 15);
   PositionPayload p{
-      getI24(buf + 6) + kLatitudeOriginE6, getI24(buf + 9) + kLongitudeOriginE6,
-      buf[12], static_cast<uint16_t>(flags & 0x0FFF),
+      getI32(buf + 6), getI32(buf + 10),
+      buf[14], static_cast<uint16_t>(flags & 0x0FFF),
       static_cast<uint8_t>((flags >> 12) & 3),
-      (flags & 0x4000) != 0, (flags & 0x8000) != 0, buf[15], buf[16]};
+      (flags & 0x4000) != 0, (flags & 0x8000) != 0, buf[17]};
   if (!validPosition(p)) return false;
   header = h;
   out = p;
@@ -227,29 +206,10 @@ inline bool decodeTelemetry(const uint8_t *buf, size_t n, Header &header,
   out = p;
   return true;
 }
-inline size_t encodeAck(uint8_t *buf, size_t capacity, const Header &h,
-                        const AckPayload &p) {
-  if (!canEncode(buf, capacity, h, MSG_ACK)) return 0;
-  encodeHeader(buf, h);
-  putU16(buf + 6, p.ackSeq);
-  putU16(buf + 8, static_cast<uint16_t>(p.rssiDbm10));
-  buf[10] = static_cast<uint8_t>(p.snrQuarterDb);
-  return ACK_PACKET_LEN;
-}
-inline bool decodeAck(const uint8_t *buf, size_t n, Header &header, AckPayload &out) {
-  Header h{};
-  if (!decodeHeader(buf, n, h) || h.msgType != MSG_ACK) return false;
-  const uint16_t rawRssi = getU16(buf + 8);
-  const int32_t rssi = rawRssi < 32768 ? rawRssi : static_cast<int32_t>(rawRssi) - 65536;
-  const int snr = buf[10] < 128 ? buf[10] : static_cast<int>(buf[10]) - 256;
-  AckPayload p{getU16(buf + 6), static_cast<int16_t>(rssi), static_cast<int8_t>(snr)};
-  header = h;
-  out = p;
-  return true;
-}
 inline size_t encodeDiagnostic(uint8_t *buf, size_t capacity, const Header &h,
                               const DiagnosticPayload &p) {
-  if (!canEncode(buf, capacity, h, MSG_DIAGNOSTIC) || (p.status & 0xC0)) return 0;
+  if (!canEncode(buf, capacity, h, MSG_DIAGNOSTIC) ||
+      ((p.status & 0x80) && !(p.status & 0x40))) return 0;
   encodeHeader(buf, h);
   putU16(buf + 6, p.epochIntervalMs);
   putU16(buf + 8, p.backlogDrops);
@@ -262,7 +222,8 @@ inline size_t encodeDiagnostic(uint8_t *buf, size_t capacity, const Header &h,
 inline bool decodeDiagnostic(const uint8_t *buf, size_t n, Header &header,
                              DiagnosticPayload &out) {
   Header h{};
-  if (!decodeHeader(buf, n, h) || h.msgType != MSG_DIAGNOSTIC || (buf[16] & 0xC0))
+  if (!decodeHeader(buf, n, h) || h.msgType != MSG_DIAGNOSTIC ||
+      ((buf[16] & 0x80) && !(buf[16] & 0x40)))
     return false;
   const DiagnosticPayload p{getU16(buf + 6), getU16(buf + 8), getU16(buf + 10),
                             getU16(buf + 12), getU16(buf + 14), buf[16]};
