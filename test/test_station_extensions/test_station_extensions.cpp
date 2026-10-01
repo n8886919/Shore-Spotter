@@ -75,6 +75,20 @@ void test_probe_rejects_duplicates_and_accepts_counter_wrap() {
   TEST_ASSERT_EQUAL_UINT32(3, link.probes);
 }
 
+void test_new_boot_clears_old_probe_results_and_command_sequence() {
+  station_client_link::Link link;
+  link.observe(5,state(7,client_control::State::Test,42,40000),1,42);
+  link.probe({7,50,2},2,-70,5);
+  link.probe({7,53,3},3,-70,5);
+  TEST_ASSERT_EQUAL_UINT32(2,link.missing);
+  link.observe(5,state(8,client_control::State::Ready,0,0),4,42);
+  TEST_ASSERT_EQUAL_UINT32(0,link.probes);
+  TEST_ASSERT_EQUAL_UINT32(0,link.missing);
+  TEST_ASSERT_EQUAL_STRING("idle",link.command);
+  TEST_ASSERT_TRUE(link.request(client_control::Action::Start,5,42));
+  TEST_ASSERT_EQUAL_UINT16(1,link.commandId);
+}
+
 void setUp() {}
 void tearDown() {}
 int main(int, char **) {
@@ -83,5 +97,6 @@ int main(int, char **) {
   RUN_TEST(test_client_control_codecs_require_exact_lengths_and_reserved_values);
   RUN_TEST(test_link_confirms_only_matching_boot_station_and_command);
   RUN_TEST(test_probe_rejects_duplicates_and_accepts_counter_wrap);
+  RUN_TEST(test_new_boot_clears_old_probe_results_and_command_sequence);
   return UNITY_END();
 }

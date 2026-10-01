@@ -37,3 +37,10 @@ SD 與 Axiom 是獨立消費者。已保存的 NVS Axiom 設定不因移除網�
 - fsync 及尾端讀回不是斷電／全卡耐受證明；USB CRC 只驗證匯出傳輸一致。
 
 入口盤點見 [功能入口](function-entrypoints.md)。
+
+
+## Heltec V4 無SD
+
+V4自動使用內建Flash保存逐包RF與Station/phone狀態，狀態入口為`GET /api/flash`。
+使用`tools/read_diagnostic_log.py`透過USB匯出，滿即停、不自動覆蓋。容量／操作／實測限制見
+[Heltec外測準備](heltec-field-ready.md)。此紀錄與瀏覽器歷史軌跡、Axiom上傳各自獨立。

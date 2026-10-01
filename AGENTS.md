@@ -64,7 +64,11 @@
 
 ## 外測診斷
 - `docs/field-diagnostic.md` — 無筆電外測流程、內建 Flash 邊界、UTC／原始資料與 USB 匯出。
-- `include/field_diagnostic.h` / `include/diagnostic_store_codec.h` / `src/diagnostic_store.cpp` — 診斷版專用，不改正常版 2 Hz。
+- `include/field_diagnostic.h` — LilyGO 診斷版流程，不改正常版 2 Hz。
+- `include/diagnostic_store_codec.h` / `src/diagnostic_store.cpp` — LilyGO 診斷版與 V4 Station 共用的 bounded Flash worker／CRC 匯出。
+- `include/station_flash.h` / `src/station_flash.cpp` / `docs/heltec-field-ready.md` — V4 無 SD 的 RF／位置脈絡記錄與外測準備。
+- `include/t096_gnss_config.h` — UC6580 暫存設定／回讀；真實輸出率與有效 fix 分開驗證。
+- `include/station_http.h` — Station 空 TCP 連線250 ms期限；其他連線排隊時100 ms寬限後讓位。
 - `include/trip_log.h` / `tools/test_trip_logging.py` — Client trip 1 Hz 長時間記錄；SD 全程 raw UART、Flash 稀疏電源／狀態，正常版 GPS gate 不變。
 - `include/power_irq.h` / `tools/test_power_irq_backend.py` — signed PMU IRQ／VBUS、clear failure 去重與動作前關機證據。
 - `tools/test_pmu_battery_diagnostic.py` — Client 診斷版唯讀 PMU 原始取樣、短讀／鎖忙／初始化回傳值與資料完整性。

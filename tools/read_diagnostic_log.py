@@ -41,6 +41,17 @@ def _finite(value):
 
 
 def decode_payload(kind, payload):
+    if kind == 9:
+        if len(payload) < 15:
+            raise ProtocolError('Truncated station RF event')
+        version, event, length, rssi, snr, error, event_id, raw_length = struct.unpack_from('<BBHhhhIB', payload)
+        if version != 1 or raw_length > 36 or len(payload) != 15 + raw_length:
+            raise ProtocolError('Invalid station RF event layout')
+        names = ('data', 'telemetry', 'diagnostic', 'length', 'format', 'binding', 'sequence',
+                 'radio_error', 'ack_error', 'ack_skipped', 'gnss_diagnostic', 'client_state', 'link_test')
+        return {'kind': 'station_packet', 'event': names[event] if event < len(names) else 'unknown',
+                'event_id': event_id, 'rx_length': length, 'rssi_dbm': rssi / 10,
+                'snr_db': snr / 4, 'error': error, 'wire_hex': payload[15:].hex()}
     if kind in (1, 6):
         return {'kind': 'raw_uart' if kind == 1 else 'discarded_backlog',
                 'raw_hex': payload.hex(),
@@ -60,11 +71,11 @@ def decode_payload(kind, payload):
                 'text': payload.decode('utf-8', errors='replace'),
                 'utf8_valid': _is_utf8(payload),
                 'note': 'Ordered JSON stream chunk; concatenate through newline within this boot/ms'}
-    if kind in (2, 4, 5):
+    if kind in (2, 4, 5, 10):
         value = json.loads(payload.decode('utf-8'))
         if not isinstance(value, dict):
             raise ProtocolError('Diagnostic JSON payload is not an object')
-        return {'kind': {2: 'boot', 4: 'phase', 5: 'gap_status'}[kind], 'data': value}
+        return {'kind': {2: 'boot', 4: 'phase', 5: 'gap_status', 10: 'station_health'}[kind], 'data': value}
     if kind != 3:
         return {'kind': 'unknown', 'raw_hex': payload.hex()}
     if len(payload) != SNAPSHOT.size:
@@ -117,7 +128,8 @@ def decode_frame(raw, index):
         raise ProtocolError(f'Frame {index}: invalid on-flash CRC/length')
     if index == 0:
         address, size, frame_bytes, version, reserved = struct.unpack_from('<IIIII', raw, 8)
-        if raw[:8] != b'SSDHDR01' or (address, size, frame_bytes, version, reserved) != (0x670000, 0x180000, 512, 1, 0):
+        if (raw[:8] != b'SSDHDR01' or (frame_bytes, version, reserved) != (512, 1, 0)
+                or (address, size) not in ((0x670000, 0x180000), (0xc90000, 0x360000))):
             raise ProtocolError('Unsupported diagnostic flash ownership header')
         return [{'kind': 'store_header', 'frame_index': 0, 'schema_version': version,
                  'partition_address': address, 'partition_bytes': size, 'frame_bytes': frame_bytes}]

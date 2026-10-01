@@ -11,7 +11,11 @@ namespace codec {
 constexpr size_t kFrameBytes = 512, kHeaderBytes = 28, kCrcOffset = 508;
 constexpr size_t kPayloadBytes = kCrcOffset - kHeaderBytes;
 constexpr size_t kEnvelopeBytes = 8, kMaxRecordBytes = kPayloadBytes - kEnvelopeBytes;
+#if defined(BOARD_HELTEC_V4)
+constexpr uint32_t kPartitionAddress = 0xc90000, kPartitionBytes = 0x360000;
+#else
 constexpr uint32_t kPartitionAddress = 0x670000, kPartitionBytes = 0x180000;
+#endif
 constexpr char kHeaderMagic[9] = "SSDHDR01", kFrameMagic[9] = "SSDFRM01";
 inline uint16_t get16(const uint8_t *p) { return uint16_t(p[0]) | uint16_t(p[1]) << 8; }
 inline uint32_t get32(const uint8_t *p) {

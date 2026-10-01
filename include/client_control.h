@@ -9,6 +9,10 @@ enum class Action : uint8_t { Start = 1, Stop = 2, Test = 3, Store = 4 };
 enum class State : uint8_t { Ready = 1, Tracking = 2, Test = 3, Storage = 4 };
 constexpr uint32_t kReadyPollMs = 30000, kActivePollMs = 5000;
 constexpr uint32_t kReceiveWindowMs = 800;
+// At SF10/BW125 a 13-byte command takes 289 ms. Listen briefly for its
+// preamble; extend only when one is present, rather than idle for 800 ms.
+constexpr uint32_t kReceiveListenMs = 85;
+constexpr uint32_t kCommandStartLatestMs = 40;
 constexpr uint32_t kStorageAfterMs = 12UL * 60 * 60 * 1000;
 constexpr uint32_t kCommandTimeoutMs = 65000;
 inline bool valid(Action a) { return uint8_t(a) >= 1 && uint8_t(a) <= 4; }

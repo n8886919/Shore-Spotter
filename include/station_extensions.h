@@ -30,8 +30,8 @@ static bool accept(const uint8_t *b,size_t n,uint32_t now) {
     if(!client_control::decodeStatus(b,n,h,s))return false;
     link.observe(h.clientId,s,now,nodeId);
     haveRf=true;lastRfMs=now;
-    // A state packet opens one 800 ms RX window on this client. Never transmit
-    // arbitrary repeated wake packets while the client is asleep.
+    // STATE opens a short preamble listen, extended for an actual command.
+    // Never transmit arbitrary repeated wake packets while the client is asleep.
     rendezvous=link.pending() && s.boot==link.requestedBoot;
     rendezvousMs=now;nextSendMs=now+20;
     return true;
@@ -63,7 +63,7 @@ static void serviceRadio() {
   if(!rendezvous || !link.pending() || !loop_metrics::due(now,nextSendMs))return;
   rendezvous=false;
   // Do not start after a stalled HTTP request has consumed the receive window.
-  if(uint32_t(now-rendezvousMs)>120)return;
+  if(uint32_t(now-rendezvousMs)>client_control::kCommandStartLatestMs)return;
   const PacketHeader h{link.client,link.commandId,MSG_CLIENT_CONTROL};
   const client_control::Command c{link.requestedBoot,link.action,nodeId};
   const size_t n=client_control::encodeCommand(txBuffer,sizeof(txBuffer),h,c);

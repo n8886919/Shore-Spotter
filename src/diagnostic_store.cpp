@@ -1,6 +1,6 @@
 #if defined(ARDUINO)
 #include "diagnostic_store.h"
-#if defined(FIELD_DIAGNOSTIC)
+#if defined(FIELD_DIAGNOSTIC) || defined(BOARD_HELTEC_V4)
 #include <atomic>
 #include <stdio.h>
 #include <stdlib.h>

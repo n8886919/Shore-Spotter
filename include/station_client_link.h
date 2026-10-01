@@ -19,7 +19,8 @@ class Link {
   }
   void observe(uint16_t id,const client_control::Status &s,uint32_t now,uint16_t station) {
     if(have && (client!=id || status.boot!=s.boot)) {
-      if(pending())command="error";
+      command=pending()?"error":"idle";
+      commandId=0;resetProbes();
     }
     status=s;client=id;receivedMs=now;have=true;
     if(s.station==station && !pending())commandId=s.command;

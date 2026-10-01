@@ -30,8 +30,9 @@
 #include "sd_log.h"
 #include "station_board.h"
 #include "radio_profile.h"
-#if defined(FIELD_DIAGNOSTIC)
 #include "diagnostic_store.h"
+#include "station_flash.h"
+#if defined(FIELD_DIAGNOSTIC)
 #include "field_diagnostic.h"
 #endif
 #if defined(CLIENT_TRIP_LOG)
@@ -48,6 +49,7 @@
 #if defined(ROLE_STATION)
 #include <WiFi.h>
 #include <WebServer.h>
+#include "station_http.h"
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <cJSON.h>
@@ -508,6 +510,7 @@ static uart_servo_mode::Endpoint uartServoMode;
 struct MetricsClock {
   static uint32_t micros() { return ::micros(); }
   static uint32_t nowUs() { return ::micros(); }
+  static uint32_t nowMs() { return ::millis(); }
 };
 using MeasureDuration = loop_metrics::Measure<MetricsClock>;
 static loop_metrics::Gap controlGap;
@@ -541,7 +544,7 @@ static bool     rxWinHaveSeq = false;
 static float    rxWinRssiMin = 0, rxWinRssiMax = 0, rxWinSnrMin = 0, rxWinSnrMax = 0;
 static double   rxWinRssiSum = 0, rxWinSnrSum = 0;
 
-http_timing::Server<WebServer, MetricsClock> httpServer(80);
+station_http::Server<MetricsClock> httpServer(80);
 
 // Station stays in RX; DIO1 reports packet completion.
 volatile bool stationRadioIrq = false;
@@ -1500,6 +1503,9 @@ static void recordPacketEvent(packet_diagnostics::Kind kind, uint32_t ms,
   }
   packetEvents.push(event);
   event.id = packetEvents.total();
+#if defined(BOARD_HELTEC_V4)
+  station_flash::packet(event);
+#endif
   sd_log::packet(event, raw, length);
 }
 
@@ -1979,7 +1985,7 @@ static void renderStationDisplay() {
   // --- LoRa link state (right side, below the label column) ---
   snprintf(buf, sizeof(buf), "LoRa:%s", !selectedOnline && boundRfAgeMs() < 90000 ? "TEL" : sig4Text(loraState));
   drawAt(96, 52, buf);
-#if defined(FIELD_DIAGNOSTIC)
+#if defined(FIELD_DIAGNOSTIC) || defined(BOARD_HELTEC_V4)
   snprintf(buf, sizeof(buf), "F:%s", diagnostic_store::stateName());
   drawAt(30, 52, buf);
 #endif
@@ -2474,6 +2480,7 @@ static void appendTimingJson(String &js) {
   js += String(controlGap.maxMs);
   js += F(",\"control_gap_over_250ms\":");
   js += String(controlGap.over250ms);
+  js += F(",\"http_idle_closed\":"); js += String(httpServer.idleConnectionsClosed());
   auto duration = [&](const char *name, const loop_metrics::Duration &value) {
     js += F(",\""); js += name; js += F("\":{\"last_ms\":");
     js += String(value.lastUs / 1000.0f, 2);
@@ -2769,6 +2776,31 @@ static bool acceptMotionRequest() {
   return true;
 }
 
+static void serviceStationFlash() {
+#if defined(BOARD_HELTEC_V4)
+  static uint32_t next=0;
+  const uint32_t now=millis();
+  if(!loop_metrics::due(now,next) || stationRadioIrq)return;
+  next=now+30000;
+  // RF events are captured individually. This sparse context records the
+  // phone reference and control health without consuming one frame per loop.
+  const auto &phone=station_extensions::phone;
+  char line[472];
+  const int n=snprintf(line,sizeof(line),
+    "{\"heap\":%lu,\"loop_max_us\":%lu,\"rx_data\":%lu,\"rx_errors\":%lu,\"missing\":%lu,"
+    "\"flash_dropped\":%lu,\"mode\":\"%s\",\"angle\":%.1f,\"phone\":%s,\"position_valid\":%s,"
+    "\"lat\":%.7f,\"lon\":%.7f,\"accuracy_m\":%.1f,\"phone_utc_ms\":%.0f,\"phone_age_ms\":%lu}",
+    (unsigned long)ESP.getFreeHeap(),(unsigned long)loopDuration.maxUs,
+    (unsigned long)rxDataCount,(unsigned long)rxErrorCount,(unsigned long)sequenceMissing,
+    (unsigned long)diagnostic_store::dropped(),trackModeStr(trackMode),servoAngleDeg,
+    phone.enabled?"true":"false",gpsFixFresh()?"true":"false",
+    gpsFixFresh()?stationLatitude():0.0,gpsFixFresh()?stationLongitude():0.0,
+    phone.enabled?phone.accuracy:0.0,phone.enabled?phone.utcMs:0.0,
+    (unsigned long)(phone.enabled?phone.age(now):0));
+  if(n>0 && size_t(n)<sizeof(line))diagnostic_store::submit(10,line,n,now);
+#endif
+}
+
 static void serviceAxiomLog() {
   const uint32_t now = millis();
   const bool busy = stationRadioIrq || loopDuration.lastUs > 20000;
@@ -2885,6 +2917,10 @@ static void handleAxiomSettings() {
 
 static void initWebServer() {
   station_extensions::registerRoutes();
+  httpServer.on("/api/flash",HTTP_GET,[](){
+    httpServer.sendHeader("Cache-Control","no-store");
+    httpServer.send(200,"application/json",diagnostic_store::statusJson());
+  });
   const char *axiomHeaders[] = {"Content-Type", "Content-Length"};
   httpServer.collectHeaders(axiomHeaders, 2);
   httpServer.on("/api/axiom", HTTP_GET, []() {
@@ -3539,7 +3575,20 @@ static void serviceClientPowerKey() {
 #if defined(ROLE_STATION)
 // Parse uplink only; the main loop restarts RX after every frame.
 static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtMs) {
+  const uint32_t previousBoot=station_extensions::link.status.boot;
+  const bool hadClientState=station_extensions::link.have;
   if (station_extensions::accept(buf, n, receivedAtMs)) {
+    if(hadClientState && previousBoot!=station_extensions::link.status.boot) {
+      // A new T096 session cannot inherit the old session's fix or diagnostics.
+      // Keep cumulative receiver counters; only reset the live source baseline.
+      havePkt=haveTelemetry=haveClientDiagnostic=false;
+      gpsSequence=command_freshness::RadioSequence{};
+      clientGnssDiagnostic=gnss_diagnostics::Latest{};
+      loraDataRate=packet_rate::Window10s{};
+      lastDataIntervalMs=0;rxWinHaveSeq=false;
+      rssiRingIdx=rssiRingCount=0;cachedPktRate=0;
+      pktsThisWindow=0;pktWindowStartMs=receivedAtMs;
+    }
     recordPacketEvent((buf[1]&15)==MSG_LINK_TEST ? packet_diagnostics::Kind::LinkTest :
         packet_diagnostics::Kind::ClientState, receivedAtMs, buf, n);
     return;
@@ -3771,6 +3820,9 @@ void setup() {
   sampleEnvSensor();
   nextEnvMs = millis() + ENV_UPDATE_MS;
   initServo();                     // restore boot centre at 90 degrees
+#if defined(BOARD_HELTEC_V4)
+  station_flash::begin(controlBootId);
+#endif
   oledOnline = initStationDisplay();
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
@@ -3820,6 +3872,11 @@ void setup() {
   WiFi.setHostname(stationHostname);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+#if defined(BOARD_HELTEC_V4)
+  // This board is the interactive Station. Avoid modem-sleep/DTIM latency
+  // while its phone polls controls; the battery Client has no Wi-Fi.
+  if (!WiFi.setSleep(false)) Log.println(F("[WiFi] Could not disable modem sleep"));
+#endif
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Log.print(F("[WiFi] Connecting to configured hotspot "));
   uint32_t wifiStart = millis();
@@ -4087,6 +4144,7 @@ void loop() {
   serviceStationDisplay();
   serviceControl();
   serviceAxiomLog();
+  serviceStationFlash();
   static uint32_t nextSdStatusMs = 0;
   if (loop_metrics::due(millis(), nextSdStatusMs)) {
     nextSdStatusMs = millis() + 10000;

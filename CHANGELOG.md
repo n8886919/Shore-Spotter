@@ -9,6 +9,26 @@
 
 ## 未發行
 
+- **2026-10-02 Heltec 夜間修正／無 SD 記錄（桌上部署）**：修正 T096 Vext/GNSS 共用上游供電，
+  加入 UC6580 專用暫存設定及回讀；R6 Build3700 實測 RMC/GGA/epoch 2.00 Hz，室內無 fix。
+  STATE 接收窗改為 85 ms listen、有 preamble/header 才延長至最多800 ms；Station 20 ms 後下行，
+  超過40 ms略過。RF 每500 ms最早時槽，獨立DATA seq、正確同epoch配對／無效轉換與低頻wire-v5診斷，
+  USB connected但未讀取不再阻塞Client。新Client boot清除舊定位／診斷／RF測試統計與命令基準。
+  V4 使用既有3.375 MiB SPIFFS分區做有CRC、bounded queue的RF/phone/Station Flash記錄；10秒flush、
+  滿即停、未知內容保留、不自動erase，新增唯讀`/api/flash`與USB匯出解碼。Axiom入口保留，缺ingest token時維持disabled。
+  native139/139與33支Python/JS回歸通過；V4/T096已USB部署。第一次22-frame實機匯出CRC全數通過，
+  app更新重啟後原11,264 bytes逐byte保留。
+  實機重現空TCP preconnect占用單一HTTP入口數秒；未送任何bytes連線加250 ms期限，
+  若有其他連線排隊則100 ms寬限後讓位，保留請求內容／SSE流程。
+  `timing.http_idle_closed`呈現清理次數；同一空連線情境由6.9秒改善至0.183–0.217秒。
+  V4另關閉Wi-Fi modem sleep；20次Ping平均62.7→7.1 ms，後續相同RF負載驗證記在[Heltec外測準備](docs/heltec-field-ready.md)。
+  最終版本600.15秒收到1,089個probe、counter缺號0、Client無重啟、Flash dropped/errors為0；
+  並行壓測仍有2次4秒API timeout，端到端網頁延遲尚未完全排除，未宣稱水上鏈路或室外GPS已通過。
+  交付前648 frames完整匯出、CRC／decode／drop均0，桌上記錄備份後清除；重新開機驗證recording，
+  T096 Ready、B組923.8 MHz、手動90°及MAC固定網址可用。
+  校正深眠文件：nRF52840原生支援VBUS上升wake，實際無線接收器路徑／電流仍待接線量測；不再將未驗證說成晶片不支援。
+
+
 - **2026-10-02 Station MAC 固定網址（V4 USB 已部署）**：device config 的 `hostname: "auto"`
   選擇既有完整 Wi-Fi MAC 命名路徑；範例與本機 V4 改採 auto，保留自訂 hostname。
   多台 auto 不視為重名，只有實際自訂名需唯一；`plan` 不以 USB serial 冒充 Wi-Fi MAC。

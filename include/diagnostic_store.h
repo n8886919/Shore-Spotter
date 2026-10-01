@@ -5,8 +5,12 @@
 
 namespace diagnostic_store {
 constexpr size_t kQueueRecords = 32;
+#if defined(BOARD_HELTEC_V4)
+constexpr uint32_t kFlushMs = 10000;
+#else
 constexpr uint32_t kFlushMs = 1000;
-// Only FIELD_DIAGNOSTIC builds touch the existing unused SPIFFS partition.
+#endif
+// FIELD_DIAGNOSTIC and V4 station builds use the existing unused SPIFFS partition.
 // Producers copy into a zero-wait queue. SD, NVS, OTA and coredump are untouched.
 void begin(uint32_t bootId);
 bool submit(uint16_t kind, const void *payload, size_t length, uint32_t ms);

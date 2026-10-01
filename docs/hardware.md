@@ -295,4 +295,18 @@ SystemOFF 電流與喚醒尚未實測。USB VBUS 抑制 Ready 12 小時後的 Sy
 收納 UX 預定採「充電座喚醒 → Web 開始／停止 → 待命 12 小時自動收納」。
 避免充電短暫斷續造成反覆關機，不以拔離充電座作為睡眠開關。封殼前需確認接收板 5 V 路徑
 確實能觸發本板喚醒，以及接收板／充電器反向漏電；若無法喚醒，再考慮磁簧外部喚醒。
-本版深眠只啟用使用者按鍵 wake，未宣稱完成充電座喚醒。1000／2500 mAh 的月數須以整機休眠電流量測估算。
+本版配置使用者按鍵 GPIO wake；nRF52840 另有 VBUS 上升自動離開 SystemOFF 的硬體能力，
+不需要用 Web／LoRa 持續聽候。Nordic 規格的 RESETREAS.VBUS 可作喚醒原因證據。
+因此先驗證 5 V 接收器到 VBUS 的路徑，再決定是否需要額外磁簧；不能把未接線當作晶片不支援。
+參考：[Nordic POWER／USB supply／System OFF](https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/power.html)。
+充電座實測尚未完成；1000／2500 mAh 的月數仍須以整機休眠電流量測估算。
+
+### T096 GNSS 上游供電（2026-10-02 桌上確認）
+
+T096 V0.2 電路圖中 Vext 供應 GNSS 的 Q3 load switch。HT-n5262G variant 腳位
+26 HIGH 與 GNSS_EN 6 LOW 必須同時成立；只拉 GNSS_EN 而關 Vext 會完全收不到 UART。
+Vext 也供應 TFT，不可用關閉共用 Vext 作為追蹤時的省螢幕電方案。Ready/SystemOFF 才關兩者。
+本次恢復 UART 後讀到 UC6580I-00／R6.0.0.0Build3700；2 Hz NMEA 已量到，室內尚無衛星 fix。
+參考：[原廠電路圖](https://resource.heltec.cn/download/Mesh_Node_T096/Schematic/Mesh_Node_T096_V0.2.pdf)、
+[UFirebird II 協定](https://en.unicore.com/uploads/file/UFirebirdII%20Series%20Protocol%20Specification_EN_R1.6.pdf)。
+第三個 CFGNAV 欄位在這顆出廠韌體須保留1000；100/0都被拒絕。此為指定韌體實測，不能推廣到所有 UC6580。

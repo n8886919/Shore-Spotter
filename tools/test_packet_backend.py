@@ -52,6 +52,7 @@ cpp = r'''
 #include "command_freshness.h"
 #include "packet_diagnostics.h"
 #include "packet_rate.h"
+#include "client_control.h"
 using std::isfinite;
 #define F(x) x
 struct LogStub {template<class T> void print(T) {} template<class T> void println(T) {}} Log;
@@ -110,8 +111,13 @@ packet_diagnostics::Ring<64> packetEvents;
 // New control/probe path is exercised with the actual radio lifecycle in
 // test_station_downlink.py; this fixture retains legacy DATA/TELEMETRY scope.
 namespace station_extensions {
+  struct {struct {uint32_t boot=0;}status;bool have=false;}link;
   bool haveRf = false; uint32_t lastRfMs = 0;
-  bool accept(const uint8_t*, size_t, uint32_t) { return false; }
+  bool accept(const uint8_t *raw,size_t n,uint32_t) {
+    PacketHeader h{};client_control::Status status{};
+    if(!client_control::decodeStatus(raw,n,h,status))return false;
+    link.status.boot=status.boot;link.have=true;return true;
+  }
 }
 namespace sd_log {
   unsigned calls = 0;
@@ -207,7 +213,7 @@ void feedWire(const std::string &wire, uint32_t now) {
 }
 void feed(const std::string &body, uint32_t now) { feedWire(sentence(body), now); }
 void reset() {
-  clockMs = 1000; txSeq = telemetrySeq = diagnosticSeq = 0;
+  clockMs = 1000; txSeq = telemetrySeq = diagnosticSeq = 0; station_extensions::link={};
   gnssDiagnosticSeq = 0; gnssDiagnosticPage = 0; rxGnssDiagnosticCount = 0;
   clientGnssDiagnostic = gnss_diagnostics::Latest{};
   havePkt = haveTelemetry = haveClientDiagnostic = haveSourceEstimate = rxWinHaveSeq = false;
@@ -373,7 +379,25 @@ void test_ten_second_packet_rate() {
  assert(rate.fps(0xfffff000u+419*500)==0.0f);
  std::cout<<"PASS exact rolling 10s DATA FPS: startup, boundary expiry, silence, recovery, sustained traffic and millis wrap\n";
 }
-int main(){test_ten_second_packet_rate();test_codec_dispatch_and_weak_quality();test_latest_and_observed_age();test_bound_rf_freshness_is_separate_from_data();test_scheduler_two_hz_latest_only_and_diagnostic_guard();}
+void test_t096_boot_discards_old_live_source() {
+ reset();pair();uint8_t wire[MAX_PACKET_LEN];auto n=buildDataPacket(wire);acceptRadioPacket(wire,n,1300);
+ assert(havePkt&&rxDataCount==1);
+ n=buildTelemetryPacket(wire);acceptRadioPacket(wire,n,1400);
+ n=buildDiagnosticPacket(wire);acceptRadioPacket(wire,n,1500);
+ n=buildGnssDiagnosticPacket(wire);acceptRadioPacket(wire,n,1600);
+ assert(haveTelemetry&&haveClientDiagnostic&&clientGnssDiagnostic.received());
+ client_control::Status state{10,client_control::State::Ready,22,1,0,0,0,0,false};
+ PacketHeader h{nodeId,1,MSG_CLIENT_STATE};
+ n=client_control::encodeStatus(wire,sizeof(wire),h,state);acceptRadioPacket(wire,n,1700);
+ assert(havePkt); // first ever STATE provides no evidence that prior DATA belongs to another boot
+ state.boot=11;n=client_control::encodeStatus(wire,sizeof(wire),h,state);acceptRadioPacket(wire,n,1800);
+ assert(!havePkt&&!haveTelemetry&&!haveClientDiagnostic&&!clientGnssDiagnostic.received());
+ assert(loraDataRate.fps(1800)==0&&rxDataCount==1&&rxTelemetryCount==1);
+ txSeq=0;n=buildDataPacket(wire);acceptRadioPacket(wire,n,1900);
+ assert(havePkt&&lastData.seq==0&&rxDataCount==2&&sequenceMissing==0);
+ std::cout<<"PASS T096 new boot clears stale live source and accepts new DATA baseline without resetting receiver counters\n";
+}
+int main(){test_t096_boot_discards_old_live_source();test_ten_second_packet_rate();test_codec_dispatch_and_weak_quality();test_latest_and_observed_age();test_bound_rf_freshness_is_separate_from_data();test_scheduler_two_hz_latest_only_and_diagnostic_guard();}
 
 '''
 

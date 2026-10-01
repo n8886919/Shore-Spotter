@@ -33,11 +33,15 @@ def main() -> None:
 #include <cstdint>
 #include <stdexcept>
 
-namespace t096_pins {{ constexpr int kGnssEnable = 6; }}
+#include "gnss_rate.h"
+#include "t096_gnss_config.h"
+gnss_rate::Monitor gpsRate; t096_gnss::Setup gnssSetup;
+bool gnssEnabled=false,dataWaiting=false; uint32_t gpsLastServiceMs=0,nextExtraMs=0; uint8_t extraKind=0;
+namespace t096_pins {{ constexpr int kGnssEnable = 6, kVextControl = 26; }}
 constexpr int OUTPUT = 1, LOW = 0, HIGH = 1;
-int pinModeCalls = 0, digitalWriteCalls = 0, lastPin = -1, lastValue = -1;
+int pinModeCalls = 0, digitalWriteCalls = 0, lastPin = -1, lastValue = -1, pins[48]={{}};
 void pinMode(int pin, int) {{ ++pinModeCalls; lastPin = pin; }}
-void digitalWrite(int pin, int value) {{ ++digitalWriteCalls; lastPin = pin; lastValue = value; }}
+void digitalWrite(int pin, int value) {{ ++digitalWriteCalls; lastPin = pin; lastValue = value; pins[pin]=value; }}
 uint32_t millis() {{ return 1234; }}
 
 struct FakeCollector {{ int resetCalls = 0; uint32_t resetAt = 0; void reset(uint32_t now) {{ ++resetCalls; resetAt = now; }} }} gnss;
@@ -53,11 +57,11 @@ struct FakeUart {{
 
 int main() {{
   setGnssEnabled(false);  // startup disable must not call end()
-  if (Serial2.endCalls || gnss.resetCalls || cadence.resetCalls || lastValue != HIGH) return 1;
+  if (Serial2.endCalls || gnss.resetCalls || cadence.resetCalls || pins[6] != HIGH || pins[26] != LOW) return 1;
   setGnssEnabled(true);
-  if (!Serial2.begun || Serial2.beginCalls != 1 || Serial2.baud != 115200 || gnss.resetCalls != 1 || cadence.resetCalls != 1 || lastValue != LOW) return 2;
+  if (!Serial2.begun || Serial2.beginCalls != 1 || Serial2.baud != 115200 || gnss.resetCalls != 1 || cadence.resetCalls != 1 || pins[6] != LOW || pins[26] != HIGH) return 2;
   setGnssEnabled(false);
-  if (Serial2.begun || Serial2.endCalls != 1 || lastValue != HIGH) return 3;
+  if (Serial2.begun || Serial2.endCalls != 1 || pins[6] != HIGH || pins[26] != LOW) return 3;
   setGnssEnabled(false);  // repeated disable remains safe
   if (Serial2.endCalls != 1) return 4;
   setGnssEnabled(true);
@@ -70,7 +74,7 @@ int main() {{
         cpp = pathlib.Path(directory) / "t096_gnss_uart.cpp"
         binary = pathlib.Path(directory) / "t096_gnss_uart"
         cpp.write_text(harness, encoding="utf-8")
-        subprocess.run([os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(binary)], check=True)
+        subprocess.run([os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra", "-I", str(ROOT/"include"), str(cpp), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
     print("PASS: actual setGnssEnabled startup/enable/disable/repeat lifecycle")
 

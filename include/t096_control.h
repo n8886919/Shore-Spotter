@@ -5,7 +5,7 @@
 #include "client_control.h"
 
 // Arduino-free control/replay policy for the T096 Client.  The radio driver
-// decides when its 800 ms receive window begins; this class decides what a
+// decides when its preamble-gated receive window begins; this class decides what a
 // decoded command is allowed to change.
 namespace t096_control {
 

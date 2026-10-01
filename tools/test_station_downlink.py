@@ -98,7 +98,7 @@ int main() {
   stationRadioIrq = true; nowMs = 31; station_extensions::serviceRadio();
   assert(!station_extensions::txActive && !txFrontend && stationRxReady && radio.finishCalls == 1 && radio.rxCalls == 1);
 
-  reset(); requestStartAndRendezvous(); nowMs = 131; station_extensions::serviceRadio();
+  reset(); requestStartAndRendezvous(); nowMs = 51; station_extensions::serviceRadio();
   assert(radio.startCalls == 0 && !station_extensions::rendezvous);  // stale HTTP/window work is skipped
 
   reset(); requestStartAndRendezvous(); radio.startResult = -42; nowMs = 30;
@@ -113,7 +113,7 @@ int main() {
   assert(station_extensions::link.lastError == RADIOLIB_ERR_TX_TIMEOUT && radio.finishCalls == 1);
   // The service itself never advances time or waits; all guard decisions use nowMs.
   assert(nowMs == 1030);
-  puts("PASS actual STATE rendezvous, 20ms guard, 120ms expiry, TX failure/timeout, and RX recovery");
+  puts("PASS actual STATE rendezvous, 20ms guard, 40ms expiry, TX failure/timeout, and RX recovery");
 }
 '''
 

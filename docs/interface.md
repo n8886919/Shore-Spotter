@@ -224,8 +224,8 @@ uint32 年齡未知為 UINT32_MAX；uint16 年齡 65535 未知、65534 表示 �
 | 8 `MSG_CLIENT_STATE` | 28 B | `boot` u32、`state` u8（Ready=1、Tracking=2、Test=3、Storage=4）、`station` u16、`command` u16、`uptime` u32、`batteryMv` u16（0 unknown）、`txPackets` u32、`rxErrors` u16、`charging` u8（只能0／1） |
 | 9 `MSG_LINK_TEST` | 18 B | `boot` u32（不可0）、`counter` u32、`uptime` u32 |
 
-T096 STATE TX 後開 800 ms RX；Station 只有 pending command 時，在該 STATE rendezvous 等 20 ms 才嘗試
-一次 type 7。排程到達時 STATE 已過 120 ms 就跳過，沒有 wake/retry。TX completed、startTransmit failure
+T096 STATE TX 後先聽85 ms，只有preamble/header才延長RX（上限800 ms）；Station 只有 pending command 時，在該 STATE rendezvous 等 20 ms 才嘗試
+一次 type 7。排程到達時 STATE 已過 40 ms 就跳過，沒有 wake/retry。TX completed、startTransmit failure
 或 1 秒未收到 TX_DONE 均關閉 FEM 並回 Station RX。Station 以 client/boot/station/command/期望 state
 完整比對後續 STATE；才會把 command 標為 `confirmed`。不同 boot 為 `error`，不同 station 不能確認而會
 timeout（65 秒）。probe 支援 uint32 wrap，重複／倒退 counter 不計入，`missing` 是相鄰 counter 推估，非
@@ -1200,3 +1200,25 @@ UART session 重新進入後需新的完整 SET。PWM 不可用回 503；成功�
 
 `bearing`由攝影站位置與收到的Client位置計算；α=1的`servo.target`使用速度向量外推後
 的位置，因此兩者可能不同。α=0不外推，兩者仍經鏡頭校正、磁偏角與0–180°限制換算。
+
+## `GET /api/flash`（Heltec V4）
+
+回傳既有 diagnostic Flash recorder 狀態：`enabled`、`accepting`、`state`、`error`、`boot_id`、
+`used_frames`／`capacity_frames`、`valid_frames`／`corrupt_frames`、`records`、`accepted`／`dropped`、
+`queued`／`queue_high`／`pending_records`、`write_max_us`、`errors`／`usb_errors`／`command_dropped`、
+`erase_count`、`flush_ms`。V4 容量 6912 × 512 B（frame 0 ownership header）、flush 10000 ms。
+非 V4 一般 Station 回 disabled；不會因此啟用 T-Beam 的診斷 profile。沒有 HTTP erase 入口。
+
+V4 預設錄製逐個 `packet_diagnostics::Event`（kind 9）與每 30 秒 JSON health（kind 10）。
+kind 9 payload 是 little endian：version u8=1、event kind u8、RX length u16、RSSI×10 i16、
+SNR×4 i16、error i16、event ID u32、raw length u8、raw bytes（最多36）。
+frame 自帶 boot ID／記錄時間／CRC／drop counter；以 boot 分段，phone UTC 只是手機提供的 metadata。
+USB `DIAG STATUS`／`DIAG READ`／`DIAG ERASE CONFIRM` 共用原匯出工具，未知或損毀 frame 明示並保留原 bytes。
+
+T096 的 DATA seq 獨立於 STATE／PROBE／診斷；新 STATE boot 會清除 Station 的舊即時定位、
+診斷、測試統計與 seq 基準，累計 Station 收件／錯誤計數保留。2 Hz 表示 GNSS 輸出與 RF 500 ms
+最早時槽；STATE／命令／診斷仍占 airtime，不能把 `age_ms` 當固定 0.5 秒或保證每秒收到兩筆 DATA。
+
+Station只對尚未送任何HTTP bytes的已accept連線套用250 ms期限，避免瀏覽器preconnect占住單一入口5秒。
+若已有其他TCP連線排隊，首批bytes的100 ms寬限過後便讓位，避免排隊連線先進入TCP重傳。
+`/api/status.timing.http_idle_closed`為本次boot累計清理次數；已開始的請求／SSE不套用。

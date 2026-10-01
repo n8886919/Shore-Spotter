@@ -107,9 +107,16 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
   [hardware.md](hardware.md)。0 dBm 是 SX1262 chip drive；FEM enabled 並非天線端 RF 輸出實測。
 - Station 可保留使用者明確更新的 phone 位置到 RAM；重開即遺失。Station HTTP 頁不自行取得瀏覽器
   定位，HTTPS helper 背景化／鎖屏可能停止，所以只有最後成功 snapshot 與 age，沒有背景定位保證。
-- T096 只有在送出 STATE 後才開 800 ms RX；Station 有 pending command 才在 rendezvous 20 ms 後嘗試
-  一次下行，STATE 過 120 ms 未排到即跳過。HTTP 202 是 pending，僅後續匹配 boot/station/command/state
+- T096 在 STATE 後先聽 85 ms；只有偵測到 preamble/header 才延長接收，最多 800 ms。Station 有 pending
+  command 才在 rendezvous 20 ms 後嘗試一次下行，STATE 過 40 ms 未排到即跳過。HTTP 202 是 pending，僅後續匹配 boot/station/command/state
   的 STATE 才 confirmed；TX failure/timeout 都回 RX。
+- T096 追蹤時同時開 Vext 與 GNSS enable。UC6580 R6 Build3700 使用 `CFGNAV,100,100,1000`、
+  RMC/GGA divisor 5；實機回讀及 UTC epoch 間隔已確認 2 Hz。GNSS 2 Hz 與有定位／RF 到達 2 Hz 是不同證據。
+  RF 採每 500 ms 最早發送時槽；STATE／TEL／DIAG／GNSS_DIAG 會占用時槽，忙碌時只取最新 epoch，
+  不補送歷史位置。DATA 有獨立 seq；STATE 與低頻診斷不造成虛假 DATA 缺號。USB log 不足空間直接略過。
+- V4 開機自動把逐包 RF bytes、RSSI/SNR/錯誤及每 30 秒的 Station/phone 狀態存入 3.375 MiB 內建 Flash，
+  無 SD 或網路也可錄。記滿停止且不自動刪除，USB 匯出／清除方式見 [Heltec 外測準備](heltec-field-ready.md)。
+  `/api/flash` 顯示 state、剩餘 frame、錯誤及 drops。既有 Axiom API 保留，需獨立 ingest token 才上傳。
 - T096 `start`／`stop`／`store` 只改 Client state；`test` 只送 RF probe。它們不改 Station Servo 或
   GPS/UART mode，也不以 fake GPS 產生 DATA、方位或追蹤。Ready 12 小時後才請求 Storage/SystemOFF，USB
   VBUS 在時抑制關機。USB VBUS 狀態回報已確認；無線充電板未接，充電喚醒、深眠電流與續航待實測。
@@ -393,3 +400,6 @@ OTA 的 last/max 耗時與 ≥50 ms 次數，另有 UART 晚服務／丟棄 byte
 不逐次寫 log。Wire 與 PMUWire 單筆交易 timeout 為 10 ms；整段操作可含多筆交易。
 同步 WebServer 仍可能阻塞，這批提供實機定位依據，並不宣稱 250 ms 期限已獲保證。
 週期 deadline 使用差值比較處理 millis 溢位，控制在同步 I/O 工作之間被服務。
+
+Heltec V4 Station 關閉 Wi-Fi modem sleep，以減少熱點／HTTP 操作等待；這是 Station 的互動延遲取捨，
+不修改無 Wi-Fi 的 T096 Client 省電規則。實測與耗電界線見 [Heltec 外測準備](heltec-field-ready.md)。

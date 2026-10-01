@@ -1,5 +1,7 @@
 #if defined(ARDUINO) && defined(BOARD_HELTEC_V4)
 #include "sd_log.h"
+#include "station_flash.h"
+#include "diagnostic_store.h"
 
 // Heltec V4 has no SD hardware. Keep Station logging call sites intact, but
 // report capability truthfully instead of presenting a failed mount as an error.
@@ -16,8 +18,8 @@ String statusJson() {
   return F("{\"supported\":false,\"present\":false,\"recording\":false,\"state\":\"unsupported\",\"errors\":0,\"error\":\"\"}");
 }
 const char *stateName() { return "unsupported"; }
-void serviceUsb() {}
-bool usbTransferActive() { return false; }
+void serviceUsb() { station_flash::serviceUsb(); }
+bool usbTransferActive() { return diagnostic_store::transferActive(); }
 void clientGps(bool, const ClientRecord &) {}
 void clientEvent(const ClientRecord &) {}
 }  // namespace sd_log
