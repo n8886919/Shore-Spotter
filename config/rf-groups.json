@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "groups": [
+    {
+      "name": "A",
+      "id": 0,
+      "frequency_mhz": 923.2,
+      "spreading_factor": 10,
+      "bandwidth_khz": 125,
+      "coding_rate": 5,
+      "sync_word": "0x12"
+    },
+    {
+      "name": "B",
+      "id": 1,
+      "frequency_mhz": 923.8,
+      "spreading_factor": 10,
+      "bandwidth_khz": 125,
+      "coding_rate": 5,
+      "sync_word": "0x12"
+    }
+  ]
+}

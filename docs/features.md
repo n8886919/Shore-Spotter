@@ -32,6 +32,7 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 - `src/main.cpp` 用 build flag 分兩種角色：`ROLE_CLIENT`（下水端）、`ROLE_STATION`（岸上攝影站）；UART 控制端點位於 `src/uart_servo_mode.cpp`。
 - 共用 LoRa 封包協定抽在 [../include/protocol.h](../include/protocol.h)；硬體腳位與 RF 參數在 `main.cpp` 上方常數區；手機熱點帳密在 [../include/wifi_config.h](../include/wifi_config.h)。
 - 角色由編譯期 `env:tbeam-client` / `env:tbeam-station`決定，未選或同時選兩個角色都會編譯失敗。
+  另有 group B 的 Heltec V4 Station 與獨立 T096 Client profile；它們不是 group A 的自動換頻版本。
 
 # 2. LoRa 無線通訊
 
@@ -48,6 +49,7 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 | TELEMETRY（TEL） | **11 bytes** | 約每 60 秒一次；電池、溫濕度、精確衛星數 |
 | DIAGNOSTIC（DIAG） | **17 bytes** | 約每 60 秒一次；Client GNSS 間隔、UART 積壓、NMEA／TX 錯誤、發送延期與狀態 |
 | GNSS DIAGNOSTIC | **36 bytes 單包** | 約每 60 秒一包；GPS 資料流、來源年齡與恢復／拒收計數 |
+| CLIENT CONTROL / STATE / LINK TEST | **13 / 28 / 18 bytes** | T096 command、STATE rendezvous/confirmation、RF probe；codec 見 interface |
 
 - **GPS 請求 2 Hz，不代表實測達標**。雙端以 115200 baud 設定 RMC＋GGA／500 ms；
   L76K 原廠 >1 Hz 要求單語句，這是已確認採用的雙語句驗證版。每 5 秒觀察 epoch／RMC／GGA
@@ -97,6 +99,20 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 - **長按 PWR 鍵** → 顯示關機畫面後由 PMU 斷電。
 
 # 4. Station（岸上攝影站）
+
+## 4.0 Heltec V4、手機位置與 T096（2026-10-02 USB 桌上部署）
+
+- Heltec V4 Station 是 group B 923.8 MHz profile；無 PMU／SD／BME280／內建 GNSS，battery/charging
+  都是 unknown。SSD1306、Servo GPIO4、FEM 和 auto GC1109/KCT8103L probe 的腳位見
+  [hardware.md](hardware.md)。0 dBm 是 SX1262 chip drive；FEM enabled 並非天線端 RF 輸出實測。
+- Station 可保留使用者明確更新的 phone 位置到 RAM；重開即遺失。Station HTTP 頁不自行取得瀏覽器
+  定位，HTTPS helper 背景化／鎖屏可能停止，所以只有最後成功 snapshot 與 age，沒有背景定位保證。
+- T096 只有在送出 STATE 後才開 800 ms RX；Station 有 pending command 才在 rendezvous 20 ms 後嘗試
+  一次下行，STATE 過 120 ms 未排到即跳過。HTTP 202 是 pending，僅後續匹配 boot/station/command/state
+  的 STATE 才 confirmed；TX failure/timeout 都回 RX。
+- T096 `start`／`stop`／`store` 只改 Client state；`test` 只送 RF probe。它們不改 Station Servo 或
+  GPS/UART mode，也不以 fake GPS 產生 DATA、方位或追蹤。Ready 12 小時後才請求 Storage/SystemOFF，USB
+  VBUS 在時抑制關機。USB VBUS 狀態回報已確認；無線充電板未接，充電喚醒、深眠電流與續航待實測。
 
 - 接收時保留實際 RF 長度，驗證 magic、v5、類型、固定長度、`clientId` 白名單與數值／保留位元。
   格式、長度、綁定、序號與 RF 錯誤分別計數，並寫入 64 筆結構化事件環形紀錄。

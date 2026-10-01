@@ -34,6 +34,8 @@ def block(marker):
 cpp = r'''
 #include <algorithm>
 #include <cassert>
+#include "radio_profile.h"
+#include "station_board.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

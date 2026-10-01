@@ -9,6 +9,24 @@
 
 ## 未發行
 
+- **2026-10-02 多板 Station、T096 Client 與固定 A/B（Heltec USB 桌上部署）**：
+  共用 Station 邏輯新增 Heltec LoRa32 V4 R2 profile／FEM 偵測與 SD/GNSS 能力區分，
+  保留 LilyGO；T096 採 nRF52840 + SX1262/FEM 與真 GNSS source，RF 測試另用 probe 不偽造座標。
+  `config/rf-groups.json` 固定 A 923.2／B 923.8 MHz；本機 device manifest 以 USB serial、角色、
+  配對與組別管理，`SHORE_DEVICE` 編譯時選組，首次配對可填 Client radio_id，既有 NVS 優先。
+  wire v5 保留原封包，新增 CONTROL/STATE/PROBE；Web 命令需 Client STATE 回覆才確認。
+  Client 待命每 30 秒回報並開 800 ms 接收窗，運行／測試每 5 秒；待命 12 小時進 SystemOFF，
+  USB 供電時抑制，拔除 USB 重新計時；追蹤不因 RF 失聯自動休眠。深眠不能由 Web 喚醒。
+  手機定位由 HTTPS 定位頁回傳 Station HTTP 視窗，含 origin/source 檢查、時間與精度；
+  Station RAM 保留最後成功位置直到重開機。原追蹤／Servo 模式不因開始或停止 Client 改變。
+  Heltec 的 0 dBm 為 SX1262 drive 設定，不能當天線端功率；充電板未接、待機電流與水上效果未驗證。
+  V4 原廠 16 MiB 已備份，device digest 比對成功。V4 app-only 燒錄 hash 驗證、T096 application DFU 完成；
+  修正 nRF UARTE 未 begin 就 end 的開機卡住，以及 FEM 延遲使舊時間 underflow、RX 窗立即關閉。
+  四種 profile build、native 138/138、實際函式 UART／RF lifecycle 與既有主機回歸通過。
+  實機 RF 測試 60.9 秒新增 99 probe，counter 缺號 0；test/start/stop 均由 STATE 確認，
+  Station 重啟後保存配對並同步命令序號；USB 中 store 回 409。LilyGO 未接，未燒錄。
+  GNSS fix、水上 RF、深眠電流／充電喚醒與手機定位授權仍待實測。詳見 [桌上驗證](docs/link-test-2026-10-02.md)。
+
 - **2026-10-02 多板移植前基線保存**：整理 9/13 之後既有 v5／SF10、Station 命名、Web、
   GNSS／SD／Flash 外測診斷與電源修正，保留各條目的歷史部署界線。
   本次重新執行 native 及 `tools/test_*` 共 25 支 Python／JavaScript 測試程式，全部通過；

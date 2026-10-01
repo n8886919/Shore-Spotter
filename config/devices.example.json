@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "devices": [
+    {
+      "name": "station-v4",
+      "board": "heltec-v4",
+      "role": "station",
+      "environment": "heltec-v4-station",
+      "usb_serial": "EXAMPLE_V4_USB_SERIAL",
+      "rf_group": "B",
+      "client": "t096-client"
+    },
+    {
+      "name": "t096-client",
+      "board": "heltec-t096",
+      "role": "client",
+      "environment": "t096-client",
+      "usb_serial": "EXAMPLE_T096_USB_SERIAL",
+      "rf_group": "B"
+    }
+  ]
+}

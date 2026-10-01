@@ -259,3 +259,39 @@ L76K 原廠要求 >1 Hz 時僅開一種 NMEA 語句；本版雙語句是使用�
 Station 每次初始化／復原開啟 SX1262 boosted RX gain，較高接收耗電用於接收性能，
 不是提高 Client 發射功率，也不能保證穿透水、人體、地形遮蔽。這次只驗證設定路徑與錯誤處理；
 實際改善幅度須同位置、天線、姿態、頻率與 SF 的現場對照。ALDO3 讀回亦非供電電壓實測。
+
+## Heltec V4 Station 與 T096 Client（2026-10-02，USB 桌上部署）
+
+新增兩個獨立 RF pair：A 為既有 T-Beam Supreme Station／Client（group 0、923.2 MHz），B 為
+Heltec V4 Station／T096 Client（group 1、923.8 MHz）。兩組均用 BW 125 kHz、SF10、CR 4/5、Sync
+Word `0x12`，但不會掃描、協商或互通。兩塊 Heltec 已燒錄並完成桌上雙向命令；LilyGO 未連接，僅 build，沒有外測。
+
+Heltec V4 Station 使用 ESP32-S3 N16R2（16 MB flash、內嵌 2 MB QSPI PSRAM，不是 R8/OPI）。
+
+| 功能 | GPIO／設定 |
+|---|---|
+| SX1262 | SCK 9、MISO 11、MOSI 10、NSS 8、DIO1 14、NRST 12、BUSY 13、TCXO 1.8 V |
+| OLED | SSD1306：SDA 17、SCL 18、RESET 21；Vext GPIO36 active-low |
+| Servo | GPIO4（Heltec 公開 header 的外接 GPIO）；只是 PWM 命令，無實體角度回授 |
+| 外接 GNSS | RX 39／TX 38 僅屬擴充模組；裸板未安裝時不初始化 GNSS |
+| 無板載項目 | 無 AXP2101、SD、BME280；電量／充電必須呈現 unknown，不能把 0 當健康 |
+
+FEM power 為 GPIO7、CSD 為 GPIO2。auto profile 依 Meshtastic 的 runtime probe：上電後釋放 GPIO2
+為 input，連續 8 次全低是 GC1109、全高是 KCT8103L，任何不一致 fail closed，不猜 RF path。GC1109
+使用 CPS GPIO46、DIO2 自動 CTX；KCT8103L 使用 CTX GPIO5（TX high／RX LNA low）、DIO2 自動 CPS。
+`heltec-v4-2-station`／`heltec-v4-3-station` 是明確 override，僅適用已確認 FEM 的板。
+本次 USB 確認 R2／16 MB flash，runtime probe 為 KCT8103L，屬 V4.3 FEM 路徑；這不能確認板面細分版號。
+雙向 RF 已通；OLED 僅有初始化成功訊息，實際顯示與 GPIO4 Servo 尚未驗收。
+0 dBm 是 SX1262 chip drive；FEM enabled 不是天線輸出功率量測。
+
+T096 是獨立 nRF52840 Client，沒有 ESP Web/Wi-Fi，也不以 fake GNSS 冒充定位：SX1262 NSS 5、DIO1 21、
+RESET 16、BUSY 19，SPI SCK 40/MISO 14/MOSI 11，FEM power 30/CSD 12/CTX 41，chip drive 0 dBm；
+GNSS enable 6（low active）、reset 46、PPS 43、RX 23、TX 25，115200 baud；battery ADC 3/control 47、
+button 42、LED 28、Vext 26。RF 收發與 USB VBUS 回報已在桌上確認；GNSS fix、ADC 電量、
+SystemOFF 電流與喚醒尚未實測。USB VBUS 抑制 Ready 12 小時後的 SystemOFF，拔除後重新計時；
+現有充電板未接，不能稱為已驗證無線充電或 VBUS wake。
+
+收納 UX 預定採「充電座喚醒 → Web 開始／停止 → 待命 12 小時自動收納」。
+避免充電短暫斷續造成反覆關機，不以拔離充電座作為睡眠開關。封殼前需確認接收板 5 V 路徑
+確實能觸發本板喚醒，以及接收板／充電器反向漏電；若無法喚醒，再考慮磁簧外部喚醒。
+本版深眠只啟用使用者按鍵 wake，未宣稱完成充電座喚醒。1000／2500 mAh 的月數須以整機休眠電流量測估算。

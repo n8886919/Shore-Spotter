@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shore Spotter 手機位置</title>
+<style>
+body{margin:0;padding:20px;background:#fff;color:#11251a;font:16px system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}main{max-width:480px;margin:auto}h1{font-size:22px;margin:0 0 8px}p{margin:9px 0}.card{margin:14px 0;padding:14px;border:1px solid #a6b5a9;border-radius:10px;background:#f4f7f4}.status{font-variant-numeric:tabular-nums;white-space:pre-line}button{margin:6px 6px 0 0;padding:10px 14px;border:1px solid #076c38;border-radius:8px;background:#076c38;color:#fff;font:600 15px inherit}button.secondary{background:#fff;color:#076c38}label{display:block;margin-top:8px;font-size:13px}input{width:100%;padding:9px;box-sizing:border-box;border:1px solid #a6b5a9;border-radius:7px;font:15px inherit}small{color:#405849}
+</style>
+<main>
+  <h1>Station 手機位置</h1>
+  <p>這頁必須由 Station 資訊頁開啟。按下開始後，位置只回傳該 Station 視窗，不會上傳到第三方。</p>
+  <div class="card">
+    <div id="status" class="status">尚未開始定位</div>
+    <button id="start" type="button">開始持續定位</button><button id="stop" class="secondary" type="button" disabled>停止</button>
+  </div>
+  <div class="card">
+    <b>手動／複製備援</b>
+    <label>緯度 <input id="lat" inputmode="decimal" placeholder="25.0"></label>
+    <label>經度 <input id="lon" inputmode="decimal" placeholder="121.5"></label>
+    <label>精度（公尺） <input id="accuracy" inputmode="decimal" placeholder="10"></label>
+    <button id="send" type="button">回傳手動位置</button><button id="copy" class="secondary" type="button">複製 JSON</button>
+    <p><small>手機鎖屏、背景化或瀏覽器省電時，持續定位可能停止；這不是背景追蹤保證。Station 會保留最後一次成功位置到重新開機。</small></p>
+  </div>
+</main>
+<script>
+(function(){
+  'use strict';
+  var $=function(id){return document.getElementById(id);};
+  var returnUrl=new URLSearchParams(location.hash.slice(1)).get('return')||'';
+  function allowedReturnUrl(value){
+    try{var u=new URL(value),h=u.hostname.toLowerCase();return u.protocol==='http:'&&(h==='localhost'||/^(?:10|127)(?:\.\d{1,3}){3}$/.test(h)||/^192\.168(?:\.\d{1,3}){2}$/.test(h)||/^172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}$/.test(h)||/\.local$/.test(h));}catch(_e){return false;}
+  }
+  var target=allowedReturnUrl(returnUrl)?returnUrl:null,watchId=null,last=null;
+  function setStatus(text){$('status').textContent=text;}
+  function message(lat,lon,accuracy,timestamp){return {type:'shore-spotter-phone-position-v1',lat:lat,lon:lon,accuracy:accuracy,timestamp:timestamp};}
+  function valid(p){return p&&Number.isFinite(p.lat)&&Number.isFinite(p.lon)&&Number.isFinite(p.accuracy)&&Number.isFinite(p.timestamp)&&p.lat>=-90&&p.lat<=90&&p.lon>=-180&&p.lon<=180&&p.accuracy>=0&&p.accuracy<=100000;}
+  function manualPosition(){
+    var lat=$('lat').value.trim(),lon=$('lon').value.trim(),accuracy=$('accuracy').value.trim();
+    return lat&&lon&&accuracy?message(Number(lat),Number(lon),Number(accuracy),Date.now()):null;
+  }
+  function send(p){
+    if(!target||!window.opener||!valid(p)){setStatus(target?'位置資料無效':'未接受有效的 Station return 位址');return false;}
+    window.opener.postMessage(p,new URL(target).origin);last=p;
+    setStatus('已回傳\n'+p.lat.toFixed(6)+', '+p.lon.toFixed(6)+'\n精度 '+p.accuracy.toFixed(1)+' m · '+new Date(p.timestamp).toLocaleTimeString());return true;
+  }
+  function stop(){if(watchId!==null){navigator.geolocation.clearWatch(watchId);watchId=null;}$('start').disabled=false;$('stop').disabled=true;}
+  $('start').onclick=function(){
+    if(!target){setStatus('此頁只能由 Station 的「用手機更新位置」開啟');return;}
+    if(!navigator.geolocation){setStatus('此瀏覽器不支援定位，請填手動位置');return;}
+    stop();setStatus('等待定位權限與第一筆位置…');$('start').disabled=true;$('stop').disabled=false;
+    watchId=navigator.geolocation.watchPosition(function(pos){
+      var p=message(pos.coords.latitude,pos.coords.longitude,pos.coords.accuracy,pos.timestamp||Date.now());
+      $('lat').value=p.lat;$('lon').value=p.lon;$('accuracy').value=p.accuracy;send(p);
+    },function(err){setStatus('定位失敗：'+err.message+'；可填手動位置。');stop();},{enableHighAccuracy:true,maximumAge:1000,timeout:20000});
+  };
+  $('stop').onclick=function(){stop();setStatus('已停止持續定位；最後一次位置仍在 Station，直到重新開機。');};
+  $('send').onclick=function(){var p=manualPosition();if(!p){setStatus('請完整填寫緯度、經度與精度');return;}send(p);};
+  $('copy').onclick=function(){
+    var p=last||manualPosition();
+    if(!valid(p)){setStatus('請先取得或填入有效位置');return;}
+    var text=JSON.stringify(p);if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(text).then(function(){setStatus('已複製位置 JSON；可從中取出座標填回 Station。');},function(){setStatus(text);});else setStatus(text);
+  };
+  if(!target)setStatus('未接受有效的 Station return 位址；請由 Station 資訊頁重新開啟。');
+})();
+</script>

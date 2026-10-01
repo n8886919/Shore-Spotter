@@ -32,13 +32,13 @@ Station SD 記錄與 USB 狀態、開始／停止、列檔／讀回及檔案格�
 
 | 參數 | 值 |
 |---|---|
-| 中心頻率 | 923.2 MHz，程式固定設定 |
+| 中心頻率 | group A（既有 T-Beam pair）923.2 MHz；group B（Heltec V4 Station + T096 Client）923.8 MHz；不掃描／不協商 |
 | 頻寬 | 125 kHz |
 | Spreading Factor | SF10 |
 | Coding Rate | 4/5 |
 | Sync Word | `0x12` |
 | 前導碼／標頭 | 8 symbols／explicit header，PHY CRC 開啟 |
-| 固定發射功率 | Client 20 dBm；Station 僅接收（初始化保留 17 dBm 設定）；ATPC 已移除 |
+| 固定發射功率 | group A Client 20 dBm；group B 為 SX1262 0 dBm chip drive。Station 僅在近期 STATE window 內送 control；數值不是天線端輸出量測 |
 | DATA 排程 | 最新有效定位即送，受 airtime＋80 ms guard 限制；失效通知一次，無 DATA 心跳 |
 | ACK | 已移除，無下行回覆 |
 | TELEMETRY／DIAGNOSTIC | 各約每 60 秒獨立發送；GNSS DIAG 約 60 秒一包，可延後定位 |
@@ -57,6 +57,9 @@ Coding Rate；本專案 Client 發送使用 4/5。頻率設定不是整套設備
 | 4 | MSG_TELEMETRY | 11 B | 288.768 ms | 電量、溫濕度與精確衛星數 |
 | 5 | MSG_DIAGNOSTIC | 17 B | 329.728 ms | Client 的 GNSS 間隔與執行計數 |
 | 6 | MSG_GNSS_DIAGNOSTIC | 36 B | 493.568 ms | 單包完整 GPS 資料流／診斷年齡快照 |
+| 7 | MSG_CLIENT_CONTROL | 13 B | 依 RadioLib 實算 | Station→T096 command |
+| 8 | MSG_CLIENT_STATE | 28 B | 依 RadioLib 實算 | T096→Station state／confirmation rendezvous |
+| 9 | MSG_LINK_TEST | 18 B | 依 RadioLib 實算 | T096→Station RF test counter |
 
 type 2（舊 ACK）與 type 3（舊 HELLO）不接受。wire 升為 v5；所有類型標頭均用新版本，
 Client／Station 必須一起更新，舊格式拒收，無自動降版。SF9 舊板也無法與 SF10 通訊。
@@ -64,8 +67,9 @@ Client／Station 必須一起更新，舊格式拒收，無自動降版。SF9 �
 
 ### 不阻塞的發送與空檔
 
-Client 使用 `startTransmit → TxDone／timeout → finishTransmit`，完成後回到 standby，
-不開啟 RX 或等待 ACK。Station 只接收。軟體 timeout 為各包向上取整的 ToA＋80 ms。
+既有 T-Beam Client 使用 `startTransmit → TxDone／timeout → finishTransmit`，完成後回到 standby，
+不開啟 RX 或等待 ACK。Station 平時只接收；T096 control 的短暫下行例外見 type 7／8／9。軟體 timeout
+為各包向上取整的 ToA＋80 ms。
 無線傳送期間仍服務 GNSS；Station 接收後繼續服務 Servo／UART。
 
 Client 觀察最新同 epoch 快照，新的有效定位且 radio 空閒、guard 已滿即可發送，不設 1 Hz 上限。
@@ -208,6 +212,25 @@ uint32 年齡未知為 UINT32_MAX；uint16 年齡 65535 未知、65534 表示 �
 計數飽和至 65535。UTC 非未知時須 <86400000。狀態以 UART／語句／epoch 推進與 fix 判斷，
 不把推算來源年齡偏移判成新位置失效。`pages_mask` 舊 API 欄位為 null，設定 pages=1。
 
+## Client Control extensions（type 7／8／9）
+
+三種 extension 都有既有共用 6-byte little-endian header，且接收端要求**精確**長度；短包、長包、
+非法 enum、0 boot、非法 station 或保留值均拒收。`seq` 是 command/state/probe 各自的 16-bit 序號，
+不是認證。
+
+| type | total | offset 6 起 payload |
+|---|---:|---|
+| 7 `MSG_CLIENT_CONTROL` | 13 B | `boot` u32（6–9，不可0）、`action` u8（10：Start=1、Stop=2、Test=3、Store=4）、`station` u16（11–12，不可0／FFFF） |
+| 8 `MSG_CLIENT_STATE` | 28 B | `boot` u32、`state` u8（Ready=1、Tracking=2、Test=3、Storage=4）、`station` u16、`command` u16、`uptime` u32、`batteryMv` u16（0 unknown）、`txPackets` u32、`rxErrors` u16、`charging` u8（只能0／1） |
+| 9 `MSG_LINK_TEST` | 18 B | `boot` u32（不可0）、`counter` u32、`uptime` u32 |
+
+T096 STATE TX 後開 800 ms RX；Station 只有 pending command 時，在該 STATE rendezvous 等 20 ms 才嘗試
+一次 type 7。排程到達時 STATE 已過 120 ms 就跳過，沒有 wake/retry。TX completed、startTransmit failure
+或 1 秒未收到 TX_DONE 均關閉 FEM 並回 Station RX。Station 以 client/boot/station/command/期望 state
+完整比對後續 STATE；才會把 command 標為 `confirmed`。不同 boot 為 `error`，不同 station 不能確認而會
+timeout（65 秒）。probe 支援 uint32 wrap，重複／倒退 counter 不計入，`missing` 是相鄰 counter 推估，非
+完整空中丟包證據。
+
 ## 單一 Client 綁定
 
 Station只接受綁定的client_id。NVS `gpsclient`保留既有綁定；若尚無該鍵，遷移舊`wl`第一個
@@ -232,6 +255,28 @@ HTTP API與OTA均未設應用層認證／密碼，同熱點可連線裝置可存
 - 攝影站開機會自動連線，IP 由手機分配，開機時顯示於 OLED
 
 以下 endpoint 透過瀏覽器或任何 HTTP client 存取，基底 URL 為攝影站的 IP（例：`http://192.168.x.x`）。
+
+## `GET` / `POST /api/station/position`
+
+GET 回 `source`（`gnss`／`phone`）、`valid`、`lat`／`lon`、phone `accuracy_m`、`updated_utc_ms`、
+`age_ms`、HTTPS helper URL 及 `retention:"until_station_restart"`。POST `action=phone` 需要 finite 的
+`lat`、`lon`、`accuracy`、`timestamp`，並檢查位置／精度範圍與 timestamp 不倒退；`action=gnss` 放棄
+RAM phone snapshot、回本機 GNSS。
+
+Station 內嵌頁是 HTTP，不能自行保證取得瀏覽器定位；使用者明確操作才開 HTTPS helper，並由
+`postMessage` 回傳。phone snapshot 只存在 Station RAM 到重開機；helper 背景化／鎖屏可能停止，age
+可見但不能宣稱持續定位或背景定位保證。
+
+## `GET` / `POST /api/client/control`
+
+GET 回 T096 最近 STATE：`supported`（90 秒內有綁定 STATE）、`client_id`、`boot_id`、`state`、`age_ms`、
+battery/charging、`command`／`command_id`、RF test `tx_packets`／`test_received`／`test_missing`／RSSI／SNR／
+max gap，以及 group/frequency。POST 僅接受 `action=start|stop|test|store`。
+
+新鮮且綁定的 STATE、沒有 pending command 且未被其他 Station 指派時，POST 回 **202**。202 只表示
+pending 等待下一個 STATE window，絕不表示 Client 已收包、已切換 state 或已開始儲存；須看後續完全
+匹配的 STATE 才是 `confirmed`。缺新鮮 STATE、已有 pending 或 Station 不符回 409。此入口不改 Station
+Servo/GPS/UART mode；`test` 只送 RF probe，不偽造 GPS/DATA/方位。
 
 ## `GET /`
 

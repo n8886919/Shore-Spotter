@@ -28,6 +28,8 @@
 #include "client_cadence.h"
 #include "async_lora_tx.h"
 #include "sd_log.h"
+#include "station_board.h"
+#include "radio_profile.h"
 #if defined(FIELD_DIAGNOSTIC)
 #include "diagnostic_store.h"
 #include "field_diagnostic.h"
@@ -79,28 +81,29 @@
 #error "Both roles defined: pick only ROLE_CLIENT or ROLE_STATION, not both."
 #endif
 
-// T-Beam Supreme (SX1262) pins from LilyGO hardware docs.
-constexpr int LORA_SCK = 12;
-constexpr int LORA_MISO = 13;
-constexpr int LORA_MOSI = 11;
-constexpr int LORA_NSS = 10;
-constexpr int LORA_DIO1 = 1;
-constexpr int LORA_NRST = 5;
-constexpr int LORA_BUSY = 4;
+constexpr int LORA_SCK = station_board::kLoraSck;
+constexpr int LORA_MISO = station_board::kLoraMiso;
+constexpr int LORA_MOSI = station_board::kLoraMosi;
+constexpr int LORA_NSS = station_board::kLoraNss;
+constexpr int LORA_DIO1 = station_board::kLoraDio1;
+constexpr int LORA_NRST = station_board::kLoraReset;
+constexpr int LORA_BUSY = station_board::kLoraBusy;
 
-// Taiwan legal LoRa sub-band (AS923 profile commonly uses 923.2 MHz).
-constexpr float RF_FREQUENCY = 923.2;
-constexpr float RF_BW = 125.0;
-constexpr int RF_SF = 10;
+// Fixed A/B P2P frequencies; the frequency alone does not establish RF compliance.
+constexpr float RF_FREQUENCY = radio_profile::frequencyMhz;
+constexpr float RF_BW = radio_profile::bandwidthKhz;
+constexpr int RF_SF = radio_profile::spreadingFactor;
 // SF10 trades airtime for sensitivity. DATA fits a 500 ms slot; low-rate
 // diagnostics use dedicated slots interleaved with DATA. Both roles must match.
 // Coding rate 4/5; v5 uplink codecs are shared by both roles.
-constexpr int RF_CR = 5;
-constexpr int RF_SYNC_WORD = 0x12;
+constexpr int RF_CR = radio_profile::codingRate;
+constexpr int RF_SYNC_WORD = radio_profile::syncWord;
 // Fixed per-role power is applied by initRadio() on boot and radio recovery.
 // Legacy Client NVS txpwr/atpc values are intentionally no longer read.
 #if defined(ROLE_CLIENT)
 constexpr int TX_POWER_DBM = 20;
+#elif defined(BOARD_HELTEC_V4)
+constexpr int TX_POWER_DBM = station_board::kTxPowerDbm;
 #else
 constexpr int TX_POWER_DBM = 17;
 #endif
@@ -142,8 +145,8 @@ constexpr uint16_t BATT_PRESENT_MIN_MV = 2500; // ignore implausible/no-battery 
 constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
 
 #if defined(ROLE_STATION)
-// Camera servo (GXServo QY3242BLS/GX3242 42KG) driven by ESP32 LEDC PWM on IO21.
-constexpr int SERVO_PIN = 21;
+// Camera servo pin comes from the selected Station hardware profile.
+constexpr int SERVO_PIN = station_board::kServoPin;
 constexpr uint32_t SERVO_PWM_HZ = servo_profile::kPwmHz;
 // ESP32-S3 LEDC timers support at most 14-bit resolution.  A 16-bit attach is
 // rejected by Arduino-ESP32 3.x, leaving the pin with no PWM output.
@@ -178,8 +181,8 @@ constexpr int PMU_SCL_PIN = 41;
 
 // On-board SH1106 OLED lives on I2C bus 0 (shared sensor bus).
 // Its power rail is ALDO1 on the AXP2101 PMU and must be enabled first.
-constexpr int OLED_SDA_PIN = 17;
-constexpr int OLED_SCL_PIN = 18;
+constexpr int OLED_SDA_PIN = station_board::kOledSda;
+constexpr int OLED_SCL_PIN = station_board::kOledScl;
 // SH1106 的位址取決於板上是哪一版磁力計：QMC6310U 在 0x1C -> 螢幕 0x3C；
 // QMC6310N 在 0x3C -> 螢幕 0x3D（見 docs/hardware.md 的 I2C 位址表）。寫死
 // 0x3C 在 N 版板子上會讓 u8g2 把畫面資料寫進磁力計的暫存器，螢幕全黑而且沒有
@@ -209,7 +212,11 @@ IPAddress cachedApIpAddr;  // last address seen, to detect DHCP changes
 #endif
 
 // Shared OLED object — client enables it only during boot-info and shutdown screens.
+#if defined(BOARD_HELTEC_V4)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, station_board::kOledReset);
+#else
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+#endif
 
 #if defined(ROLE_STATION)
 // Rolling log the web UI can render. The station lives on a tripod at the beach,
@@ -299,7 +306,10 @@ struct DecodedTelemetry {
 
 // Exactly one bound GPS client. srcId remains in the wire protocol so future
 // multi-client support can reuse this filter and select a ClientState explicitly.
-constexpr uint16_t DEFAULT_GPS_CLIENT_ID = 0;  // a new station must be explicitly paired
+#ifndef SHORE_DEFAULT_CLIENT_ID
+#define SHORE_DEFAULT_CLIENT_ID 0
+#endif
+constexpr uint16_t DEFAULT_GPS_CLIENT_ID = SHORE_DEFAULT_CLIENT_ID;  // saved NVS binding takes precedence
 static uint16_t gpsClientId = DEFAULT_GPS_CLIENT_ID;  // 0 = intentionally unbound
 static bool isClientAllowed(uint16_t id) {
   return gpsClientId != 0 && id == gpsClientId;
@@ -527,6 +537,7 @@ void IRAM_ATTR onLoRaDio1() {
   stationRadioIrqMs = millis();
   stationRadioIrq = true;
 }
+#include "station_extensions.h"
 #endif
 
 #if defined(ROLE_STATION)
@@ -603,6 +614,10 @@ static bool batteryCharging() {
 }
 
 static bool initPmu() {
+#if defined(BOARD_HELTEC_V4)
+  Log.println(F("[PMU] unsupported on Heltec V4; battery state remains unknown"));
+  return false;
+#else
   PMUWire.begin(PMU_SDA_PIN, PMU_SCL_PIN);
   PMUWire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
   if (!pmu.begin(PMUWire, AXP2101_SLAVE_ADDRESS, PMU_SDA_PIN, PMU_SCL_PIN)) {
@@ -628,6 +643,7 @@ static bool initPmu() {
 
   Log.println(F("[PMU] AXP2101 init ok"));
   return true;
+#endif
 }
 
 #if defined(ROLE_CLIENT) && defined(FIELD_DIAGNOSTIC)
@@ -824,6 +840,12 @@ static void serviceFieldDiagnostic() {
 #endif
 
 static void configureGps() {
+#if defined(BOARD_HELTEC_V4)
+  Log.println(F("[GNSS] unsupported: Heltec V4 external 38/39 GNSS is not installed"));
+  gnssCollector.reset(millis());
+  gpsServiceStarted = true;
+  return;
+#else
   pinMode(GPS_EN_PIN, OUTPUT);
   digitalWrite(GPS_EN_PIN, HIGH);
   GPSSerial.setRxBufferSize(GPS_RX_BUFFER_BYTES);
@@ -852,9 +874,13 @@ static void configureGps() {
   Log.println(F("[GNSS] requested 115200 baud, 2 Hz RMC+GGA verification configuration"));
 #endif
   Log.println(F("[GNSS] command writes are not verification; observed rates follow every 5 s"));
+#endif
 }
 
 static void serviceGps() {
+#if defined(BOARD_HELTEC_V4)
+  return;
+#else
   const uint32_t now = millis();
   if (!gpsServiceStarted || now - gpsLastServiceMs > GPS_BACKLOG_GUARD_MS) {
     // Discard bytes accumulated while blocked (including the boot screen).
@@ -897,20 +923,26 @@ static void serviceGps() {
       station.arrivalAgeMs < GPS_FIX_MAX_AGE_MS,
       station.epochMsOfDay, station.lat, station.lon);
 #endif
+#endif
 }
 
 // 「現在真的有定位」。見 GPS_FIX_MAX_AGE_MS —— isValid() 單獨用是不夠的。
 static bool gpsFixFresh() {
+#if defined(ROLE_STATION)
+  if (station_extensions::phone.enabled) return true;
+#endif
   gnss_snapshot::Snapshot sample;
   return gnssCollector.sample(millis(), sample) && sample.fix &&
          sample.arrivalAgeMs < GPS_FIX_MAX_AGE_MS;
 }
 #if defined(ROLE_STATION)
 static double stationLatitude() {
+  if (station_extensions::phone.enabled) return station_extensions::phone.lat;
   if (stationAverage.count()) return stationAverage.latitude();
   gnss_snapshot::Snapshot sample; gnssCollector.sample(millis(), sample); return sample.lat;
 }
 static double stationLongitude() {
+  if (station_extensions::phone.enabled) return station_extensions::phone.lon;
   if (stationAverage.count()) return stationAverage.longitude();
   gnss_snapshot::Snapshot sample; gnssCollector.sample(millis(), sample); return sample.lon;
 }
@@ -925,6 +957,21 @@ static double stationLongitude() {
 
 #if defined(ROLE_STATION)
 static bool initStationDisplay() {
+#if defined(BOARD_HELTEC_V4)
+  station_board::prepareStationPeripherals();
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN, 100000);
+  Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
+  display.setI2CAddress(OLED_ADDR_DEFAULT << 1);
+  display.setBusClock(100000);
+  if (!display.begin()) {
+    Log.println(F("[OLED] Heltec V4 SSD1306 init failed"));
+    return false;
+  }
+  display.setPowerSave(0);
+  display.setContrast(255);
+  Log.println(F("[OLED] Heltec V4 SSD1306 initialized"));
+  return true;
+#else
   const bool powered = pmuOnline && pmu.setALDO1Voltage(3300) && pmu.enableALDO1() &&
       pmu.isEnableALDO1() && pmu.getALDO1Voltage() == 3300;
   Log.print(F("[OLED] ALDO1 3300 mV readback=")); Log.println(powered ? "ok" : "failed");
@@ -955,10 +1002,15 @@ static bool initStationDisplay() {
   Log.print(F(" SCL=")); Log.println(digitalRead(OLED_SCL_PIN));
   Log.println(F("[OLED] display writes disabled; LoRa and SD continue"));
   return false;
+#endif
 }
 #endif
 
 static bool initEnvSensor() {
+#if defined(BOARD_HELTEC_V4)
+  Log.println(F("[ENV] unsupported on Heltec V4 (no BME280)"));
+  return false;
+#else
   // BME280 is common and simple; try both default addresses.
   if (envSensor.begin(0x76, &Wire) || envSensor.begin(0x77, &Wire)) {
     Log.println(F("[ENV] BME280 init ok"));
@@ -966,6 +1018,7 @@ static bool initEnvSensor() {
   }
   Log.println(F("[ENV] BME280 not found (telemetry stays N/A)"));
   return false;
+#endif
 }
 
 static void sampleEnvSensor() {
@@ -1004,6 +1057,7 @@ static uint32_t boundRfAgeMs() {
   if (haveTelemetry) age = std::min(age, uint32_t(now-lastTelemetryRxMs));
   if (haveClientDiagnostic) age = std::min(age, uint32_t(now-lastClientDiagnosticMs));
   if (clientGnssDiagnostic.received()) age = std::min(age, clientGnssDiagnostic.rxAgeMs(now));
+  if (station_extensions::haveRf) age = std::min(age, uint32_t(now-station_extensions::lastRfMs));
   return age;
 }
 static SigLevel stationGpsState() {
@@ -1134,6 +1188,17 @@ static size_t buildGnssDiagnosticPacket(uint8_t *buf) {
 // ALDO3 supplies the SX1262. Reapply and read back before boot/recovery SPI access.
 // Readback proves the PMU configuration, not the measured voltage/RF output.
 static bool prepareRadioPower() {
+#if defined(BOARD_HELTEC_V4)
+  station_board::prepareStationPeripherals();
+  if (!station_board::prepareStationRadioFrontend()) {
+    Log.println(F("[LoRa] ERROR: Heltec V4 FEM detection unstable"));
+    return false;
+  }
+  delay(10);
+  Log.print(F("[LoRa] Heltec V4 FEM=")); Log.print(station_board::heltecFemName());
+  Log.println(F("; board RF output is unmeasured"));
+  return true;
+#else
 #if defined(ROLE_CLIENT)
   ClientRailGuard guard;
   if (!guard.held) { Log.println(F("[LoRa] PMU busy; defer radio recovery")); return false; }
@@ -1146,17 +1211,30 @@ static bool prepareRadioPower() {
   delay(10);  // rail settling before the radio reset/SPI sequence
   Log.println(F("[LoRa] ALDO3 configured 3300 mV, enabled (readback verified)"));
   return true;
+#endif
 }
 
 static bool initRadio() {
   if (!prepareRadioPower()) return false;
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+#if defined(BOARD_HELTEC_V4)
+  int state = radio.begin(RF_FREQUENCY, RF_BW, RF_SF, RF_CR, RF_SYNC_WORD, TX_POWER_DBM, 8, 1.8f);
+#else
   int state = radio.begin(RF_FREQUENCY, RF_BW, RF_SF, RF_CR, RF_SYNC_WORD, TX_POWER_DBM);
+#endif
   if (state != RADIOLIB_ERR_NONE) {
     Log.print(F("[LoRa] init failed, code="));
     Log.println(state);
     return false;
   }
+#if defined(BOARD_HELTEC_V4)
+  state = radio.setDio2AsRfSwitch(true);
+  if (state != RADIOLIB_ERR_NONE) {
+    Log.print(F("[LoRa] Heltec V4 DIO2 RF switch failed, code="));
+    Log.println(state);
+    return false;
+  }
+#endif
 #if defined(ROLE_STATION)
   state = radio.setRxBoostedGainMode(true);
   if (state != RADIOLIB_ERR_NONE) {
@@ -1415,6 +1493,8 @@ static void recordPacketEvent(packet_diagnostics::Kind kind, uint32_t ms,
 
 
 static void serviceStationRadio() {
+  station_extensions::serviceRadio();
+  if (station_extensions::txActive) return;
   MeasureDuration timing(loraDuration);
   if (!stationRxReady &&
       loop_metrics::due(millis(), nextStationRxRetryMs)) {
@@ -1481,6 +1561,7 @@ static bool setGpsClientBinding(uint16_t id) {
   if (id == gpsClientId) return true;
   enterManual();
   gpsClientId = id;
+  station_extensions::resetClient();
   gpsClient = ClientState{};
   gpsSequence = command_freshness::RadioSequence{};
   haveClientDiagnostic = false;
@@ -1590,6 +1671,14 @@ static bool clientFixFresh() {
 static bool haveBearingFix() { return clientFixFresh() && gpsFixFresh(); }
 
 static void updateDeclination() {
+  if (station_extensions::phone.enabled) {
+    const time_t utc = static_cast<time_t>(station_extensions::phone.utcMs / 1000.0);
+    struct tm date{}; float year=0;
+    declinationReady = gmtime_r(&utc, &date) &&
+      magnetic_declination::decimalYear(date.tm_year+1900, date.tm_mon+1, date.tm_mday, year) &&
+      magnetic_declination::taiwanDegrees(stationLatitude(), stationLongitude(), year, declinationDeg);
+    return;
+  }
   // TinyGPS date and location share the station receiver; no network/date entry.
   // Recompute at 1 Hz, but revoke immediately when the live inputs become stale.
   if (!gpsFixFresh() || !gps.date.isValid() || gps.date.age() >= 60000) {
@@ -2041,7 +2130,10 @@ static String buildTrackJson() {
 
   String js;
   js.reserve(900);
-  js += F("{\"linked\":");
+  js += F("{\"board\":\""); js += station_board::deviceBoard();
+  js += F("\",\"rf_group\":"); js += String(radio_profile::group);
+  js += F(",\"frequency_mhz\":"); js += String(RF_FREQUENCY, 1);
+  js += F(",\"linked\":");
   js += linked ? F("true") : F("false");
   js += F(",\"data_fresh\":"); js += linked ? F("true") : F("false");
   const uint32_t rfAge = boundRfAgeMs();
@@ -2103,7 +2195,7 @@ static String buildTrackJson() {
   js += F(",\"batt_pct\":");
   js += cachedBatteryMv > 0 ? String(batteryPercent(cachedBatteryMv)) : F("-1");
   js += F(",\"charging\":");
-  js += batteryCharging() ? F("true") : F("false");
+  js += station_board::kHasPmu ? (batteryCharging() ? F("true") : F("false")) : F("null");
   js += F("},\"telemetry\":{\"batt_mv\":");
   js += haveTelemetry ? String(lastTelemetry.batteryMv) : F("0");
   js += F(",\"temp_c\":");
@@ -2778,6 +2870,7 @@ static void handleAxiomSettings() {
 }
 
 static void initWebServer() {
+  station_extensions::registerRoutes();
   const char *axiomHeaders[] = {"Content-Type", "Content-Length"};
   httpServer.collectHeaders(axiomHeaders, 2);
   httpServer.on("/api/axiom", HTTP_GET, []() {
@@ -3431,6 +3524,11 @@ static void serviceClientPowerKey() {
 #if defined(ROLE_STATION)
 // Parse uplink only; the main loop restarts RX after every frame.
 static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtMs) {
+  if (station_extensions::accept(buf, n, receivedAtMs)) {
+    recordPacketEvent((buf[1]&15)==MSG_LINK_TEST ? packet_diagnostics::Kind::LinkTest :
+        packet_diagnostics::Kind::ClientState, receivedAtMs, buf, n);
+    return;
+  }
   using packet_diagnostics::Kind;
   PacketHeader hdr{};
   auto reject = [&](Kind kind) {
@@ -3667,6 +3765,10 @@ void setup() {
 
   // A CPU/USB reset does not remove SD power. Start with a real card power cycle
   // so an interrupted write/format cannot leave the next boot's SPI card busy.
+#if defined(BOARD_HELTEC_V4)
+  sd_log::begin(controlBootId, false);
+  Log.println(F("[SD] unsupported on Heltec V4 (no SD hardware)"));
+#else
   const bool sdWasOff = pmuOnline && pmu.disableBLDO1() && !pmu.isEnableBLDO1();
   delay(100);
   const bool sdPowered = sdWasOff && pmu.setBLDO1Voltage(3300) && pmu.enableBLDO1() &&
@@ -3683,6 +3785,7 @@ void setup() {
     sd_log::text(chunk, n, millis());
   }
   Log.print(F("[SD] BLDO1 3300 mV readback=")); Log.println(sdPowered ? "ok" : "failed");
+#endif
 
   cachedBatteryMv = readBatteryMilliVolts();
   if (batteryCriticallyLow()) showLowBatteryAndPowerOff();  // refuse to boot empty
@@ -3924,7 +4027,7 @@ void loop() {
         rxRestarted = true; stationRxReady = true;
       }
     }
-    if (!rxRestarted) {
+    if (!rxRestarted && !station_extensions::txActive) {
       // Do not clear the software IRQ after restarting RX: preserve a new packet.
       stationRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
       if (!stationRxReady) nextStationRxRetryMs = millis() + 100;

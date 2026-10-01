@@ -107,6 +107,12 @@ uint16_t rxWinFirstSeq = 0, rxWinLastSeq = 0;
 int clientHumBaselinePct = -1;
 command_freshness::RadioSequence gpsSequence;
 packet_diagnostics::Ring<64> packetEvents;
+// New control/probe path is exercised with the actual radio lifecycle in
+// test_station_downlink.py; this fixture retains legacy DATA/TELEMETRY scope.
+namespace station_extensions {
+  bool haveRf = false; uint32_t lastRfMs = 0;
+  bool accept(const uint8_t*, size_t, uint32_t) { return false; }
+}
 namespace sd_log {
   unsigned calls = 0;
   void packet(const packet_diagnostics::Event &e, const uint8_t *raw, size_t length) {

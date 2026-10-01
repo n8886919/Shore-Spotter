@@ -34,8 +34,15 @@
 | 角度數字 | 寫在外圈的圓形把手內；不得恢復右下角數字框或底部水平滑桿 |
 | 提醒 | 畫面底部半透明覆蓋層；見下節 |
 
-資訊頁保留裝置遙測、韌體版本、校正偏移、回到 90°、指南針校正、共用 Servo 最高速度、GPS 預測 α。
+資訊頁保留裝置遙測、韌體版本、校正偏移、回到 90°、指南針校正、共用 Servo 最高速度、GPS 預測 α，及下列 Station／Client 擴充卡。
 沒有另外新增除錯或 SD log 操作 UI；SD 透過 USB 讀取。
+
+### Station 手機位置與 T096 Client
+
+- 資訊頁在既有 Servo／GPS 設定卡後，保留簡短的「Station 位置」卡：顯示目前來源、位置時間及精度；可切回 Station GNSS、由手機更新，或在無法開手機定位頁時手填緯度／經度／精度。手機通常放在 Station 旁邊，故可作為 Station 位置來源。
+- Station 內嵌頁是 HTTP，不能宣稱可直接取得瀏覽器定位。使用者按「用手機更新位置」才開啟 GitHub Pages 的 HTTPS 手機定位頁 `phone-location.html`；它用 `watchPosition` 持續回傳。頁面背景化／鎖屏／被瀏覽器節電時可能停止，Station 只在 RAM 保留最後成功 snapshot 到重新開機，不能說成背景定位保證。
+- 手機定位頁不會上傳位置；它只會回傳給本次開啟它的 Station 頁面。主頁只收固定 `https://n8886919.github.io` origin 與當次開啟頁面的有效位置。return URL 放於 fragment，避免傳到 GitHub HTTP 請求；僅可為 HTTP 私有 IP、localhost 或 `.local` Station 位址；手動輸入仍會走同一個 Station local API。
+- 資訊頁另有「T096 Client 遠端控制」卡。僅在近期收到 T096 `STATE` 時啟用開始、停止為待命、無 GPS 的 LoRa RF 測試及深度休眠請求；送出後要顯示等待 Client 確認，不能把已入隊當成完成。停止後是可由 Web 最遲約 30 秒重新啟動的待命；未接 USB 時待命 12 小時會自動請求深度休眠，USB 供電時抑制。Client 回覆收納請求不證明已經睡眠；深度休眠後需外部喚醒，Web 不能喚醒，充電板上的實際休眠仍未驗證。USB 供電時禁用深度休眠請求並顯示先移除 USB。顯示 Client state、STATE 年齡、命令結果、RF 收／漏包、RSSI、SNR 與最大間隔。離線只顯示未收到近期 STATE，不可假稱待命或深度休眠；開始／停止 Client 也不能切換 Servo／GPS 模式。
 
 ## 雷達與地圖
 
@@ -112,6 +119,7 @@ LoRa 的狀態行顯示 `1.8 FPS · 10s` 形式的最近 10 秒平均；連線�
 
 ## 驗收與部署紀錄
 
+- 2026-10-02 未發行：資訊頁新增 Station 手機位置與 T096 Client 遠端控制入口；HTTPS 手機定位頁與 UI 主機測試待 Station API 合併後驗證。尚未燒錄、未取得手機背景定位或戶外 RF 測試證據。
 - 2026-09-23 未發行：岸端改名 Station，前端讀取 `track.station` 與獨立的 `station_average`；
   RF 活動燈與 DATA 新鮮度分開。七組既有 UI 測試通過，另驗證「只有 TEL、無 GPS DATA」仍顯示
   RF 收件、GPS 保持無定位、FPS 保持 0、過期轉灰，以及舊 API 缺欄位的回退；尚未燒錄／外測。

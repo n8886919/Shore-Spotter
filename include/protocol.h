@@ -13,13 +13,17 @@ constexpr uint16_t ID_BROADCAST = 0xFFFF;
 constexpr uint16_t STATION_ID = 0x0010;
 enum MsgType : uint8_t {
   MSG_DATA = 1, /* 2: removed ACK, 3: reserved */ MSG_TELEMETRY = 4, MSG_DIAGNOSTIC = 5,
-  MSG_GNSS_DIAGNOSTIC = 6
+  MSG_GNSS_DIAGNOSTIC = 6,
+  MSG_CLIENT_CONTROL = 7, MSG_CLIENT_STATE = 8, MSG_LINK_TEST = 9
 };
 constexpr size_t PACKET_HEADER_LEN = 6;
 constexpr size_t DATA_PACKET_LEN = 18;
 constexpr size_t TELEMETRY_PACKET_LEN = 11;
 constexpr size_t DIAGNOSTIC_PACKET_LEN = 17;
 constexpr size_t GNSS_DIAGNOSTIC_PACKET_LEN = 36;
+constexpr size_t CLIENT_CONTROL_PACKET_LEN = 13;
+constexpr size_t CLIENT_STATE_PACKET_LEN = 28;
+constexpr size_t LINK_TEST_PACKET_LEN = 18;
 constexpr size_t MAX_PACKET_LEN = GNSS_DIAGNOSTIC_PACKET_LEN;
 
 struct PacketHeader {
@@ -66,6 +70,9 @@ inline size_t packetLength(uint8_t type) {
     case MSG_TELEMETRY: return TELEMETRY_PACKET_LEN;
     case MSG_DIAGNOSTIC: return DIAGNOSTIC_PACKET_LEN;
     case MSG_GNSS_DIAGNOSTIC: return GNSS_DIAGNOSTIC_PACKET_LEN;
+    case MSG_CLIENT_CONTROL: return CLIENT_CONTROL_PACKET_LEN;
+    case MSG_CLIENT_STATE: return CLIENT_STATE_PACKET_LEN;
+    case MSG_LINK_TEST: return LINK_TEST_PACKET_LEN;
     default: return 0;
   }
 }

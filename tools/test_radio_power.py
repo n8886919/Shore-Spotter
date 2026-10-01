@@ -41,6 +41,8 @@ assert not re.search(r'\bradio\.setOutputPower\s*\(', code), \
 
 cpp = r'''
 #include <cassert>
+#include "radio_profile.h"
+#include "station_board.h"
 #include <atomic>
 #include <cstdint>
 #include <iostream>
@@ -196,7 +198,7 @@ with tempfile.TemporaryDirectory(prefix="shore-radio-power-") as folder:
         subprocess.run([
             "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
             f"-DROLE_{role}", f"-DEXPECTED_DBM={expected_dbm}",
-            str(source), "-o", str(executable),
+            "-I", str(ROOT / "include"), str(source), "-o", str(executable),
         ], check=True)
         subprocess.run([str(executable)], check=True)
 setup = block("void setup(")

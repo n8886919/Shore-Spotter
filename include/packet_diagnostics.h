@@ -5,13 +5,15 @@
 namespace packet_diagnostics {
 // AckError/AckSkipped retain historical event IDs; current firmware never emits them.
 enum class Kind : uint8_t { Data, Telemetry, Diagnostic, Length, Format, Binding, Sequence,
-                            RadioError, AckError, AckSkipped, GnssDiagnostic };
+                            RadioError, AckError, AckSkipped, GnssDiagnostic, ClientState, LinkTest };
 inline const char *name(Kind kind) {
   switch (kind) {
     case Kind::Data: return "data";
     case Kind::Telemetry: return "telemetry";
     case Kind::Diagnostic: return "diagnostic";
     case Kind::GnssDiagnostic: return "gnss_diagnostic";
+    case Kind::ClientState: return "client_state";
+    case Kind::LinkTest: return "link_test";
     case Kind::Length: return "length";
     case Kind::Format: return "format";
     case Kind::Binding: return "binding";

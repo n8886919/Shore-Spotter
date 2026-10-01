@@ -123,6 +123,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
 #cfgSpeed{width:130px;padding:8px;border:1px solid var(--line);border-radius:6px;background:#ffffff;color:var(--fg)}
 #cfgPrediction{width:20px;height:20px;accent-color:var(--acc)}
 .hint3{display:block;margin-top:6px;font-size:11px;color:var(--mut);line-height:1.45}
+.extensionCard h3{margin:0 0 4px;font-size:14px;font-weight:700}
+.extensionActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.extensionActions button{flex:0 1 auto;min-width:112px}
+.extensionFields{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-top:8px}
+.extensionFields input{min-width:0;width:100%;padding:9px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--fg);font-size:13px}
+.extensionStatus{margin-top:8px;font-size:12px;line-height:1.45;color:var(--mut)}
+.extensionStatus b{color:var(--fg)}
+@media(max-width:440px){.extensionFields{grid-template-columns:1fr 1fr}.extensionFields input:last-child{grid-column:span 2}}
 .bar{height:6px;border-radius:3px;background:#d9e3dc;overflow:hidden;margin-top:8px}
 .bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
 .r b{font-variant-numeric:tabular-nums}
@@ -264,6 +272,39 @@ button:disabled{opacity:.4;cursor:not-allowed}
       <span id="predictionHelp" class="hint3">預設關閉。僅影響 GPS 模式。開啟（α＝1）：兩端品質合格且速度有效時，依接收後時間外推；品質差時仍追最新位置。關閉（α＝0）：追蹤最近收到的位置。切換可能改變追蹤目標，共用最高速度維持不變。修改後自動儲存，重開機保留。</span>
       <span id="predictionSaveState" class="hint3" role="status" aria-live="polite">讀取預測設定中</span>
     </div>
+    <div id="stationPositionSettings" class="card extensionCard" style="flex:none">
+      <h3>Station 位置</h3>
+      <div class="r"><span>目前來源</span><b id="stationPositionSource">讀取中</b></div>
+      <div class="r"><span>位置時間</span><b id="stationPositionTime">--</b></div>
+      <div class="r"><span>精度</span><b id="stationPositionAccuracy">--</b></div>
+      <div class="extensionActions">
+        <button id="btnPhonePosition" type="button">用手機更新位置</button>
+        <button id="btnGnssPosition" type="button">改用 Station GNSS</button>
+      </div>
+      <div class="extensionFields">
+        <input id="stationPhoneLat" type="number" inputmode="decimal" step="any" placeholder="緯度 lat" aria-label="Station 手動緯度">
+        <input id="stationPhoneLon" type="number" inputmode="decimal" step="any" placeholder="經度 lon" aria-label="Station 手動經度">
+        <input id="stationPhoneAccuracy" type="number" inputmode="decimal" min="0" step="any" placeholder="精度 m" aria-label="Station 手動精度，公尺">
+      </div>
+      <div class="extensionActions"><button id="btnManualPhonePosition" type="button">送出手動位置</button></div>
+      <p id="stationPositionState" class="extensionStatus" role="status" aria-live="polite">手機定位需從 HTTPS 手機定位頁明確按下開始；關閉或背景化後，Station 保留最後一次有效位置到重新開機。</p>
+    </div>
+    <div id="clientControlSettings" class="card extensionCard" style="flex:none">
+      <h3>T096 Client 遠端控制</h3>
+      <div class="r"><span>組別／頻率</span><b id="clientRadioGroup">--</b></div>
+      <div class="r"><span>配對 Client</span><b id="clientPairedId">--</b></div>
+      <div class="r"><span>裝置狀態</span><b id="clientControlState">讀取中</b></div>
+      <div class="r"><span>距上次 STATE</span><b id="clientControlAge">--</b></div>
+      <div class="r"><span>命令</span><b id="clientControlCommand">--</b></div>
+      <div id="clientControlTest" class="extensionStatus">測試：--</div>
+      <div class="extensionActions">
+        <button id="btnClientStart" type="button" disabled>開始追蹤</button>
+        <button id="btnClientStop" type="button" disabled>停止為待命</button>
+        <button id="btnClientTest" type="button" disabled>LoRa RF 測試</button>
+        <button id="btnClientStore" type="button" disabled>請求深度休眠</button>
+      </div>
+      <p id="clientControlHint" class="extensionStatus" role="status" aria-live="polite">等待 T096 Client 的近期 STATE；離線時不會假稱為待命或深度休眠。</p>
+    </div>
   </section>
 </main>
 
@@ -380,7 +421,7 @@ function httpExchange(job,url,method,read){
     httpReject(job,httpError('讀取逾時；若未恢復請重新整理','TimeoutError'));
   },HTTP_TIMEOUT_MS);
   var options={cache:'no-store'};if(method)options.method=method;if(ac)options.signal=ac.signal;
-  if(method==='POST'&&job.body!==undefined){options.headers={'Content-Type':'application/json'};options.body=job.body;}
+  if(method==='POST'&&job.body!==undefined){options.headers={'Content-Type':job.form?'application/x-www-form-urlencoded;charset=UTF-8':'application/json'};options.body=job.body;}
   // Do not release httpActive on the timeout alone: unsupported/ineffective
   // abort must not let a second fetch overlap a still-running body read.
   return Promise.resolve().then(function(){
@@ -425,14 +466,14 @@ function httpPump(){
       Promise.resolve().then(httpPump);
     });
 }
-function httpRequest(url,priority,key,read,method,intent,body){
+function httpRequest(url,priority,key,read,method,intent,body,form){
   if(key&&httpByKey[key])return httpByKey[key].promise;
   var motion=method==='POST'&&isMotionUrl(url);
   if(motion){intent=intent||controlIntent();if(performance.now()>=intent.deadline)
     return Promise.reject(httpError('控制指令等待逾時，請重試','TimeoutError'));}
   var job={url:url,priority:priority,key:key,read:read||httpJsonBody,method:method,
     motion:motion,order:++httpOrder,deadline:motion?intent.deadline:performance.now()+HTTP_TIMEOUT_MS,
-    context:motion?intent.context:null,body:body};
+    context:motion?intent.context:null,body:body,form:!!form};
   job.promise=new Promise(function(resolve,reject){job.resolve=resolve;job.reject=reject;});
   job.timer=setTimeout(function(){
     job.cancelled=true;if(job.abort)job.abort.abort();
@@ -1267,6 +1308,121 @@ function drawMap(d,dist){
   x.fillText('© OpenStreetMap',W-6,12);x.textAlign='left';
 }
 
+// ---- Station phone position + remote T096 Client controls -----------------
+// The station itself is HTTP, so browser geolocation is deliberately delegated
+// to the HTTPS helper.  It sends no location anywhere except this open station
+// page via postMessage; the Station POST below remains on the local Wi-Fi link.
+var PHONE_HELPER_ORIGIN='https://n8886919.github.io';
+var PHONE_HELPER_URL=PHONE_HELPER_ORIGIN+'/Shore-Spotter/phone-location.html';
+var phonePopup=null,stationPositionBusy=false,queuedPhonePosition=null;
+var clientControlBusy=false;
+function formEncode(values){
+  return Object.keys(values).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(values[k]);}).join('&');
+}
+function formPost(url,values,key){
+  return httpRequest(url,0,key||null,null,'POST',null,formEncode(values),true);
+}
+function validStationReturnUrl(url){
+  try{
+    var u=new URL(url),h=u.hostname.toLowerCase();
+    return u.protocol==='http:'&&(h==='localhost'||/^(?:10|127)(?:\.\d{1,3}){3}$/.test(h)||
+      /^192\.168(?:\.\d{1,3}){2}$/.test(h)||/^172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}$/.test(h)||/\.local$/.test(h));
+  }catch(_e){return false;}
+}
+function validPhonePosition(p){
+  return p&&p.type==='shore-spotter-phone-position-v1'&&Number.isFinite(p.lat)&&Number.isFinite(p.lon)&&
+    Number.isFinite(p.accuracy)&&Number.isFinite(p.timestamp)&&p.lat>=-90&&p.lat<=90&&p.lon>=-180&&p.lon<=180&&
+    p.accuracy>=0&&p.accuracy<=100000&&p.timestamp>=1577836800000&&p.timestamp<=Date.now()+300000;
+}
+function phoneLocationMessage(event,popup){
+  if(event.origin!==PHONE_HELPER_ORIGIN||event.source!==popup||!validPhonePosition(event.data))return null;
+  return {lat:event.data.lat,lon:event.data.lon,accuracy:event.data.accuracy,timestamp:Math.round(event.data.timestamp)};
+}
+function positionTime(ms){
+  if(!Number.isFinite(ms)||ms<=0)return '--';
+  var d=new Date(ms);return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function renderStationPosition(j){
+  j=j||{};var valid=!!j.valid,source=j.source==='phone'?'手機':'Station GNSS';
+  $('stationPositionSource').textContent=valid?source:'無有效位置';
+  $('stationPositionTime').textContent=valid?positionTime(j.updated_utc_ms):'--';
+  $('stationPositionAccuracy').textContent=valid&&Number.isFinite(j.accuracy_m)?j.accuracy_m.toFixed(1)+' m':'--';
+  if(j.helper_url&&/^https:\/\/n8886919\.github\.io\/Shore-Spotter\/phone-location\.html(?:$|[?#])/.test(j.helper_url))PHONE_HELPER_URL=j.helper_url;
+}
+function refreshStationPosition(){
+  return httpRequest('/api/station/position',2,'station-position').then(renderStationPosition).catch(function(){
+    $('stationPositionSource').textContent='讀取失敗';
+  });
+}
+function submitStationPhonePosition(p,quiet){
+  if(!validPhonePosition({type:'shore-spotter-phone-position-v1',lat:p.lat,lon:p.lon,accuracy:p.accuracy,timestamp:p.timestamp})){
+    if(!quiet)toast('位置資料無效');return Promise.resolve();
+  }
+  if(stationPositionBusy){queuedPhonePosition=p;return Promise.resolve();}
+  stationPositionBusy=true;$('stationPositionState').textContent='正在更新 Station 位置…';
+  return formPost('/api/station/position',{action:'phone',lat:p.lat,lon:p.lon,accuracy:p.accuracy,timestamp:Math.round(p.timestamp)},'station-phone')
+    .then(function(j){renderStationPosition(j);$('stationPositionState').textContent='已更新；手機定位頁背景化或關閉後，Station 會保留此最後位置到重新開機。';})
+    .catch(function(e){$('stationPositionState').textContent='位置未確認：'+(e.message||'連線失敗');if(!quiet)toast(e.message||'位置未確認');})
+    .finally(function(){stationPositionBusy=false;var next=queuedPhonePosition;queuedPhonePosition=null;if(next)submitStationPhonePosition(next,true);});
+}
+function openPhoneLocationHelper(){
+  var returnUrl=window.location.href;
+  if(!validStationReturnUrl(returnUrl)){toast('目前 Station 位址不是允許的私有 IP 或 .local');return;}
+  phonePopup=window.open(PHONE_HELPER_URL+'#return='+encodeURIComponent(returnUrl),'shoreSpotterPhoneLocation','popup,width=420,height=620');
+  if(!phonePopup)toast('瀏覽器封鎖手機定位頁，請允許 popup 後重試');
+  else $('stationPositionState').textContent='已開啟 HTTPS 手機定位頁；在頁內明確按「開始持續定位」。';
+}
+window.addEventListener('message',function(event){
+  var p=phoneLocationMessage(event,phonePopup);
+  if(p)submitStationPhonePosition(p,true);
+});
+$('btnPhonePosition').onclick=openPhoneLocationHelper;
+$('btnManualPhonePosition').onclick=function(){
+  var latText=$('stationPhoneLat').value.trim(),lonText=$('stationPhoneLon').value.trim(),accuracyText=$('stationPhoneAccuracy').value.trim();
+  if(!latText||!lonText||!accuracyText){toast('請完整填寫緯度、經度與精度');return;}
+  var p={lat:Number(latText),lon:Number(lonText),accuracy:Number(accuracyText),timestamp:Date.now()};
+  submitStationPhonePosition(p,false);
+};
+$('btnGnssPosition').onclick=function(){
+  $('btnGnssPosition').disabled=true;$('stationPositionState').textContent='正在切回 Station GNSS…';
+  formPost('/api/station/position',{action:'gnss'},'station-gnss').then(function(j){renderStationPosition(j);$('stationPositionState').textContent='已要求改用 Station GNSS。';})
+    .catch(function(e){$('stationPositionState').textContent='切換未確認：'+(e.message||'連線失敗');toast(e.message||'切換未確認');})
+    .finally(function(){$('btnGnssPosition').disabled=false;});
+};
+function clientStateText(state){return ({ready:'停止待命（網頁最遲約 30 秒可啟動）',tracking:'追蹤中',test:'RF 測試中',storage:'已回覆收納請求',unknown:'未知／未確認'})[state]||'未知／未確認';}
+function clientCommandText(command){return ({idle:'無待命令',pending:'等待 Client 確認',confirmed:'Client 已確認',timeout:'等待逾時',error:'命令錯誤'})[command]||'--';}
+function renderClientControl(j){
+  j=j||{};var supported=j.supported===true,command=clientCommandText(j.command);
+  $('clientRadioGroup').textContent=Number.isFinite(j.frequency_mhz)?(j.rf_group===0?'A':j.rf_group===1?'B':'?')+' / '+j.frequency_mhz.toFixed(1)+' MHz':'--';
+  $('clientPairedId').textContent=j.client_id>0?Number(j.client_id).toString(16).toUpperCase().padStart(4,'0'):'未配對';
+  $('clientControlState').textContent=supported?clientStateText(j.state):'未收到近期 STATE';
+  $('clientControlAge').textContent=supported&&Number.isFinite(j.age_ms)?(j.age_ms/1000).toFixed(1)+' s':'--';
+  $('clientControlCommand').textContent=(j.state==='storage'&&j.command==='confirmed'?'已回覆收納請求':command)+(j.command_id!=null?' #'+j.command_id:'');
+  var test=Number.isFinite(j.test_received)?'RF：收 '+j.test_received+'／漏 '+(Number.isFinite(j.test_missing)?j.test_missing:'--')+
+    '，'+(Number.isFinite(j.test_rssi)?j.test_rssi.toFixed(0)+' dBm':'--')+'，'+(Number.isFinite(j.test_snr)?j.test_snr.toFixed(1)+' dB':'--')+
+    '，最大間隔 '+(Number.isFinite(j.test_max_gap_ms)?j.test_max_gap_ms+' ms':'--'):'RF：尚無測試結果';
+  $('clientControlTest').textContent=test;
+  $('clientControlHint').textContent=supported?(j.last_error?'最後錯誤：'+j.last_error:
+    j.command==='pending'?'命令已入隊，等待 T096 STATE 確認。':
+    j.charging===true?'USB 供電中：待命 12 小時自動深度休眠會抑制；請先移除 USB 才能請求深度休眠。':
+    j.state==='storage'?'Client 已回覆收納請求；這不證明已進入深度休眠。深度休眠後須由外部喚醒，網頁不能喚醒。':
+    '停止後為待命，網頁最遲約 30 秒可重新啟動；未接 USB 時待命 12 小時會自動請求深度休眠。開始／停止 Client 不會切換 Servo GPS 模式。'):
+    '尚未收到近期 T096 STATE；離線不會被標示為待命或深度休眠。';
+  ['btnClientStart','btnClientStop','btnClientTest'].forEach(function(id){$(id).disabled=!supported||clientControlBusy;});
+  $('btnClientStore').disabled=!supported||clientControlBusy||j.charging===true;
+}
+function refreshClientControl(){return httpRequest('/api/client/control',2,'client-control').then(renderClientControl).catch(function(){renderClientControl({supported:false});});}
+function sendClientControl(action){
+  if(clientControlBusy)return;clientControlBusy=true;renderClientControl({supported:true,state:'unknown',command:'pending'});
+  return formPost('/api/client/control',{action:action},'client-command').then(function(j){renderClientControl(j);})
+    .catch(function(e){toast(e.message||'Client 命令未確認');$('clientControlHint').textContent='命令未確認：'+(e.message||'連線失敗');})
+    .finally(function(){clientControlBusy=false;refreshClientControl();});
+}
+$('btnClientStart').onclick=function(){sendClientControl('start');};
+$('btnClientStop').onclick=function(){sendClientControl('stop');};
+$('btnClientTest').onclick=function(){sendClientControl('test');};
+$('btnClientStore').onclick=function(){sendClientControl('store');};
+
 showPage('radar');
 refresh();refreshStatus();
 // ---- camera compass calibration ----
@@ -1325,8 +1481,12 @@ $('btnCompassCal').onclick=function(){
 };
 
 refreshStatus();          // 提醒不要等到第一個 3 秒週期才出現
+refreshStationPosition();
+refreshClientControl();
 setInterval(refresh,1000);
 setInterval(refreshStatus,3000);
+setInterval(refreshStationPosition,3000);
+setInterval(refreshClientControl,3000);
 loadSpeedSetting();
 loadPredictionSetting();
 </script>

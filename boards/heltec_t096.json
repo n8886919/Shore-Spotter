@@ -1,0 +1,21 @@
+{
+  "build": {
+    "core": "nRF5",
+    "cpu": "cortex-m4",
+    "arduino": {"ldscript": "nrf52840_s140_v6.ld"},
+    "bsp": {"name": "adafruit"},
+    "bootloader": {"settings_addr": "0xFF000"},
+    "extra_flags": "-DNRF52840_XXAA -DHT_N5262G",
+    "f_cpu": "64000000L",
+    "hwids": [["0x239A", "0x8071"]],
+    "mcu": "nrf52840",
+    "softdevice": {"sd_flags": "-DS140", "sd_name": "s140", "sd_version": "6.1.1", "sd_fwid": "0x00B6"},
+    "usb_product": "HT-n5262G",
+    "variant": "HT-n5262G"
+  },
+  "frameworks": ["arduino"],
+  "name": "Heltec Mesh Node T096 (HT-n5262G)",
+  "upload": {"maximum_ram_size": 248832, "maximum_size": 815104, "protocol": "nrfutil", "protocols": ["nrfutil"], "use_1200bps_touch": true, "wait_for_upload_port": true},
+  "url": "https://github.com/HelTecAutomation/Heltec_nRF52",
+  "vendor": "Heltec"
+}

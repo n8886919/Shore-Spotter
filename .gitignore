@@ -13,3 +13,6 @@ docs/scan-report.md
 # Python bytecode (tools/)
 __pycache__/
 *.pyc
+
+# USB identities and pairing on this machine
+config/devices.local.json
