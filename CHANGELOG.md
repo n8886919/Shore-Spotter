@@ -18,7 +18,8 @@
   Client 待命每 30 秒回報並開 800 ms 接收窗，運行／測試每 5 秒；待命 12 小時進 SystemOFF，
   USB 供電時抑制，拔除 USB 重新計時；追蹤不因 RF 失聯自動休眠。深眠不能由 Web 喚醒。
   手機定位由 HTTPS 定位頁回傳 Station HTTP 視窗，含 origin/source 檢查、時間與精度；
-  Station RAM 保留最後成功位置直到重開機。原追蹤／Servo 模式不因開始或停止 Client 改變。
+  Station RAM 保留最後成功位置直到重開機；HTTPS helper 已部署並核對 HTTP 200／內容一致。
+  原追蹤／Servo 模式不因開始或停止 Client 改變。
   Heltec 的 0 dBm 為 SX1262 drive 設定，不能當天線端功率；充電板未接、待機電流與水上效果未驗證。
   V4 原廠 16 MiB 已備份，device digest 比對成功。V4 app-only 燒錄 hash 驗證、T096 application DFU 完成；
   修正 nRF UARTE 未 begin 就 end 的開機卡住，以及 FEM 延遲使舊時間 underflow、RX 窗立即關閉。

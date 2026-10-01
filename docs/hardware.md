@@ -262,8 +262,9 @@ Station 每次初始化／復原開啟 SX1262 boosted RX gain，較高接收耗�
 
 ## Heltec V4 Station 與 T096 Client（2026-10-02，USB 桌上部署）
 
-新增兩個獨立 RF pair：A 為既有 T-Beam Supreme Station／Client（group 0、923.2 MHz），B 為
-Heltec V4 Station／T096 Client（group 1、923.8 MHz）。兩組均用 BW 125 kHz、SF10、CR 4/5、Sync
+配置兩個獨立 RF group：A 保留原本的 923.2 MHz（group 0），B 是目前接線的
+Heltec V4 Station／T096 Client（group 1、923.8 MHz）。兩塊 LilyGO 預定都當 Station；
+未連線，尚未改寫實體角色，A 的 Client 待實際硬體登記配對。兩組均用 BW 125 kHz、SF10、CR 4/5、Sync
 Word `0x12`，但不會掃描、協商或互通。兩塊 Heltec 已燒錄並完成桌上雙向命令；LilyGO 未連接，僅 build，沒有外測。
 
 Heltec V4 Station 使用 ESP32-S3 N16R2（16 MB flash、內嵌 2 MB QSPI PSRAM，不是 R8/OPI）。

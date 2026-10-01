@@ -32,7 +32,7 @@ Station SD 記錄與 USB 狀態、開始／停止、列檔／讀回及檔案格�
 
 | 參數 | 值 |
 |---|---|
-| 中心頻率 | group A（既有 T-Beam pair）923.2 MHz；group B（Heltec V4 Station + T096 Client）923.8 MHz；不掃描／不協商 |
+| 中心頻率 | group A（保留原頻道，設備待登記）923.2 MHz；group B（Heltec V4 Station + T096 Client）923.8 MHz；不掃描／不協商 |
 | 頻寬 | 125 kHz |
 | Spreading Factor | SF10 |
 | Coding Rate | 4/5 |
