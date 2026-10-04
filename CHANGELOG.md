@@ -21,6 +21,8 @@
   最終120.270秒觀測219個probe、缺號0、最大間隔1,014 ms；最低heap70,220 bytes、兩端boot不變。
   雲端回讀164 records且isPartial=false；並行仍有2次4秒HTTP逾時。Client stop確認後回Ready，Servo維持manual 90°。
   這是USB近距離桌上結果，非水上距離／手機熱點或續航驗證；細節見docs/lilygo-t096-2026-10-04.md。
+  當晚另以既有API將同一ingest key設到V4，確認NVS儲存／連續上傳與雙Station cloud分組回讀；
+  V4未重新燒錄／重啟，表單仍維持9/22移除後的設計。兩站當下皆無Client STATE，不把cloud成功當成RF證據。
 
 - **2026-10-02 Heltec 夜間修正／無 SD 記錄（桌上部署）**：修正 T096 Vext/GNSS 共用上游供電，
   加入 UC6580 專用暫存設定及回讀；R6 Build3700 實測 RMC/GGA/epoch 2.00 Hz，室內無 fix。

@@ -47,9 +47,14 @@ python3 tools/read_diagnostic_log.py --port <確認過的Station USB port> erase
 會產出 `.bin` 原frames、`.ndjson` 解碼與 `.manifest.json` 完整性報告。工具不透過DTR／RTS重置ESP32，
 frame／傳輸CRC、分boot序號、drops及解碼錯誤均保留。下載成功不等於全程RF零丟包。
 
-**Axiom目前未啟用**：新V4沒有ingest token；本機只有既有query token，沒有把它冒充裝置上傳金鑰。
-舊Axiom非阻塞上傳程式與HTTP設定入口保留；取得原Station ingest設定或新的限dataset ingest token後，
-可依 [axiom-log.md](axiom-log.md) 啟用，並以成功上傳計數／雲端讀回驗證。Flash目前負責離線保留，沒有新增Flash自動補傳雲端。
+10/2部署時V4尚無ingest token，Axiom未啟用。**10/4已啟用並驗證**：從原LilyGO Station取回的ingest key
+透過既有`POST /api/axiom`設到V4，NVS非同步儲存完成、連續HTTP 200且cloud回讀成功。
+未重新燒錄或重啟V4；query token仍只供查詢，不拿來上傳。網頁Axiom表單於9/22已移除，設定API保留。
+Station身分以`node_id`區分（V4 `ED2C`／60716，LilyGO `584C`／22604），`boot_id`區分開機場次，
+`bound_client_id`為綁定Client（F035／61493），不代表當時收到Client資料。
+雙站皆採B923.8 MHz，同一Client每次開機只有第一個有效命令的Station能控制，另一台可接收上行。
+兩台各自連上有網際網路的Wi-Fi／手機熱點才能上傳；Flash沒有自動補傳雲端。
+驗證細節見[10/4筆記](lilygo-t096-2026-10-04.md)。
 
 ## 本輪修正與已知限制
 
