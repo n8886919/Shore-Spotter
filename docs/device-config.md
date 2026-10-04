@@ -15,10 +15,14 @@
 - Station 的 `hostname`：建議填 `auto`，由完整 Wi-Fi MAC 產生固定名稱。
   也可自訂如 `shore-b`，不填 `.local`；1–31 字元（ESP32 網路函式庫上限），只接受小寫英數與中間的連字號，
   以英文字母開頭。`auto` 為保留值；Client 不使用此欄位。
-- Station 的 `client`：配對 Client 的 **device name**。兩端必須在同一 RF group；一個 Client 不可被兩個 Station 配對。
+- Station 的 `client`：接收 Client 的 **device name**。兩端必須在同一 RF group；多個 Station profile 可指向同一 Client，方便替換開發板與比較接收。
+
+T096 每次開機由第一個有效命令的 Station 取得該次控制權，其他 Station 仍可接收上行，
+但不能同時控制。切換控制 Station 時先重啟 T096，再從要使用的 Station 下命令；
+只修改 manifest 或 Station 的接收綁定不會轉移 Client 既有的控制權。
 
 範例以 Heltec V4 Station 與 T096 Client 同在 B 示範，USB serial 是待替換的 placeholder。
-真實序號只保存在被忽略的本機 manifest；未連線的 LILYGO 與第二個 Client 待確認硬體後加入。
+真實序號只保存在被忽略的本機 manifest；新增裝置前須先核對硬體與USB身份。
 
 ```sh
 python3 tools/device_config.py list

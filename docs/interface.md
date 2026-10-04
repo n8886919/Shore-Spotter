@@ -882,10 +882,12 @@ POST 必須是 **`Content-Type: application/json`、有 Content-Length 的 JSON 
 - 無效設定／格式 `400`；前一筆設定尚未完成 `409`；背景 task 無法啟動 `503`。
 - GET 狀態：`enabled`、`dataset`、`region`、`token_set`、`state`、`saving`、`in_flight`、
   `boot_id`、`save_id`、`queue_depth`／`queue_capacity`、`sample_ms`／`flush_ms`、`sample_bytes`、
+  `heap_free`／`heap_largest`、`min_upload_heap`／`min_upload_block`、`psram_total`、`batch_in_psram`、
   `sent_samples`、`dropped_samples`、`failed_samples`、`sent_bytes`、`requests`、
   `capture_last_us`／`capture_max_us`、`request_ms`、`worker_stack_free_min`、
   `retry_in_ms`、`http_status`、`transport_error`、`last_success_age_ms`。
   計數自 Station 本次開機起累計；`sent_bytes` 僅計整批確認成功的 payload bytes。
+  heap／PSRAM大小與門檻單位為bytes；`batch_in_psram`只表示當下batch已配置於PSRAM，停用後回false。
 - `state` 為 `disabled`、`saving`、`idle`、`waiting_wifi`、`waiting_time`、`low_memory`、
   `waiting_batch`、`uploading`、`backoff`、`rejected`、`storage_error`、`task_error`、`ota_paused`。
   關閉後 `in_flight=true` 表示先前已開始的請求仍在完成中。

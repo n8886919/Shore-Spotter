@@ -9,6 +9,19 @@
 
 ## 未發行
 
+- **2026-10-04 LilyGO Station 共用 T096（桌上部署）**：device manifest 允許多個 Station profile
+  指向同一 Client，保留同 RF group 與 USB／名稱唯一性檢查。T096 每次開機只接受第一個 Station
+  控制的規則不變；切換控制 Station 需重啟 Client。原板有效 NVS 中的 Axiom ingest 設定已取回至本機私人檔案。
+  LilyGO 原約117 KB閒置 heap，無法同時負擔32 KiB batch與原100 KiB TLS門檻。
+  單純降低門檻的實測最低 heap 只有5,496 bytes，因此改啟用 Supreme 的 QSPI PSRAM，
+  batch 優先配置於 PSRAM；未有可用 PSRAM 時保留內部 RAM fallback。
+  TLS前保留原100 KiB總量／48 KiB連續區塊與48 KiB採樣門檻，buffer／queue容量不變。
+  Axiom狀態新增free／largest heap、門檻、PSRAM容量及batch位置。
+  device config 7 tests、Axiom／debug主機回歸與LilyGO／V4 build通過；僅LilyGO實體部署、ROM hash驗證。
+  最終120.270秒觀測219個probe、缺號0、最大間隔1,014 ms；最低heap70,220 bytes、兩端boot不變。
+  雲端回讀164 records且isPartial=false；並行仍有2次4秒HTTP逾時。Client stop確認後回Ready，Servo維持manual 90°。
+  這是USB近距離桌上結果，非水上距離／手機熱點或續航驗證；細節見docs/lilygo-t096-2026-10-04.md。
+
 - **2026-10-02 Heltec 夜間修正／無 SD 記錄（桌上部署）**：修正 T096 Vext/GNSS 共用上游供電，
   加入 UC6580 專用暫存設定及回讀；R6 Build3700 實測 RMC/GGA/epoch 2.00 Hz，室內無 fix。
   STATE 接收窗改為 85 ms listen、有 preamble/header 才延長至最多800 ms；Station 20 ms 後下行，

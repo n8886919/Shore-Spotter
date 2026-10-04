@@ -30,7 +30,7 @@ const char *stateName(State s) {
 }
 struct Shared {
   Config config, pending;
-  bool saving = false, inFlight = false;
+  bool saving = false, inFlight = false, batchInPsram = false;
   uint32_t generation = 1, queued = 0, dropped = 0, sent = 0, failed = 0;
   uint32_t requests = 0, captureLastUs = 0, captureMaxUs = 0, bootId = 0;
   uint64_t bytes = 0;
@@ -122,6 +122,7 @@ void worker(void *) {
       history.valid = false;
       if (ntpStarted) { esp_sntp_stop(); ntpStarted = false; }
       discardQueued(); free(batch); batch = nullptr;
+      portENTER_CRITICAL(&mux); shared.batchInPsram = false; portEXIT_CRITICAL(&mux);
       vTaskDelay(pdMS_TO_TICKS(100)); continue;
     }
     if (WiFi.status() != WL_CONNECTED) { state(State::Wifi); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
@@ -136,14 +137,24 @@ void worker(void *) {
       portEXIT_CRITICAL(&mux);
       vTaskDelay(pdMS_TO_TICKS(100)); continue;
     }
-    // Heap checks happen before batch allocation AND TLS. Wi-Fi and control must
-    // retain headroom even if the free space is fragmented.
-    if (ESP.getFreeHeap() < kMinUploadHeap + (batch ? 0 : kBatchBytes) ||
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 48 * 1024) {
+    if (!batch) {
+      batch = static_cast<char *>(heap_caps_malloc(kBatchBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+      const bool external = batch != nullptr;
+      // Boards without usable PSRAM retain the original guarded internal path.
+      if (!batch && ESP.getFreeHeap() >= kMinUploadHeap + kBatchBytes &&
+          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= kMinUploadBlock)
+        batch = static_cast<char *>(malloc(kBatchBytes));
+      if (!batch) {
+        state(State::Memory); nextUpload = millis() + kFlushMs; vTaskDelay(pdMS_TO_TICKS(100)); continue;
+      }
+      portENTER_CRITICAL(&mux); shared.batchInPsram = external; portEXIT_CRITICAL(&mux);
+    }
+    // Check remaining internal RAM after allocation, including when a board
+    // falls back to internal RAM. TLS must leave room for Wi-Fi and Web work.
+    if (ESP.getFreeHeap() < kMinUploadHeap ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < kMinUploadBlock) {
       state(State::Memory); nextUpload = millis() + kFlushMs; vTaskDelay(pdMS_TO_TICKS(100)); continue;
     }
-    if (!batch) batch = static_cast<char *>(malloc(kBatchBytes));
-    if (!batch) { state(State::Memory); nextUpload = millis() + kFlushMs; continue; }
     const uint32_t batchGeneration = generation.load();
     uint32_t dropped, maxCapture;
     portENTER_CRITICAL(&mux); dropped = shared.dropped; maxCapture = shared.captureMaxUs; portEXIT_CRITICAL(&mux);
@@ -287,6 +298,8 @@ String statusJson() {
   Shared s;
   portENTER_CRITICAL(&mux); s = shared; portEXIT_CRITICAL(&mux);
   const uint32_t now = millis();
+  const uint32_t heapFree = ESP.getFreeHeap();
+  const uint32_t heapLargest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   const char *status = s.saving ? "saving" : otaPaused.load() ? "ota_paused" :
       !s.config.enabled && s.state != State::Storage && s.state != State::Task ? "disabled" : stateName(s.state);
   String js; js.reserve(1000);
@@ -301,6 +314,11 @@ String statusJson() {
   number("boot_id", s.bootId); number("save_id", s.saveId); number("queue_depth", samples ? uxQueueMessagesWaiting(samples) : 0);
   number("queue_capacity", kQueueSamples); number("sample_ms", kSampleMs); number("flush_ms", kFlushMs);
   number("sample_bytes", sizeof(Sample));
+  number("heap_free", heapFree); number("heap_largest", heapLargest);
+  number("min_upload_heap", kMinUploadHeap);
+  number("min_upload_block", kMinUploadBlock);
+  number("psram_total", ESP.getPsramSize());
+  js += ",\"batch_in_psram\":"; js += s.batchInPsram ? "true" : "false";
   number("sent_samples", s.sent); number("dropped_samples", s.dropped); number("failed_samples", s.failed);
   js += ",\"sent_bytes\":"; js += String(static_cast<unsigned long long>(s.bytes));
   number("requests", s.requests);

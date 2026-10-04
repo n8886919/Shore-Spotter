@@ -123,6 +123,17 @@ class DeviceConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "distinct"):
                 load_rf_profile.load_groups(path)
 
+    def test_multiple_station_profiles_can_reference_same_client(self):
+        devices = copy.deepcopy(DEVICES["devices"])
+        devices.append(dict(devices[0], name="station-lilygo", board="lilygo-tbeam",
+                            environment="tbeam-station", usb_serial="LILYGO", hostname="auto"))
+        parsed = self._load_data(devices, GROUPS)
+        self.assertEqual(len(parsed), 3)
+        self.assertEqual(parsed["station-lilygo"]["client"], parsed["station-v4"]["client"])
+        devices[-1]["rf_group"] = "A"
+        with self.assertRaisesRegex(device_config.ConfigError, "不同 RF group"):
+            self._load_data(devices, GROUPS)
+
     def test_selected_device_overrides_default_group_and_checks_environment(self):
         devices = copy.deepcopy(DEVICES)
         devices["devices"][1]["radio_id"] = 0x1234

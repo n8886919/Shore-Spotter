@@ -16,7 +16,10 @@
 namespace axiom_log {
 constexpr uint32_t kSampleMs = 1000, kFlushMs = 5000, kMaxAgeMs = 15000;
 constexpr size_t kQueueSamples = 8, kBatchSamples = 5, kBatchBytes = 32768;
-constexpr uint32_t kMinUploadHeap = 100 * 1024, kMinCaptureHeap = 48 * 1024;
+// Prefer PSRAM for the upload batch; preserve the original internal-RAM
+// headroom for TLS, Wi-Fi and concurrent Web requests.
+constexpr uint32_t kMinUploadHeap = 100 * 1024, kMinUploadBlock = 48 * 1024;
+constexpr uint32_t kMinCaptureHeap = 48 * 1024;
 constexpr uint32_t kConfigMagic = 0x41584c31;
 struct Config {
   uint32_t magic = kConfigMagic;

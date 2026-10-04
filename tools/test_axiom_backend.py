@@ -41,9 +41,9 @@ struct String : std::string {
   template<class T, typename std::enable_if<std::is_integral<T>::value,int>::type=0>
   explicit String(T v) : std::string(std::to_string(v)) {}
 };
-uint32_t clockMs=0, heapFree=300000; bool wifi=true, clockReady=true;
+uint32_t clockMs=0, heapFree=300000, largestOverride=0; bool wifi=true, clockReady=true, psramAvailable=false;
 uint32_t millis(){return clockMs;} uint32_t micros(){return clockMs*1000;}
-struct Esp {uint32_t getFreeHeap(){return heapFree;}} ESP;
+struct Esp {uint32_t getFreeHeap(){return heapFree;} uint32_t getPsramSize(){return psramAvailable?8*1024*1024:0;}} ESP;
 struct Wifi {int status(){return wifi?3:0;}} WiFi;
 constexpr int WL_CONNECTED=3;
 int ntpCalls=0;
@@ -53,8 +53,12 @@ time_t fakeTime(time_t*){return clockReady?1760000000+clockMs/1000:0;}
 int fakeGetTime(timeval *v,void*){v->tv_sec=fakeTime(nullptr);v->tv_usec=(clockMs%1000)*1000;return 0;}
 #define time fakeTime
 #define gettimeofday fakeGetTime
-constexpr int MALLOC_CAP_INTERNAL=1,MALLOC_CAP_8BIT=2;
-uint32_t heap_caps_get_largest_free_block(int){return heapFree;}
+constexpr int MALLOC_CAP_INTERNAL=1,MALLOC_CAP_8BIT=2,MALLOC_CAP_SPIRAM=4;
+uint32_t heap_caps_get_largest_free_block(int){return largestOverride?largestOverride:heapFree;}
+void *heap_caps_malloc(size_t bytes,int caps){
+ assert(bytes==32768&&caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+ return psramAvailable?malloc(bytes):nullptr;
+}
 using BaseType_t=int; using TaskHandle_t=void*; using portMUX_TYPE=int;
 constexpr int portMUX_INITIALIZER_UNLOCKED=0,pdTRUE=1,pdPASS=1;
 #define portENTER_CRITICAL(x) ((void)(x))
@@ -121,7 +125,7 @@ std::function<void(axiom_log::Sample&)> decorateSample;
 void reset(){
  if(samples)vQueueDelete(samples);samples=nullptr;task=nullptr;
  shared=Shared{};collecting=false;otaPaused=false;generation=1;nextSampleMs=0;sampleId=0;
- clockMs=0;heapFree=300000;wifi=true;clockReady=true;ntpCalls=0;performCalls=0;
+ clockMs=0;heapFree=300000;largestOverride=0;wifi=true;clockReady=true;psramAvailable=false;ntpCalls=0;performCalls=0;
  httpCode=200;transportError=0;responseBody.clear();retryAfter.clear();lastPayload.clear();
  duringUpload={};onDelay={};decorateSample={};savedNvs.clear();saveFail=false;
 }
@@ -323,6 +327,18 @@ int main(){
  // Missing time / low heap / OTA / loop overload do not start any HTTP upload.
  reset();assert(configure(enabled()));clockReady=false;
  runUntil([]{return clockMs>6000;});assert(performCalls==0&&ntpCalls==1);
+ // At the observed LilyGO idle heap, PSRAM permits repeated uploads while
+ // preserving conservative internal headroom. Internal fallback must wait.
+ reset();assert(configure(enabled()));heapFree=117468;psramAvailable=true;
+ duringUpload=[]{assert(shared.batchInPsram);heapFree=149656;largestOverride=55284;};
+ runUntil([]{return performCalls>=2;},15000);assert(shared.sent>0);
+ assert(!shared.batchInPsram); // disable frees the external batch too
+ reset();assert(configure(enabled()));heapFree=117468;
+ runUntil([]{return clockMs>6000;});assert(performCalls==0&&shared.state==State::Memory);
+ for(bool external:{false,true}){
+  reset();assert(configure(enabled()));psramAvailable=external;largestOverride=24*1024;
+  runUntil([]{return clockMs>6000;});assert(performCalls==0&&shared.state==State::Memory);
+ }
  reset();assert(configure(enabled()));heapFree=80000;
  runUntil([]{return clockMs>6000;});assert(performCalls==0&&shared.state==State::Memory);
  reset();assert(configure(enabled()));pauseForOta(true);

@@ -92,7 +92,7 @@ def load_devices(path: Path, groups: dict[str, dict]) -> dict[str, dict]:
         if "radio_id" in device and (type(device["radio_id"]) is not int or not 1 <= device["radio_id"] < 65535):
             raise ConfigError(f"{name}: radio_id 必須是 1..65534 的整數（來自裝置開機資訊）")
         devices[name] = device
-    paired_clients: dict[str, str] = {}
+    paired_clients: set[str] = set()
     for station in (item for item in devices.values() if item["role"] == "station"):
         client_name = station["client"]
         client = devices.get(client_name)
@@ -100,9 +100,10 @@ def load_devices(path: Path, groups: dict[str, dict]) -> dict[str, dict]:
             raise ConfigError(f"{station['name']}: 找不到配對 Client {client_name!r}")
         if client["rf_group"] != station["rf_group"]:
             raise ConfigError(f"{station['name']} 與 {client_name} 使用不同 RF group")
-        if client_name in paired_clients:
-            raise ConfigError(f"Client {client_name} 被兩個 Station 配對：{paired_clients[client_name]}、{station['name']}")
-        paired_clients[client_name] = station["name"]
+        # Multiple receiver profiles may observe the same Client. Control
+        # ownership is enforced by the Client's first requester per boot,
+        # not by removing alternative Station profiles from this manifest.
+        paired_clients.add(client_name)
     for client in (item for item in devices.values() if item["role"] == "client"):
         if client["name"] not in paired_clients:
             raise ConfigError(f"Client {client['name']} 沒有配對 Station")

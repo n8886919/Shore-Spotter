@@ -111,7 +111,16 @@ DATA 只送最新有效定位，失效只通知一次，不重傳舊定位。
   不寫 flash log、不補傳整場斷線資料。啟用後可能帶上原有 64 筆 ring 的近期封包事件，
   不會占用／推進瀏覽器的事件游標。
 - RF IRQ 待處理、前次 loop 超過 20 ms、採樣時 heap 低於 48 KiB 時跳過採樣。
-  TLS 啟動前至少保留 100 KiB free heap 與 48 KiB 最大連續區塊；batch 尚未配置時另加 32 KiB。
+  TLS 啟動前至少保留100 KiB內部 free heap與48 KiB最大連續區塊。
+  32 KiB batch優先配置於PSRAM；不可用時，先確認內部heap能容納batch及上述TLS餘裕，
+  配置後再次檢查剩餘heap。停用／OTA時釋放batch。
+  T-Beam Supreme Station環境啟用原廠QSPI PSRAM設定；Client環境不變。
+  原LilyGO約117 KB閒置heap，內部batch加TLS門檻會讓上傳永遠停在low_memory；
+  調低門檻雖可上傳，並行實測最低heap只有5,496 bytes，因此未採用該做法。
+  `GET /api/axiom`另回報`heap_free`、`heap_largest`、`min_upload_heap`、`min_upload_block`、
+  `psram_total`及`batch_in_psram`；batch位置為當下配置狀態，停用後回false。
+  heap欄位在HTTP組裝前讀取，仍受當下HTTP／Wi-Fi等配置影響。
+
 - HTTP 網路操作 timeout 設 3 秒；DNS／TLS／多次網路操作的總時間可能更長，但不在控制 loop 等待。
   失敗批次丟棄，後續批次按 5、10、20…300 秒退避；429／503 的 `Retry-After` 秒數或
   HTTP-date 會延長等待，最大 24 小時。400／401／403／404／413／422 停止上傳，需修正後重新儲存。

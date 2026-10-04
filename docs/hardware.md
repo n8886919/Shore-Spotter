@@ -19,6 +19,10 @@ ALDO4 仍供 GPS；ALDO1 供 OLED／BME280，不因 OLED 睡眠而斷電。
 這是寄存器設定驗證，不代表已量測實際電壓／RF 功率。
 電源通道來源：[LILYGO 官方 T-Beam Supreme 文件](https://wiki.lilygo.cc/products/t-beam-series/t-beam-supreme/)。
 
+T-Beam Supreme Station 使用8 MB QSPI PSRAM，`tbeam-station`明確設定`qio_qspi`及`BOARD_HAS_PSRAM`；
+本輪584C實機`GET /api/axiom`的`psram_total`為8,388,608 bytes，upload batch配置於PSRAM。
+Client環境不變；記憶體配置與驗證見[本輪筆記](lilygo-t096-2026-10-04.md)。
+
 ---
 
 # LILYGO T-Beam Supreme - V3.0 / L76K / 915mhz / SX1262
