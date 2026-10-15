@@ -3,6 +3,8 @@
 #include <cmath>
 #include "servo_motion.h"
 #include "servo_profile.h"
+#include "servo_controller.h"
+#include <string>
 #include "command_freshness.h"
 #include "control_cadence.h"
 using servo_motion::Controller;
@@ -38,16 +40,16 @@ void test_latest_target_reversal_and_no_deadband() {
   c.target(170);c.target(120);c.target(0);c.tickUs(60100);
   TEST_ASSERT_DOUBLE_WITHIN(1e-9,before-.3,c.position());TEST_ASSERT_EQUAL(0,c.requested());
   TEST_ASSERT_EQUAL(-30,c.velocity());
-  TEST_ASSERT_FALSE(c.target(NAN));TEST_ASSERT_FALSE(c.target(-1));TEST_ASSERT_FALSE(c.target(181));
+  TEST_ASSERT_FALSE(c.target(NAN));TEST_ASSERT_FALSE(c.target(-1));TEST_ASSERT_FALSE(c.target(360));
 }
 void test_live_speed_change_preserves_target_and_position() {
-  Controller c;c.target(180);c.tickUs(50000);const double before=c.position();
+  Controller c(90);c.target(180);c.tickUs(50000);const double before=c.position();
   TEST_ASSERT_TRUE(c.setSpeed(10));TEST_ASSERT_EQUAL(180,c.requested());TEST_ASSERT_EQUAL(before,c.position());
   c.tickUs(60000);TEST_ASSERT_DOUBLE_WITHIN(1e-9,before+.1,c.position());
   c.setSpeed(90);c.tickUs(70000);TEST_ASSERT_DOUBLE_WITHIN(1e-9,before+1,c.position());
 }
 void test_stall_hold_and_fault_never_bank_time() {
-  Controller c;c.target(180);c.tickUs(1000000);TEST_ASSERT_EQUAL(91.5,c.position());
+  Controller c(90);c.target(180);c.tickUs(1000000);TEST_ASSERT_EQUAL(91.5,c.position());
   c.tickUs(1000250);TEST_ASSERT_DOUBLE_WITHIN(1e-8,91.5075,c.position());
   c.holdUs(1000250);c.tickUs(4000250);TEST_ASSERT_FALSE(c.moving());
   c.target(0);c.tickUs(4000500);TEST_ASSERT_DOUBLE_WITHIN(1e-8,91.5,c.position());
@@ -55,12 +57,40 @@ void test_stall_hold_and_fault_never_bank_time() {
   TEST_ASSERT_TRUE(c.faulted());c.initializeUs(90,6000000);TEST_ASSERT_FALSE(c.faulted());
 }
 void test_pwm_precision_and_gps_independent_cadence() {
-  TEST_ASSERT_EQUAL(2728,servo_profile::dutyForAngle(0));TEST_ASSERT_EQUAL(8183,servo_profile::dutyForAngle(90));
-  TEST_ASSERT_EQUAL(13639,servo_profile::dutyForAngle(180));
-  TEST_ASSERT_NOT_EQUAL(servo_profile::dutyForAngle(90),servo_profile::dutyForAngle(90.02));
+  TEST_ASSERT_EQUAL(500,servo_profile::pulseForAngleMdeg(0));
+  TEST_ASSERT_EQUAL(1500,servo_profile::pulseForAngleMdeg(179500));
+  TEST_ASSERT_EQUAL(2500,servo_profile::pulseForAngleMdeg(359000));
+  TEST_ASSERT_EQUAL(500,servo_profile::pulseForAngleMdeg(-1));
+  TEST_ASSERT_EQUAL(2500,servo_profile::pulseForAngleMdeg(360000));
   control_cadence::GpsCadence gps;const uint32_t t=UINT32_MAX-25;
   TEST_ASSERT_FALSE(gps.poll(t));TEST_ASSERT_FALSE(gps.poll(t+49));TEST_ASSERT_TRUE(gps.poll(t+50));
   TEST_ASSERT_FALSE(gps.poll(t+50));TEST_ASSERT_TRUE(gps.poll(t+160));TEST_ASSERT_FALSE(gps.poll(t+161));
+}
+void test_uart_output_coalesces_busy_latest_target_and_preserves_final_command() {
+  struct Serial {
+    int capacity=9; bool shortWrite=false; std::string bytes;
+    int availableForWrite(){return capacity;}
+    size_t write(const uint8_t *p,size_t n){bytes.assign(reinterpret_cast<const char*>(p),n);return shortWrite?n-1:n;}
+  } serial;
+  servo_controller::Output output;
+  using R=servo_controller::Result;
+  const uint32_t start=UINT32_MAX-10;
+  TEST_ASSERT_TRUE(output.send(serial,179.5,start)==R::Sent);
+  TEST_ASSERT_EQUAL_STRING("#00P1500!",serial.bytes.c_str());
+  TEST_ASSERT_TRUE(output.send(serial,179.5,start+20)==R::Idle);
+  TEST_ASSERT_TRUE(output.send(serial,180,start+1)==R::Deferred);
+  serial.capacity=8;
+  TEST_ASSERT_TRUE(output.send(serial,190,start+20)==R::Deferred);
+  TEST_ASSERT_EQUAL(1,output.sent());TEST_ASSERT_EQUAL(1,output.deferred());
+  serial.capacity=9;
+  TEST_ASSERT_TRUE(output.send(serial,200,start+21)==R::Deferred);
+  TEST_ASSERT_TRUE(output.send(serial,359,start+40)==R::Sent);
+  TEST_ASSERT_EQUAL_STRING("#00P2500!",serial.bytes.c_str());
+  TEST_ASSERT_EQUAL(2,output.sent());
+  TEST_ASSERT_TRUE(output.send(serial,360,start+60)==R::Fault);
+  serial.shortWrite=true;
+  TEST_ASSERT_TRUE(output.send(serial,0,start+60)==R::Fault);
+  TEST_ASSERT_EQUAL(1,output.errors());TEST_ASSERT_EQUAL(2500,output.pulse());
 }
 void test_http_generation_sequence_age_and_wrap() {
   command_freshness::HttpGate gate;gate.reset(55);
@@ -87,6 +117,7 @@ int main(int,char**){UNITY_BEGIN();
  RUN_TEST(test_live_speed_change_preserves_target_and_position);
  RUN_TEST(test_stall_hold_and_fault_never_bank_time);
  RUN_TEST(test_pwm_precision_and_gps_independent_cadence);
+ RUN_TEST(test_uart_output_coalesces_busy_latest_target_and_preserves_final_command);
  RUN_TEST(test_http_generation_sequence_age_and_wrap);
  RUN_TEST(test_radio_sequence_and_reboot_candidates);
  return UNITY_END();}

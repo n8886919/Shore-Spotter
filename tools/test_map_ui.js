@@ -24,7 +24,7 @@ const {createPage,settle}=require('./test_motion_ui.js');
  canvas.arc=(x,y,r)=>{if(r===6)markers.push({x,y});};
  Object.assign(p.track.station,{fix:true,lat:24,lon:121});
  Object.assign(p.track.client,{fix:true,lat:24,lon:121.001});
- Object.assign(p.track.servo,{mount_offset_deg:90,declination_deg:0,calibrated:true});
+ Object.assign(p.track.servo,{mount_offset_deg:269.5,declination_deg:0,calibrated:true});
  p.c.last.track=p.track;p.c.viewMode='radar';p.c.drawRadar(p.track,100);
  const {cx,cy}=p.c.radarGeometry();
  assert(Math.abs(labels.E.x-cx)<1e-8&&labels.E.y<cy);

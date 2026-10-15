@@ -111,6 +111,19 @@ int main() {
   nowMs = 1030; station_extensions::serviceRadio();
   assert(!station_extensions::txActive && !txFrontend && stationRxReady);
   assert(station_extensions::link.lastError == RADIOLIB_ERR_TX_TIMEOUT && radio.finishCalls == 1);
+  reset();state(77,0,0,client_control::State::Tracking);
+  assert(station_extensions::link.request(client_control::Action::Stop,nowMs,nodeId));
+  assert(station_extensions::link.pending());
+  const uint16_t stopId=station_extensions::link.commandId;
+  nowMs=10;state(77,0,0,client_control::State::Tracking);
+  nowMs=30;station_extensions::serviceRadio();
+  assert(client_control::decodeCommand(radio.sent,radio.sentLength,h,c));
+  assert(c.action==client_control::Action::Stop);
+  stationRadioIrq=true;nowMs=31;station_extensions::serviceRadio();
+  assert(station_extensions::link.pending()); // TX alone never confirms.
+  nowMs=530;state(77,nodeId,stopId,client_control::State::Ready);
+  assert(!station_extensions::link.pending()&&station_extensions::link.command[0]=='c');
+  nowMs=1030;
   // The service itself never advances time or waits; all guard decisions use nowMs.
   assert(nowMs == 1030);
   puts("PASS actual STATE rendezvous, 20ms guard, 40ms expiry, TX failure/timeout, and RX recovery");

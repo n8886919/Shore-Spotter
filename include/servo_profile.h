@@ -6,17 +6,17 @@
 
 namespace servo_profile {
 
-constexpr char kName[] = "gx42-180-v1";
+constexpr char kName[] = "youmi-359-uart-v1";
 constexpr int32_t kHardMinimumMdeg = 0;
-constexpr int32_t kHardMaximumMdeg = 180000;
+constexpr int32_t kHardMaximumMdeg = 359000;
 // These are deliberately explicit even though they currently equal the known
-// 180-degree endpoints. Narrow them after supervised mechanical commissioning.
+// 359-degree endpoints. Narrow them after supervised mechanical commissioning.
 constexpr int32_t kSoftMinimumMdeg = 0;
-constexpr int32_t kSoftMaximumMdeg = 180000;
-constexpr int32_t kHomeMdeg = 90000;
+constexpr int32_t kSoftMaximumMdeg = 359000;
+constexpr int32_t kHomeMdeg = 179500;
 constexpr uint16_t kPulseMinimumUs = 500;
 constexpr uint16_t kPulseMaximumUs = 2500;
-constexpr uint16_t kPwmHz = 333;
+constexpr uint16_t kPwmHz = 50;
 constexpr uint8_t kPwmResolutionBits = 14;
 constexpr uint32_t kPwmMaxDuty = (1u << kPwmResolutionBits) - 1;
 constexpr uint16_t kWatchdogMs = 250;
@@ -65,9 +65,9 @@ inline uint16_t pulseForAngleMdeg(int32_t angleMdeg) {
 // Callers validate finite angles; clamp the fixed mechanical command range.
 inline uint32_t dutyForAngle(double angleDeg) {
   if(angleDeg<0)angleDeg=0;
-  if(angleDeg>180)angleDeg=180;
+  if(angleDeg>359)angleDeg=359;
   const double pulseUs=kPulseMinimumUs+
-      angleDeg*(kPulseMaximumUs-kPulseMinimumUs)/180.0;
+      angleDeg*(kPulseMaximumUs-kPulseMinimumUs)/359.0;
   return static_cast<uint32_t>(std::lround(pulseUs*kPwmHz*kPwmMaxDuty/1000000.0));
 }
 

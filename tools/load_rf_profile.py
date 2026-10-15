@@ -38,8 +38,11 @@ def load_groups(path: Path = PROFILE_PATH) -> dict[str, dict]:
             raise ValueError("RF group ids must be unique integers 0..255")
         if type(frequency) not in (int, float) or not math.isfinite(frequency) or not 863 <= frequency <= 928 or frequency in frequencies:
             raise ValueError("RF groups need distinct fixed frequencies within 863..928 MHz hardware range")
-        if (group.get("spreading_factor"), group.get("bandwidth_khz"), group.get("coding_rate"), str(group.get("sync_word")).lower()) != (10, 125, 5, "0x12"):
-            raise ValueError("This firmware profile uses SF10/BW125/CR5/sync 0x12")
+        sf = group.get("spreading_factor")
+        if type(sf) is not int or sf not in (9, 10):
+            raise ValueError("Validated RF profiles require integer SF9 or SF10")
+        if (group.get("bandwidth_khz"), group.get("coding_rate"), str(group.get("sync_word")).lower()) != (125, 5, "0x12"):
+            raise ValueError("This firmware profile uses BW125/CR5/sync 0x12")
         groups[name] = group
         ids.add(group_id)
         frequencies.add(frequency)
@@ -84,13 +87,14 @@ def apply_profile(env) -> None:
     if group_name not in groups:
         raise ValueError("custom_rf_group must name a group from config/rf-groups.json")
     existing = env.get("CPPDEFINES", [])
-    for name in ("SHORE_RF_GROUP", "SHORE_RF_FREQUENCY_MHZ"):
+    for name in ("SHORE_RF_GROUP", "SHORE_RF_FREQUENCY_MHZ", "SHORE_RF_SPREADING_FACTOR"):
         if _has_define(existing, name):
             raise ValueError(f"{name} is already defined; remove the hard-coded build flag")
     group = groups[group_name]
     env.Append(CPPDEFINES=[
         ("SHORE_RF_GROUP", str(group["id"])),
         ("SHORE_RF_FREQUENCY_MHZ", f"{float(group['frequency_mhz'])}f"),
+        ("SHORE_RF_SPREADING_FACTOR", str(group["spreading_factor"])),
     ])
 
 

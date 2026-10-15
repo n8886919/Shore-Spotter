@@ -5,6 +5,7 @@
 #include "diagnostic_store.h"
 #endif
 #include "firmware_version.h"
+#include "radio_profile.h"
 #include <SD.h>
 #include <SPI.h>
 #include <sd_diskio.h>
@@ -267,8 +268,8 @@ bool openPart() {
   portEXIT_CRITICAL(&mux);
   const int n = snprintf(encoded, sizeof(encoded),
       "{\"kind\":\"session\",\"app\":\"shore-spotter\",\"role\":\"%s\",\"schema_version\":1,\"boot_id\":%lu,\"firmware\":\"%s\","
-      "\"build\":\"%s %s\",\"protocol\":%u,\"sf\":10,\"bw_khz\":125,\"cr\":5,"
-      "\"frequency_mhz\":923.2,\"clock\":\"boot_ms; _time null until UTC available\","
+      "\"build\":\"%s %s\",\"protocol\":%u,\"sf\":%d,\"bw_khz\":%.0f,\"cr\":%d,"
+      "\"frequency_mhz\":%.3f,\"clock\":\"boot_ms; _time null until UTC available\","
       "\"packet_queue\":%u,\"sync_ms\":%lu,\"overwrite\":true,\"gps_gate\":%s,\"profile\":\"%s\"}\n",
 #if defined(ROLE_CLIENT)
       "client",
@@ -276,6 +277,8 @@ bool openPart() {
       "station",
 #endif
       (unsigned long)bootId, SHORE_SPOTTER_VERSION, __DATE__, __TIME__, PROTO_VERSION,
+      radio_profile::spreadingFactor, double(radio_profile::bandwidthKhz),
+      radio_profile::codingRate, double(radio_profile::frequencyMhz),
       unsigned(kPacketQueue), (unsigned long)kSyncMs,
 #if defined(CLIENT_TRIP_LOG)
       "false", "client-trip-1hz");

@@ -28,10 +28,13 @@
 #include "client_cadence.h"
 #include "async_lora_tx.h"
 #include "sd_log.h"
+#include "sdk_log.h"
 #include "station_board.h"
 #include "radio_profile.h"
 #include "diagnostic_store.h"
 #include "station_flash.h"
+#include "rf_reception.h"
+#include "t096_power.h"
 #if defined(FIELD_DIAGNOSTIC)
 #include "field_diagnostic.h"
 #endif
@@ -56,7 +59,7 @@
 #include <esp_heap_caps.h>
 #include "axiom_log.h"
 #include "alerts.h"    // 現場提醒的門檻與分級
-#include "uart_servo_mode.h"  // UART input, shared with GPS tracking
+#include "servo_controller.h"
 #include "servo_motion.h"
 #include "control_cadence.h"
 #include "station_position.h"
@@ -148,23 +151,8 @@ constexpr uint16_t BATT_PRESENT_MIN_MV = 2500; // ignore implausible/no-battery 
 constexpr uint32_t CLIENT_SCREEN_WAKE_MS = 10000;
 
 #if defined(ROLE_STATION)
-// Camera servo pin comes from the selected Station hardware profile.
-constexpr int SERVO_PIN = station_board::kServoPin;
-constexpr uint32_t SERVO_PWM_HZ = servo_profile::kPwmHz;
-// ESP32-S3 LEDC timers support at most 14-bit resolution.  A 16-bit attach is
-// rejected by Arduino-ESP32 3.x, leaving the pin with no PWM output.
-constexpr uint8_t SERVO_PWM_RES_BITS = servo_profile::kPwmResolutionBits;
-constexpr int SERVO_LEDC_CH = 0;     // LEDC channel (arduino-esp32 2.x)
-// Camera tracking loop. The servo is refreshed far faster than position packets
-// arrive (2 Hz RF, independently of GNSS epochs): between fresh packets the
-// surfer's position is dead-reckoned from the
-// velocity vector already carried in PositionPayload, so the camera pans
-// continuously instead of stepping once per received packet — and keeps panning
-// through a dropped packet instead of freezing for a whole second.
+// GPS target scheduling remains independent of the bounded 9600-baud output.
 constexpr uint32_t TRACK_UPDATE_MS = control_cadence::kGpsPeriodMs;
-constexpr float DR_MIN_SPEED_CMS = 30.0f;     // below this the GPS course is noise
-constexpr float DR_MAX_AGE_S = 2.0f;          // source + RF + receive age ceiling
-constexpr const char *GPS_PREDICTION_KEY = "gpspred5";
 
 #endif
 
@@ -448,6 +436,7 @@ struct ClientState {
   int humidityBaselinePct = -1;
 };
 static ClientState gpsClient;
+static rf_reception::Latest rfReception;
 // Existing formatters use aliases to the one active record.
 static DecodedData &lastData = gpsClient.position;
 static bool &havePkt = gpsClient.havePosition;
@@ -483,21 +472,21 @@ static float    cachedPktRate   = 0.0f;  // pkts/s averaged over ~60 s
 // reference is entered from the compass on the lens, and kept only in RAM.
 using TrackMode = tracking_policy::Mode;
 static TrackMode trackMode = TrackMode::Manual;
-static TrackMode lastTrackingMode = TrackMode::Uart;
+static TrackMode lastTrackingMode = TrackMode::Gps;
 static tracking_policy::Source controlSource = tracking_policy::Source::Hold;
 static tracking_policy::Selector sourceSelector;
-static float servoAngleDeg = 90.0f;
-static float servoTargetDeg = 90.0f;
-static float mountOffsetDeg = 90.0f;
+static float servoAngleDeg = 179.5f;
+static float servoTargetDeg = 179.5f;
+static float mountOffsetDeg = 269.5f;
 static float declinationDeg = 0.0f;
 static bool declinationReady = false;
 static bool mountCalibrated = true; // explicit default: 90-degree reference is usable
-static bool gpsPredictionEnabled = false;  // alpha = 1; false selects alpha = 0
 static bool gpsFinishingTarget = false;
 static station_position::Average stationAverage;
-static bool servoPwmReady = false;
+static bool servoOutputReady = false;
 static control_cadence::GpsCadence gpsCadence;
-static uint32_t servoLastDuty=UINT32_MAX;
+static HardwareSerial servoSerial(2);
+static servo_controller::Output servoOutput;
 static uint8_t oledNextRow=8;
 static uint32_t oledFrames=0;
 static servo_motion::Controller servoMotion;
@@ -505,7 +494,6 @@ static command_freshness::HttpGate commandGate;
 static command_freshness::RadioSequence gpsSequence;
 static uint32_t controlBootId = 0;
 static uint32_t rejectedMotionCommands = 0, rejectedGpsSequence = 0;
-static uart_servo_mode::Endpoint uartServoMode;
 
 struct MetricsClock {
   static uint32_t micros() { return ::micros(); }
@@ -1076,6 +1064,15 @@ static uint32_t boundRfAgeMs() {
   if (station_extensions::haveRf) age = std::min(age, uint32_t(now-station_extensions::lastRfMs));
   return age;
 }
+static uint16_t boundClientBatteryMv() {
+  const uint32_t now = millis();
+  const auto &link = station_extensions::link;
+  const uint32_t stateAge = link.have ? uint32_t(now-link.receivedMs) : UINT32_MAX;
+  const uint32_t telAge = haveTelemetry ? uint32_t(now-lastTelemetryRxMs) : UINT32_MAX;
+  if (stateAge < 90000 && link.status.batteryMv &&
+      (telAge >= 90000 || !lastTelemetry.batteryMv || stateAge <= telAge)) return link.status.batteryMv;
+  return telAge < 90000 ? lastTelemetry.batteryMv : 0;
+}
 static SigLevel stationGpsState() {
   bool  fix  = gpsFixFresh();
   int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
@@ -1107,12 +1104,11 @@ static void loadStationSettings() {
   double speed=servo_motion::kDefaultSpeed;
   servo_motion::decodeSpeed(prefs.getUInt(servo_motion::kSpeedKey,0),speed);
   servoMotion.setSpeed(speed);
-  const uint32_t prediction = prefs.getUInt(GPS_PREDICTION_KEY, 0);
-  gpsPredictionEnabled = prediction <= 1 ? prediction == 1 : false;
+
   // Old acceleration/jerk/deadband profiles are deliberately ignored.
-  // Old mount* and mag* NVS keys are ignored. Boot uses a valid 90-degree
-  // reference; manual calibration replaces it in RAM until the next boot.
-  mountOffsetDeg = 90.0f;
+  // Old mount* and mag* NVS keys are ignored. Boot uses a default 90-degree
+  // compass heading at the commanded 179.5-degree centre; calibration is RAM-only.
+  mountOffsetDeg = 269.5f;
   mountCalibrated = true;
 }
 
@@ -1532,7 +1528,7 @@ static void serviceStationRadio() {
 static const char *trackModeStr(TrackMode mode) {
   switch (mode) {
     case TrackMode::Gps: return "gps";
-    case TrackMode::Uart: return "uart";
+    case TrackMode::Uart: return "removed";
     case TrackMode::Paused: return "paused";
     default: return "manual";
   }
@@ -1543,29 +1539,15 @@ static bool gpsModeAvailable();
 static void updateTracking();
 
 static bool setServoAngle(float deg) {
-  if (!servoPwmReady || !isfinite(deg)) return false;
-  deg = constrain(deg, 0.0f, 180.0f);
-  const uint32_t duty = servo_profile::dutyForAngle(deg);
-  if (duty == servoLastDuty) {
-    servoAngleDeg = deg;
-    return true;  // PWM hardware keeps sending the existing pulse
-  }
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  if (!ledcWrite(SERVO_PIN, duty)) {
-    servoPwmReady = false;
-    return false;
-  }
-#else
-  ledcWrite(SERVO_LEDC_CH, duty);
-#endif
-  servoLastDuty = duty;
-  servoAngleDeg = deg;
-  return true;
+  if (!servoOutputReady || !isfinite(deg)) return false;
+  const auto result = servoOutput.send(servoSerial, deg, millis());
+  if (result == servo_controller::Result::Fault) { servoOutputReady = false; return false; }
+  if (result != servo_controller::Result::Deferred) servoAngleDeg = deg;
+  return true; // TX/idle only; not a hardware ACK or physical angle
 }
 
 static void enterManual() {
   gpsFinishingTarget = false;
-  uartServoMode.leave();
   sourceSelector.reset();
   controlSource = tracking_policy::Source::Hold;
   servoTargetDeg = servoAngleDeg;
@@ -1582,6 +1564,7 @@ static bool setGpsClientBinding(uint16_t id) {
   gpsClientId = id;
   station_extensions::resetClient();
   gpsClient = ClientState{};
+  rfReception = rf_reception::Latest{};
   gpsSequence = command_freshness::RadioSequence{};
   haveClientDiagnostic = false;
   clientGnssDiagnostic = gnss_diagnostics::Latest{};
@@ -1598,11 +1581,10 @@ static bool setGpsClientBinding(uint16_t id) {
 static void serviceControl() {
   const uint32_t now = millis();
   controlGap.observe(now);
-  if (trackMode == TrackMode::Uart) uartServoMode.poll();
   const auto next = sourceSelector.update(
       now, trackMode,
-      servoPwmReady && trackMode == TrackMode::Gps && gpsTrackingUsable(),
-      servoPwmReady && trackMode == TrackMode::Uart && uartServoMode.ready());
+      servoOutputReady && trackMode == TrackMode::Gps && gpsTrackingUsable(),
+      false);
   if (next != controlSource) {
     const bool finishGps = trackMode == TrackMode::Gps &&
         controlSource == tracking_policy::Source::Gps && next == tracking_policy::Source::Hold;
@@ -1612,27 +1594,24 @@ static void serviceControl() {
     Log.print(F("[SERVO] source -> "));
     Log.println(tracking_policy::sourceName(controlSource));
   }
-  if (trackMode == TrackMode::Uart && controlSource == tracking_policy::Source::Uart) {
-    if (!servoMotion.target(uartServoMode.targetMdeg() / 1000.0)) servoMotion.holdUs(micros());
-  }
-  const bool permitted = servoPwmReady && (trackMode == TrackMode::Manual ||
+  const bool permitted = servoOutputReady && (trackMode == TrackMode::Manual ||
       controlSource == tracking_policy::Source::Gps ||
-      (trackMode == TrackMode::Gps && gpsFinishingTarget) ||
-      controlSource == tracking_policy::Source::Uart);
+      (trackMode == TrackMode::Gps && gpsFinishingTarget));
   if (!permitted) servoMotion.holdUs(micros());
-  if (gpsFinishingTarget && !servoMotion.moving()) gpsFinishingTarget = false;
+  if (gpsFinishingTarget && !servoMotion.moving() &&
+      servoOutput.pulse() == servo_profile::pulseForAngleMdeg(lround(servoMotion.requested()*1000))) gpsFinishingTarget = false;
   if(gpsCadence.poll(now)) updateTracking();
   const uint32_t nowUs = micros();
   {
     MeasureDuration timing(motionDuration);
-    if (permitted && servoMotion.tickUs(nowUs) &&
-        !setServoAngle(static_cast<float>(servoMotion.position()))) {
-      servoMotion.initializeUs(servoAngleDeg, nowUs);  // retain last successful PWM command
+    if (permitted) servoMotion.tickUs(nowUs);
+    if (permitted && !setServoAngle(static_cast<float>(servoMotion.position()))) {
+      servoMotion.initializeUs(servoAngleDeg, nowUs);  // retain last successfully sent command
       servoMotion.faultUs(nowUs);
     }
   }
   servoTargetDeg = static_cast<float>(servoMotion.requested());
-  if ((!servoPwmReady || servoMotion.faulted()) && trackMode != TrackMode::Paused) {
+  if ((!servoOutputReady || servoMotion.faulted()) && trackMode != TrackMode::Paused) {
     enterManual();
     trackMode = TrackMode::Paused;
     Log.println(F("[SERVO] control fault; motion paused"));
@@ -1640,43 +1619,24 @@ static void serviceControl() {
 }
 
 static bool initServo() {
-  // Diagnostics must distinguish reboots even if PWM initialization fails.
 #if defined(FIELD_DIAGNOSTIC)
   controlBootId = diagnosticBootId;
 #else
   controlBootId = esp_random();
 #endif
-  if (controlBootId == 0) controlBootId = 1;
+  if (!controlBootId) controlBootId = 1;
   commandGate.reset(esp_random());
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  servoPwmReady = ledcAttach(SERVO_PIN, SERVO_PWM_HZ, SERVO_PWM_RES_BITS);
-#else
-  servoPwmReady = ledcSetup(SERVO_LEDC_CH, SERVO_PWM_HZ,
-                            SERVO_PWM_RES_BITS) > 0;
-  if (servoPwmReady) ledcAttachPin(SERVO_PIN, SERVO_LEDC_CH);
-#endif
-  if (!servoPwmReady) {
-    Log.print(F("[SERVO] ERROR: LEDC attach failed on IO"));
-    Log.println(SERVO_PIN);
-    return false;
-  }
-  // First PWM command: physical position is unknown without servo feedback.
-  // Runtime slew starts from this commanded home; boot motion cannot be bounded.
-  if (!setServoAngle(90.0f)) {
-    servoPwmReady = false;
-    Log.println(F("[SERVO] ERROR: boot centre PWM write failed"));
-    return false;
+  // TX-only. GPIO44 is not attached; controller TX level/ACK is undocumented.
+  servoSerial.setTxBufferSize(128);
+  servoSerial.begin(servo_controller::kBaud, SERIAL_8N1, -1, station_board::kServoTxPin);
+  servoOutputReady = bool(servoSerial);
+  if (!servoOutputReady || !setServoAngle(servo_profile::kHomeMdeg / 1000.0f)) {
+    servoOutputReady = false; Log.println(F("[SERVO] UART output initialization failed")); return false;
   }
   servoTargetDeg = servoAngleDeg;
   servoMotion.initializeUs(servoAngleDeg, micros());
-  Log.print(F("[SERVO] LEDC ready on IO"));
-  Log.print(SERVO_PIN);
-  Log.print(F(" at "));
-  Log.print(SERVO_PWM_HZ);
-  Log.print(F(" Hz/"));
-  Log.print(SERVO_PWM_RES_BITS);
-  Log.print(F(" bit; centred at 90 deg"));
-  Log.println();
+  Log.printf("[SERVO] Youmi TX GPIO%d 9600 8N1 M%u home 179.5; no feedback\n",
+             station_board::kServoTxPin, servoOutput.channel());
   return true;
 }
 
@@ -1715,41 +1675,11 @@ static void updateDeclination() {
           stationLatitude(), stationLongitude(), year, declinationDeg);
 }
 
-// Valid current positions permit tracking; poor quality only blocks prediction.
+// Track only the most recently received valid position; no prediction feature.
 static bool gpsModeAvailable() { return haveBearingFix(); }
-static bool gpsPredictionAllowed() {
-  gnss_snapshot::Snapshot sample;
-  return gpsModeAvailable() && gnssCollector.sample(millis(), sample) &&
-      tracking_policy::predictionQuality(sample.satellites, sample.hdop) &&
-      tracking_policy::predictionQuality(lastData.satellites,
-                                        lastData.hdop10 == 255 ? NAN : lastData.hdop10 / 10.0f) &&
-      lastData.velocityValid && lastData.speedCmS != UINT16_MAX &&
-      lastData.speedCmS >= DR_MIN_SPEED_CMS && lastData.courseDeg10 < 3600;
-}
+
 static bool gpsTrackingUsable() {
   return mountCalibrated && declinationReady && gpsModeAvailable();
-}
-
-// Project the last received client position forward along its velocity vector.
-//
-// Optional prediction uses only elapsed time since RX, not unverified GNSS age.
-// It starts from the received position and is blocked by poor/unknown quality.
-static void predictClientPos(double &lat, double &lon) {
-  lat = lastData.lat;
-  lon = lastData.lon;
-  if (!gpsPredictionEnabled || !gpsPredictionAllowed()) return;
-  float ageS = clientSampleAgeMs() / 1000.0f;
-  if (ageS <= 0.0f) return;
-  // Cap the projection instead of letting it run away when the link drops: the
-  // camera coasts for ~2 packets, then holds.
-  if (ageS > DR_MAX_AGE_S) ageS = DR_MAX_AGE_S;
-  float distM = (lastData.speedCmS / 100.0f) * ageS;
-  float courseRad = radians(lastData.courseDeg10 / 10.0f);
-  double cosLat = cos(radians(lat));
-  lat += (distM * cos(courseRad)) / 111320.0;
-  if (fabs(cosLat) > 1e-6) {
-    lon += (distM * sin(courseRad)) / (111320.0 * cosLat);
-  }
 }
 
 // Recompute the GPS target; the elapsed-time Servo output is independent.
@@ -1760,17 +1690,15 @@ static void updateTracking() {
     return;
   }
 
-  double clientLat, clientLon;
-  predictClientPos(clientLat, clientLon);
+  const double clientLat = lastData.lat, clientLon = lastData.lon;
   float bearing = (float)computeBearing(stationLatitude(), stationLongitude(),
                                         clientLat, clientLon);
   float target = normalize360(magnetic_declination::trueBearing(
       mountOffsetDeg, declinationDeg) - bearing);
-  if (target > 270.0f) target -= 360.0f;  // wrap small negatives toward 0
-  servoTargetDeg = constrain(target,0.0f,180.0f);
+  servoTargetDeg = constrain(target,0.0f,359.0f);
   if (!servoMotion.target(servoTargetDeg)) servoMotion.holdUs(micros());
 
-  // Only the common motion backend can write PWM.
+  // Only the common motion backend can transmit Servo commands.
   static uint32_t lastTrackLogMs = 0;
   if (millis() - lastTrackLogMs >= 3000) {
     lastTrackLogMs = millis();
@@ -1797,13 +1725,12 @@ static float lockMountOffset(float compassBearing, float servoDeg) {
 // Only the explicitly selected source is enabled. Switching closes old UART
 // input before opening a new UART session; calibration remains in RAM.
 static bool selectTrackingMode(TrackMode mode) {
-  if (!servoPwmReady || (mode != TrackMode::Gps && mode != TrackMode::Uart)) return false;
+  if (!servoOutputReady || mode != TrackMode::Gps) return false;
   if (mode == TrackMode::Gps && !gpsModeAvailable()) return false;
   if (trackMode == mode) return true;
   enterManual();
   trackMode = mode;
   lastTrackingMode = mode;
-  if (mode == TrackMode::Uart) uartServoMode.enter(commandGate.epoch());
 
   Log.print(F("[TRACK] mode -> "));
   Log.println(trackModeStr(mode));
@@ -1907,7 +1834,7 @@ static void renderStationDisplay() {
                         ((millis() - lastRxMs) <= LINK_WARN_MS);
   bool selectedTelemetry = haveTelemetry && (lastTelemetry.srcId == selectedId) && millis()-lastTelemetryRxMs < 90000;
 
-  SigLevel loraState = selectedOnline ? loraSignal(lastRssi, lastSnr) : SIG_MISS;
+  SigLevel loraState = rfReception.signal(millis());
   SigLevel cGps;
   if (!selectedOnline) {
     cGps = SIG_MISS;
@@ -1973,8 +1900,9 @@ static void renderStationDisplay() {
     snprintf(buf, sizeof(buf), "--%%");
   }
   drawLeft(41, buf);
-  if (selectedTelemetry && lastTelemetry.batteryMv > 0) {
-    snprintf(buf, sizeof(buf), "%u%%", batteryPercent(lastTelemetry.batteryMv));
+  const uint16_t clientBatteryMv = boundClientBatteryMv();
+  if (clientBatteryMv > 0) {
+    snprintf(buf, sizeof(buf), "%u%%", batteryPercent(clientBatteryMv));
   } else {
     snprintf(buf, sizeof(buf), "--%%");
   }
@@ -1983,7 +1911,7 @@ static void renderStationDisplay() {
   if (batteryCharging()) display.drawXBMP(2, 34, 8, 8, ICON_BOLT_8);  // ⚡ on USB
 
   // --- LoRa link state (right side, below the label column) ---
-  snprintf(buf, sizeof(buf), "LoRa:%s", !selectedOnline && boundRfAgeMs() < 90000 ? "TEL" : sig4Text(loraState));
+  snprintf(buf, sizeof(buf), "LoRa:%s", sig4Text(loraState));
   drawAt(96, 52, buf);
 #if defined(FIELD_DIAGNOSTIC) || defined(BOARD_HELTEC_V4)
   snprintf(buf, sizeof(buf), "F:%s", diagnostic_store::stateName());
@@ -2039,24 +1967,9 @@ static String motionSettingsJson() {
   appendCommandContext(js);js+='}';return js;
 }
 
-static String gpsPredictionJson() {
-  String js = F("{\"ok\":true,\"enabled\":");
-  js += gpsPredictionEnabled ? F("true") : F("false");
-  js += F(",\"alpha\":"); js += gpsPredictionEnabled ? '1' : '0';
-  js += F(",\"default_enabled\":false,");
-  appendCommandContext(js); js += '}'; return js;
-}
 
-static bool saveGpsPrediction(bool enabled) {
-  const uint32_t saved = enabled ? 1 : 0;
-  if (prefs.getUInt(GPS_PREDICTION_KEY, UINT32_MAX) != saved &&
-      (prefs.putUInt(GPS_PREDICTION_KEY, saved) != sizeof(saved) ||
-       prefs.getUInt(GPS_PREDICTION_KEY, UINT32_MAX) != saved)) return false;
-  // The next GPS target tick uses this setting. Mode, calibration and the
-  // common Servo rate limiter remain intact; no direct PWM write here.
-  gpsPredictionEnabled = enabled;
-  return true;
-}
+
+
 
 // Persist a single value before applying it. No separate Apply/Save stages.
 static bool saveServoSpeed(double speed) {
@@ -2069,8 +1982,8 @@ static bool saveServoSpeed(double speed) {
 }
 
 static bool requestTrackingMode(TrackMode mode) {
-  if(!servoPwmReady) {
-    httpServer.send(503,"application/json","{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+  if(!servoOutputReady) {
+    httpServer.send(503,"application/json","{\"ok\":false,\"error\":\"servo UART output unavailable\"}");
     return false;
   }
   if(mode==TrackMode::Gps && !gpsModeAvailable()) {
@@ -2083,8 +1996,8 @@ static bool requestTrackingMode(TrackMode mode) {
 // Exact commanded centre, with no pending movement. There is no physical
 // position feedback; the operator must also wait for the camera to settle.
 static bool compassCalibrationReady() {
-  return servoAngleDeg == 90.0f && servoMotion.position() == 90.0 &&
-         servoMotion.requested() == 90.0 && !servoMotion.moving();
+  return servoAngleDeg == 179.5f && servoMotion.position() == 179.5 &&
+         servoMotion.requested() == 179.5 && !servoMotion.moving();
 }
 
 static void appendServoJson(String &js) {
@@ -2095,9 +2008,6 @@ static void appendServoJson(String &js) {
   js += F(",\"moving\":"); js += servoMotion.moving() ? F("true") : F("false");
   js += F(",\"finishing_last_gps_target\":"); js += gpsFinishingTarget ? F("true") : F("false");
   js += F(",\"speed_limit_deg_s\":"); js += String(servoMotion.speed(),3);
-  js += F(",\"prediction_enabled\":"); js += gpsPredictionEnabled ? F("true") : F("false");
-  js += F(",\"prediction_alpha\":"); js += gpsPredictionEnabled ? '1' : '0';
-  js += F(",\"prediction_active\":"); js += gpsPredictionEnabled && trackMode == TrackMode::Gps && gpsTrackingUsable() && gpsPredictionAllowed() ? F("true") : F("false");
   js += F(",\"velocity_deg_s\":"); js += String(servoMotion.velocity(), 3);
   js += F(",\"motion_fault\":"); js += servoMotion.faulted() ? F("true") : F("false");
   js += F(",\"rejected_commands\":"); js += String(rejectedMotionCommands);
@@ -2117,12 +2027,17 @@ static void appendServoJson(String &js) {
   js += mountCalibrated ? F("true") : F("false");
   js += F(",\"calibration_ready\":");
   js += compassCalibrationReady() ? F("true") : F("false");
-  js += F(",\"pwm_ok\":");
-  js += servoPwmReady ? F("true") : F("false");
-  js += F(",\"uart_state\":\"");
-  js += uartServoMode.stateName();
-  js += F("\",\"uart_ready\":");
-  js += uartServoMode.ready() ? F("true") : F("false");
+  js += F(",\"output_ready\":"); js += servoOutputReady ? F("true") : F("false");
+  js += F(",\"profile\":\"youmi-359-uart-v1\",\"controller\":{\"baud\":9600,\"tx_gpio\":");
+  js += String(station_board::kServoTxPin);
+  js += F(",\"rx_enabled\":false,\"channel\":"); js += String(servoOutput.channel());
+  js += F(",\"pulse_us\":"); js += String(servoOutput.pulse());
+  js += F(",\"last_frame\":\""); js += servoOutput.frame();
+  js += F("\",\"tx_commands\":"); js += String(servoOutput.sent());
+  js += F(",\"tx_deferred\":"); js += String(servoOutput.deferred());
+  js += F(",\"tx_errors\":"); js += String(servoOutput.errors());
+  js += F(",\"last_tx_age_ms\":"); js += servoOutput.sent() ? String(uint32_t(millis()-servoOutput.lastSentMs())) : F("null");
+  js += F(",\"feedback_available\":false,\"actual_angle\":null}");
   js += F(",\"mount_offset_deg\":");
   js += String(mountOffsetDeg, 1);
   js += F(",\"north_reference\":\"magnetic\",\"declination_deg\":");
@@ -2204,6 +2119,9 @@ static String buildTrackJson() {
   js += gps.satellites.isValid() ? String(gps.satellites.value()) : F("-1");
   js += F(",\"hdop\":");
   js += gps.hdop.isValid() ? String(gps.hdop.hdop(), 1) : F("-1");
+  js += F(",\"position_age_ms\":");
+  gnss_snapshot::Snapshot positionSample;
+  js += !station_extensions::phone.enabled && gnssCollector.sample(millis(), positionSample) ? String(positionSample.arrivalAgeMs) : F("null");
   js += F(",\"temp_c\":");
   if (cachedTempC10 != INT16_MIN) {
     js += String((int)lround(cachedTempC10 / 10.0));
@@ -2217,7 +2135,7 @@ static String buildTrackJson() {
   js += F(",\"charging\":");
   js += station_board::kHasPmu ? (batteryCharging() ? F("true") : F("false")) : F("null");
   js += F("},\"telemetry\":{\"batt_mv\":");
-  js += haveTelemetry ? String(lastTelemetry.batteryMv) : F("0");
+  js += String(boundClientBatteryMv());
   js += F(",\"temp_c\":");
   if (haveTelemetry && lastTelemetry.tempC != INT8_MIN) {
     js += String((int)lastTelemetry.tempC);
@@ -2327,18 +2245,6 @@ static void appendAlertsJson(String &js) {
           (hum - clientHumBaselinePct) + " 個百分點，可能正在慢慢滲水。建議上岸檢查防水圈。");
     }
 
-    if (lastTelemetry.batteryMv > 0) {
-      int pct = batteryPercent(lastTelemetry.batteryMv);
-      alerts::Level bl = alerts::batteryLevel(pct);
-      if (bl == alerts::ERROR) {
-        add(bl, "client_batt", "追蹤器快沒電了",
-            String("只剩 ") + pct + "%，沒電就會自動關機、追蹤中斷。請換一顆電池，或先結束這一輪。");
-      } else if (bl == alerts::WARN) {
-        add(bl, "client_batt", "追蹤器電量偏低",
-            String("剩 ") + pct + "%，還可以再撐一陣子，建議先把備用電池準備好。");
-      }
-    }
-
     if (lastTelemetry.tempC != INT8_MIN) {
       int t = lastTelemetry.tempC;
       alerts::Level tl = alerts::temperatureLevel(t, true);
@@ -2350,6 +2256,17 @@ static void appendAlertsJson(String &js) {
             String("盒內 ") + t + "°C，建議先收到陰影下。");
       }
     }
+  }
+
+  // Battery can arrive in T096 STATE even while GNSS/TELEMETRY is off.
+  const uint16_t clientBatteryMv = boundClientBatteryMv();
+  if (clientBatteryMv) {
+    const int pct = batteryPercent(clientBatteryMv);
+    auto level = alerts::batteryLevel(pct);
+    if (station_extensions::link.have && clientBatteryMv < t096_power::kWarnMv && level == alerts::NONE)
+      level = alerts::WARN;
+    add(level, "client_batt", level == alerts::ERROR ? "追蹤器快沒電了" : "追蹤器電量偏低",
+        String("電池 ") + String(clientBatteryMv/1000.0f,2) + " V，約 " + pct + "%；請準備充電或換電池。");
   }
 
   // --- 下水端：衛星 -------------------------------------------------------
@@ -2405,15 +2322,11 @@ static void appendAlertsJson(String &js) {
   }
 
   // --- 設定與硬體 ---------------------------------------------------------
-  if (!servoPwmReady) {
+  if (!servoOutputReady) {
     add(alerts::ERROR, "servo_fault", "雲台沒有反應",
-        "鏡頭無法轉動。請檢查雲台的訊號線（IO21）和接地線有沒有鬆脫，然後重新開機。");
+        "鏡頭無法轉動。請檢查雲台的訊號線（TX GPIO43 → 控制板 RX）和接地線有沒有鬆脫，然後重新開機。");
   }
-  if (trackMode == TrackMode::Uart && !uartServoMode.ready()) {
-    add(alerts::WARN, "uart_wait", "等待 UART 指令",
-        "尚未收到有效指令或指令已逾時，鏡頭保持原角度。請檢查控制端程式與 UART 接線。");
-  }
-  if (servoMotion.faulted() && servoPwmReady) {
+  if (servoMotion.faulted() && servoOutputReady) {
     add(alerts::ERROR, "motion_fault", "運動控制已保持",
         "控制器偵測到無效狀態，已停止更新角度。請重新開機；若持續發生，請保留執行紀錄。");
   }
@@ -2495,9 +2408,9 @@ static void appendTimingJson(String &js) {
   duration("lora", loraDuration);
   duration("ota", otaDuration);
   duration("motion", motionDuration);
-  js += F(",\"uart_late_polls\":"); js += String(uartServoMode.latePolls());
-  js += F(",\"uart_discarded_bytes\":"); js += String(uartServoMode.discardedBytes());
-  js += F(",\"uart_rejected_commands\":"); js += String(uartServoMode.rejectedCommands());
+  js += F(",\"uart_late_polls\":"); js += String(0);
+  js += F(",\"uart_discarded_bytes\":"); js += String(0);
+  js += F(",\"uart_rejected_commands\":"); js += String(0);
   appendHttpDetailJson(js);
   js += '}';
 }
@@ -2521,9 +2434,10 @@ static String buildStatusJson() {
   float rssiAvg = rssiRingCount ? rssiSum / rssiRingCount : 0;
   float snrAvg  = rssiRingCount ? snrSum  / rssiRingCount : 0;
   js += F("\"lora\":{\"rssi\":");
-  js += String(lastRssi, 1);
+  js += rfReception.fresh(millis()) ? String(rfReception.rssi(), 1) : F("null");
   js += F(",\"snr\":");
-  js += String(lastSnr, 1);
+  js += rfReception.fresh(millis()) ? String(rfReception.snr(), 1) : F("null");
+  js += F(",\"signal\":\""); js += sig4Text(rfReception.signal(millis())); js += '"';
   js += F(",\"rssi_avg\":");
   js += rssiRingCount ? String(rssiAvg, 1) : F("null");
   js += F(",\"snr_avg\":");
@@ -2814,7 +2728,7 @@ static void serviceAxiomLog() {
   s.heapFree = ESP.getFreeHeap(); s.heapMin = ESP.getMinFreeHeap();
   s.heapLargest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   s.resetReason = esp_reset_reason(); s.wifiRssi = WiFi.RSSI();
-  s.batteryMv = cachedBatteryMv; s.clientBatteryMv = haveTelemetry ? lastTelemetry.batteryMv : 0;
+  s.batteryMv = cachedBatteryMv; s.clientBatteryMv = boundClientBatteryMv();
   gnssCollector.sample(now, s.gps); s.gpsFresh = gpsFixFresh();
   s.gnssCounters = gnssCollector.stats(); s.gpsBacklogDrops = gpsBacklogDrops;
   s.stationGnss = gnss_diagnostics::capture(gnssCollector, now);
@@ -2835,17 +2749,17 @@ static void serviceAxiomLog() {
   s.angle = servoAngleDeg; s.target = servoTargetDeg; s.speed = servoMotion.speed(); s.velocity = servoMotion.velocity();
   snprintf(s.mode, sizeof(s.mode), "%s", trackModeStr(trackMode));
   snprintf(s.source, sizeof(s.source), "%s", tracking_policy::sourceName(controlSource));
-  snprintf(s.uartState, sizeof(s.uartState), "%s", uartServoMode.stateName());
-  s.pwmOk = servoPwmReady; s.motionFault = servoMotion.faulted(); s.calibrated = mountCalibrated;
+  snprintf(s.uartState, sizeof(s.uartState), "%s", "removed");
+  s.pwmOk = servoOutputReady; s.motionFault = servoMotion.faulted(); s.calibrated = mountCalibrated;
   s.declinationReady = declinationReady; s.declination = declinationDeg; s.mountOffset = mountOffsetDeg;
-  s.prediction = gpsPredictionEnabled; s.predictionActive = gpsPredictionEnabled && trackMode == TrackMode::Gps && gpsTrackingUsable() && gpsPredictionAllowed(); s.gpsUsable = gpsTrackingUsable();
+  s.prediction = false; s.predictionActive = false; s.gpsUsable = gpsTrackingUsable();
   s.finishingGpsTarget = gpsFinishingTarget;
   s.stationSamples = stationAverage.count(); s.stationLat = stationAverage.latitude();
   s.stationLon = stationAverage.longitude(); s.stationRmsM = stationAverage.rmsM();
   s.stationWarning = stationAverage.warning();
   if (gpsRate.ready()) { s.gpsHz = gpsRate.hz(); s.gpsRmcHz = gpsRate.rmcHz(); s.gpsGgaHz = gpsRate.ggaHz(); }
-  s.uartLate = uartServoMode.latePolls(); s.uartDiscarded = uartServoMode.discardedBytes();
-  s.uartRejected = uartServoMode.rejectedCommands(); s.motionRejected = rejectedMotionCommands;
+  s.uartLate = 0; s.uartDiscarded = 0;
+  s.uartRejected = 0; s.motionRejected = rejectedMotionCommands;
   s.controlGapMax = controlGap.maxMs; s.controlGapOver250 = controlGap.over250ms;
   const loop_metrics::Duration durations[] = {loopDuration, httpDuration, loraDuration, motionDuration,
     envDuration, pmuDuration, oledDuration, otaDuration};
@@ -3000,7 +2914,7 @@ static void initWebServer() {
     }
     if (!compassCalibrationReady()) {
       httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"請先回到 90° 並等鏡頭停穩，再按校正\"}");
+                      "{\"ok\":false,\"error\":\"請先鏡頭置中並等鏡頭停穩，再按校正\"}");
       return;
     }
     lockMountOffset(bearing, servoAngleDeg);
@@ -3064,43 +2978,42 @@ static void initWebServer() {
   httpServer.on("/api/servo/mode", HTTP_POST, []() {
     if (!acceptMotionRequest()) return;
     String mode = httpServer.arg("mode");
-    if (mode == "jetson") mode = "uart";  // compatibility with existing callers
     if (mode == "manual") {
       enterManual();
-    } else if (mode == "gps" || mode == "uart") {
-      if (!requestTrackingMode(mode == "gps" ? TrackMode::Gps : TrackMode::Uart)) return;
+    } else if (mode == "gps") {
+      if (!requestTrackingMode(TrackMode::Gps)) return;
     } else {
       httpServer.send(400, "application/json",
-                      "{\"ok\":false,\"error\":\"mode must be manual, gps or uart\"}");
+                      "{\"ok\":false,\"error\":\"mode must be manual or gps\"}");
       return;
     }
     httpServer.send(200, "application/json", controlReply());
   });
   // One fresh command cancels tracking and requests centre through the common
-  // limiter. Do not write PWM here or restore the previous automatic mode.
+  // limiter. Do not write controller frames here or restore the previous automatic mode.
   httpServer.on("/api/servo/center", HTTP_POST, []() {
     if (!acceptMotionRequest()) return;
-    if (!servoPwmReady || servoMotion.faulted()) {
+    if (!servoOutputReady || servoMotion.faulted()) {
       httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable or motion fault\"}");
+                      "{\"ok\":false,\"error\":\"servo UART output unavailable or motion fault\"}");
       return;
     }
     enterManual();
-    servoMotion.target(90.0);
+    servoMotion.target(179.5);
     servoTargetDeg = static_cast<float>(servoMotion.requested());
     httpServer.send(200, "application/json", controlReply());
   });
   httpServer.on("/api/servo", HTTP_POST, []() {
     if (!acceptMotionRequest()) return;
     float angle = 0.0f;
-    if (!parseAngleArgument("angle", 0.0f, 180.0f, angle)) {
+    if (!parseAngleArgument("angle", 0.0f, 359.0f, angle)) {
       httpServer.send(400, "application/json",
-                      "{\"ok\":false,\"error\":\"angle must be 0..180\"}");
+                      "{\"ok\":false,\"error\":\"angle must be 0..359\"}");
       return;
     }
-    if (!servoPwmReady) {
+    if (!servoOutputReady) {
       httpServer.send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"servo PWM unavailable\"}");
+                      "{\"ok\":false,\"error\":\"servo UART output unavailable\"}");
       return;
     }
     if (trackMode != TrackMode::Manual) {
@@ -3113,6 +3026,9 @@ static void initWebServer() {
     }
     servoTargetDeg = static_cast<float>(servoMotion.requested());
     httpServer.send(200, "application/json", controlReply());
+  });
+  httpServer.on("/api/sd/status", HTTP_GET, []() {
+    httpServer.send(200, "application/json", sd_log::statusJson());
   });
   httpServer.on("/api/servo/settings",HTTP_GET,[](){
     httpServer.send(200,"application/json",motionSettingsJson());
@@ -3134,28 +3050,8 @@ static void initWebServer() {
     }
     httpServer.send(200,"application/json",motionSettingsJson());
   });
-  httpServer.on("/api/track/prediction", HTTP_GET, []() {
-    httpServer.sendHeader("Cache-Control", "no-store");
-    httpServer.send(200, "application/json", gpsPredictionJson());
-  });
-  httpServer.on("/api/track/prediction", HTTP_POST, []() {
-    if (!acceptMotionRequest()) return;
-    bool validArgs = httpServer.args() == 4;
-    for (int i = 0; i < httpServer.args(); ++i) {
-      const String name = httpServer.argName(i);
-      if (name != "enabled" && name != "epoch" && name != "seq" && name != "stamp") validArgs = false;
-    }
-    const String enabled = httpServer.arg("enabled");
-    if (!validArgs || (enabled != "0" && enabled != "1")) {
-      httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"enabled must be 0 or 1; no other settings accepted\"}");
-      return;
-    }
-    if (!saveGpsPrediction(enabled == "1")) {
-      httpServer.send(503, "application/json", "{\"ok\":false,\"error\":\"GPS prediction could not be saved; current setting retained\"}");
-      return;
-    }
-    httpServer.send(200, "application/json", gpsPredictionJson());
-  });
+
+
   httpServer.on("/api/track/start", HTTP_POST, []() {
     if (!acceptMotionRequest()) return;
     if (!requestTrackingMode(TrackMode::Gps)) return;
@@ -3591,6 +3487,7 @@ static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
     }
     recordPacketEvent((buf[1]&15)==MSG_LINK_TEST ? packet_diagnostics::Kind::LinkTest :
         packet_diagnostics::Kind::ClientState, receivedAtMs, buf, n);
+    rfReception.observe(receivedAtMs, receivedPacketRssi, receivedPacketSnr);
     return;
   }
   using packet_diagnostics::Kind;
@@ -3612,6 +3509,7 @@ static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
     DecodedTelemetry tel{};
     if (!parseTelemetryPacket(buf, n, tel)) { ++rejectedFormat; return reject(Kind::Format); }
     lastTelemetry = tel; haveTelemetry = true; lastTelemetryRxMs = receivedAtMs;
+    rfReception.observe(receivedAtMs, receivedPacketRssi, receivedPacketSnr);
     ++rxTelemetryCount; ++rxWinTelem;
     if (clientHumBaselinePct < 0 && tel.humidityPct != 255) clientHumBaselinePct = tel.humidityPct;
     recordPacketEvent(Kind::Telemetry, receivedAtMs, buf, n);
@@ -3622,6 +3520,7 @@ static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
     if (!protocol::decodeDiagnostic(buf, n, hdr, diag)) { ++rejectedFormat; return reject(Kind::Format); }
     lastClientDiagnostic = diag; haveClientDiagnostic = true;
     lastClientDiagnosticMs = receivedAtMs; ++rxDiagnosticCount;
+    rfReception.observe(receivedAtMs, receivedPacketRssi, receivedPacketSnr);
     recordPacketEvent(Kind::Diagnostic, receivedAtMs, buf, n);
     return;
   }
@@ -3631,6 +3530,7 @@ static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
       ++rejectedFormat; return reject(Kind::Format);
     }
     clientGnssDiagnostic.accept(hdr, report, receivedAtMs);
+    rfReception.observe(receivedAtMs, receivedPacketRssi, receivedPacketSnr);
     ++rxGnssDiagnosticCount;
     recordPacketEvent(Kind::GnssDiagnostic, receivedAtMs, buf, n);
     return;
@@ -3657,6 +3557,7 @@ static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
   lastData = data; lastRxMs = receivedAtMs; havePkt = true; ++rxDataCount;
   loraDataRate.record(receivedAtMs);
   lastRssi = receivedPacketRssi; lastSnr = receivedPacketSnr;
+  rfReception.observe(receivedAtMs, receivedPacketRssi, receivedPacketSnr);
   if (!data.fix) ++invalidFixPackets;
   if (!data.velocityValid) ++invalidVelocityPackets;
   recordPacketEvent(Kind::Data, receivedAtMs, buf, n, &data);
@@ -3691,6 +3592,7 @@ void setup() {
   // buffer fills (HWCDC.cpp: tx_timeout_ms) — on battery it never happens,
   // which is why the symptom only ever showed up on the bench.
   Serial.setTxTimeoutMs(0);
+  sdk_log::begin(); // SDK task output must not bypass USB export framing.
   delay(1200);
   bootMs = millis();
   powerBootId = esp_random();
@@ -3819,7 +3721,7 @@ void setup() {
   envSensorOnline = initEnvSensor();
   sampleEnvSensor();
   nextEnvMs = millis() + ENV_UPDATE_MS;
-  initServo();                     // restore boot centre at 90 degrees
+  initServo();                     // command boot centre at 179.5 degrees
 #if defined(BOARD_HELTEC_V4)
   station_flash::begin(controlBootId);
 #endif
@@ -3931,6 +3833,7 @@ void setup() {
 }
 
 void loop() {
+  sdk_log::drain(Log);
 #if defined(FIELD_DIAGNOSTIC)
   serviceFieldDiagnostic();
 #endif

@@ -1,5 +1,37 @@
 # 介面規格（Interface）
 
+## 2026-10-11 現行控制與介面
+
+正式原始碼已整合 Youmi 35 kg（5–8.4 V、359°）＋串口控制板，固定 **M0**。
+Station UART2 **9600 8N1、TX GPIO43、RX 不配置**；`#00P0500!`～`#00P2500!`，無換行。
+`include/servo_controller.h` 合併最新目標、去重、最多 50 Hz 非阻塞送出；控制板自行產生 50 Hz PWM。
+角度 0～359°，中位 **179.5°／1500 μs**；開機輸出中位、預設手動。沒有 ACK 或實際角度回授。
+UART 寫入成功只證明 Station 交給 UART，不能證明控制板接受或 Servo 到位。
+只留手動／GPS；舊 115200 SET／SET2／SYNC 外部輸入不再編入正常 Station，`mode=uart/jetson` 回 400。
+GPS α UI、預測運算與設定 API 已移除；`/api/track/prediction` 回 404，舊 NVS 鍵不讀寫。
+GPS 仍使用兩端有效且新鮮的位置、磁偏角與校正，失效轉完最後有效目標；不自動切換來源。
+共用速限預設 30°/s、整數 1～90，NVS `servospd` 保存；GPS 目標每 50 ms 重算。
+
+資訊頁四區：**定位資訊／Station Info／控制板／Surfer Info**。
+座標只顯示 Google Maps 連結；手填欄位由上至下經度／緯度／誤差。
+卫星顯示無／少／中／多；HDOP 下方說明其為幾何指標，不能換算成已知實際誤差。
+手機回報半徑、Station 30 秒 RMS 散布、實際誤差分開；真實誤差需對照已知參考位置。
+Station 顯示自有溫濕度與 SD 記錄狀態，無運行時間／Servo 來源／SD 錯誤計數；
+Surfer 顯示電池、GPS 開啟／關閉、STATE／DATA 年齡與 RF 品質，無 USB 供電列。
+GPS 狀態只依近期 STATE；未知或過期不假裝為關閉。
+控制板區顯示 M0、串口、命令角度／脈寬／字串與 UART 計數，實際角度為未知。
+磁偏角移到定位資訊；速度點數字開視窗、儲存成功才關閉，指南針整數 0～359、預設 90。
+「鏡頭置中」回 179.5°；停穩後填北 0°、東 90°、南 180°、西 270°重新校正（只存 RAM）。
+手動完整圓軌道 0～359°，0／359 在下、90 左、180 上、270 右，放開才送、端點不環繞。
+UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw 角度；地理方位另依校正計算。
+手機定位權限流程延後、不加複製診斷摘要。
+
+部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；OTA 結果另見本次驗證記錄。
+主機通過 140 項 native、實際 HTTP／UART／GPS gate／NVS、圓形操作及地圖回歸。
+實體 M0 接線、UART 接受、轉向、端點、帶載及戶外 GPS 精度仍待驗收。
+
+## 以下為前版規格／歷史紀錄（控制與 UI 差異以上節為準）
+
 本文件彙整 Shore Spotter 的 wire／HTTP 契約及欄位對應：
 
 1. **下層 — LoRa 封包**（Surfer ↔ 攝影站，RF 二進位格式）
@@ -34,35 +66,35 @@ Station SD 記錄與 USB 狀態、開始／停止、列檔／讀回及檔案格�
 |---|---|
 | 中心頻率 | group A（保留原頻道，設備待登記）923.2 MHz；group B（Heltec V4 Station + T096 Client）923.8 MHz；不掃描／不協商 |
 | 頻寬 | 125 kHz |
-| Spreading Factor | SF10 |
+| Spreading Factor | A 組 SF10；B 組 SF9（兩端必須一致） |
 | Coding Rate | 4/5 |
 | Sync Word | `0x12` |
 | 前導碼／標頭 | 8 symbols／explicit header，PHY CRC 開啟 |
 | 固定發射功率 | group A Client 20 dBm；group B 為 SX1262 0 dBm chip drive。Station 僅在近期 STATE window 內送 control；數值不是天線端輸出量測 |
 | DATA 排程 | 最新有效定位即送，受 airtime＋80 ms guard 限制；失效通知一次，無 DATA 心跳 |
 | ACK | 已移除，無下行回覆 |
-| TELEMETRY／DIAGNOSTIC | 各約每 60 秒獨立發送；GNSS DIAG 約 60 秒一包，可延後定位 |
+| TELEMETRY／DIAGNOSTIC | T-Beam Client 各約 60 秒；T096 每 5 秒輪替 TEL／DIAG／GNSS（各約 15 秒），另有 STATE，可延後定位 |
 
 同組兩端頻率、BW、SF、Sync Word 必須一致。explicit header 帶有發送端的 payload
 Coding Rate；本專案 Client 發送使用 4/5。頻率設定不是整套設備的法規／審驗認定。
 目前未實作頻道掃描或協商切頻。Client ID 或 Sync Word 的資料過濾不會消除同頻 RF 碰撞。
 開機與無線電重建均使用各角色固定功率；Client 不讀寫舊 `shorespt_client/txpwr`、
-`atpc` NVS 鍵，也不清除它們。固定功率不隨接收品質調整；目前 SF10／無 ACK 排程如下。
+`atpc` NVS 鍵，也不清除它們。固定功率不隨接收品質調整；目前 A 組 SF10／B 組 SF9，均無 DATA ACK，排程如下。
 
 ## 封包類型與空中時間
 
-| type | 名稱 | 大小（含共用標頭） | 空中時間 | 用途 |
-|---|---|---:|---:|---|
-| 1 | MSG_DATA | 18 B | 329.728 ms | 完整 E7 位置、速度向量與定位品質；無來源 age |
-| 4 | MSG_TELEMETRY | 11 B | 288.768 ms | 電量、溫濕度與精確衛星數 |
-| 5 | MSG_DIAGNOSTIC | 17 B | 329.728 ms | Client 的 GNSS 間隔與執行計數 |
-| 6 | MSG_GNSS_DIAGNOSTIC | 36 B | 493.568 ms | 單包完整 GPS 資料流／診斷年齡快照 |
-| 7 | MSG_CLIENT_CONTROL | 13 B | 依 RadioLib 實算 | Station→T096 command |
-| 8 | MSG_CLIENT_STATE | 28 B | 依 RadioLib 實算 | T096→Station state／confirmation rendezvous |
-| 9 | MSG_LINK_TEST | 18 B | 依 RadioLib 實算 | T096→Station RF test counter |
+| type | 名稱 | 大小（含共用標頭） | A：SF10 | B：SF9 | 用途 |
+|---|---|---:|---:|---:|---|
+| 1 | MSG_DATA | 18 B | 329.728 ms | 185.344 ms | 完整 E7 位置、速度向量與定位品質；無來源 age |
+| 4 | MSG_TELEMETRY | 11 B | 288.768 ms | 144.384 ms | 電量、溫濕度與精確衛星數 |
+| 5 | MSG_DIAGNOSTIC | 17 B | 329.728 ms | 164.864 ms | Client 的 GNSS 間隔與執行計數 |
+| 6 | MSG_GNSS_DIAGNOSTIC | 36 B | 493.568 ms | 267.264 ms | 單包完整 GPS 資料流／診斷年齡快照 |
+| 7 | MSG_CLIENT_CONTROL | 13 B | 288.768 ms | 164.864 ms | Station→T096 command |
+| 8 | MSG_CLIENT_STATE | 28 B | 411.648 ms | 226.304 ms | T096→Station state／confirmation rendezvous |
+| 9 | MSG_LINK_TEST | 18 B | 329.728 ms | 185.344 ms | T096→Station RF test counter |
 
 type 2（舊 ACK）與 type 3（舊 HELLO）不接受。wire 升為 v5；所有類型標頭均用新版本，
-Client／Station 必須一起更新，舊格式拒收，無自動降版。SF9 舊板也無法與 SF10 通訊。
+Client／Station 必須一起更新，舊格式拒收，無自動降版。SF9 與 SF10 不互通；B 組改 SF9 時須同步更新參與收發的兩端，舊 v4 仍拒收。
 2 Hz 是 GPS 請求值，實際 DATA 頻率由有效新定位、RF 占用與診斷共同決定，不能由設定推定收包率。
 
 ### 不阻塞的發送與空檔
@@ -81,17 +113,22 @@ RMC／GGA 尚未配對時最多短等 150 ms；新 GGA 可提供位置但不借�
 本機發射失敗仍消耗該筆發送機會，避免緊密重試；沒有 ACK／舊定位重傳。
 
 DATA、TEL、DIAG 各有獨立序號，GNSS DIAG 每包使用獨立 seq；診斷不消耗 DATA seq。
-SF10 的 DATA／DIAG 約 330 ms，GNSS DIAG 約 494 ms，TEL 約 289 ms；所有包在實際 TxDone 後
+A 組 SF10 的 DATA／DIAG 約 330 ms，GNSS DIAG 約 494 ms，TEL 約 289 ms；B 組 SF9
+分別為 DATA 186／DIAG 165／GNSS 268／TEL 145 ms（向上取整）。既有 T-Beam Client 所有包在實際 TxDone 後
 至少留 80 ms guard。TEL／DIAG 約 60 秒一次；GNSS 每包約 60 秒取樣一次。
 診斷不依賴有效定位：無 fix 時仍送。每秒最多一包診斷，同時到期優先 TEL、DIAG、GNSS DIAG；
 有持續待送 DATA 時與 DATA 交錯，必要時延後一筆定位。失效通知優先於診斷。
 GNSS 診斷單包即可解碼，無分頁組裝／舊序號等待；診斷不刷新位置接收時間。
+T096 保留每 500 ms 最早發送時槽、85 ms preamble listen／800 ms RX 上限與既有 STATE／控制插入；
+T096 Tracking 約每 5 秒一包 STATE，另每 5 秒輪替一包 TEL／DIAG／GNSS（各約 15 秒）。
+兩類額外封包均占 500 ms 時槽，因此有效 DATA 發送約 1.6 包／秒；沒有新 fix 或漏包還會更低。
+降低 SF 不提高 GNSS 2 Hz 或保證實收 DATA 2 Hz。
 
 `skipped_slots` 保留舊欄位名稱；本版表示 DATA 因 radio 忙碌／未就緒而延期的工作次數，
 同一次等待只加一次，之後只送最新快照。無新 epoch、診斷等待均不算 RF 失敗。
 Client 序列摘要另列 `diagnostic_tx`。`pkt_rate` 低於 2 Hz 不代表丟包，需看 DATA 序號缺口。
 
-雙端開機先初始化 PMU；每次 LoRa 初始化／復原前均設定 ALDO3 3300 mV、啟用並讀回確認，
+T-Beam 雙端開機先初始化 PMU；每次 LoRa 初始化／復原前均設定 ALDO3 3300 mV、啟用並讀回確認，
 短等 10 ms 後才開始 SPI／radio.begin。PMU 不可用、寫入或讀回失敗不繼續 radio 初始化。
 寄存器讀回不是電壓實測；仍須實機確認供電與距離。
 
@@ -192,7 +229,8 @@ bit7=1而bit6=0為矛盾旗標，拒收；約2 Hz的判準是三者均在1.6–2
 
 ## GNSS_DIAGNOSTIC（type 6，36 bytes）
 
-單包完整快照，獨立 seq，每 60 秒找空檔發送；無 page 欄位或組裝狀態。
+單包完整快照，獨立 seq；T-Beam 約每 60 秒找空檔，T096 Tracking 每 5 秒輪替 TEL／DIAG／GNSS_DIAG（每類約15秒）。
+T096 Ready 不送此診斷。無 page 欄位或組裝狀態。
 接收端先檢查版本、長度與綁定，再直接替換報告，Client 重啟後不等待舊報告到期。
 診斷不控制 Servo，也不刷新 DATA 接收時間。`rx_age_ms` 從此包收到時起算。
 
@@ -225,11 +263,16 @@ uint32 年齡未知為 UINT32_MAX；uint16 年齡 65535 未知、65534 表示 �
 | 9 `MSG_LINK_TEST` | 18 B | `boot` u32（不可0）、`counter` u32、`uptime` u32 |
 
 T096 STATE TX 後先聽85 ms，只有preamble/header才延長RX（上限800 ms）；Station 只有 pending command 時，在該 STATE rendezvous 等 20 ms 才嘗試
-一次 type 7。排程到達時 STATE 已過 40 ms 就跳過，沒有 wake/retry。TX completed、startTransmit failure
+一次 type 7。排程到達時 STATE 已過 40 ms 就跳過；同一窗口不重送 wake／命令，
+pending 可等後續 STATE 再嘗試，直到確認／錯誤／65秒逾時。TX completed、startTransmit failure
 或 1 秒未收到 TX_DONE 均關閉 FEM 並回 Station RX。Station 以 client/boot/station/command/期望 state
 完整比對後續 STATE；才會把 command 標為 `confirmed`。不同 boot 為 `error`，不同 station 不能確認而會
 timeout（65 秒）。probe 支援 uint32 wrap，重複／倒退 counter 不計入，`missing` 是相鄰 counter 推估，非
 完整空中丟包證據。
+
+Ready 的30秒計時以成功的上一筆 STATE TX_DONE 為基準，不是固定整點輪詢，也不是每次重啟。
+發射／確認及其他期限會影響實際間隔；10/10 純電池 Start confirmed 實測30.776秒，
+正常約一輪、約31秒，失聯或錯過窗口仍可能逾時。詳細時序見 [RTC待機](t096-rtc-standby-2026-10-09.md)。
 
 ## 單一 Client 綁定
 
@@ -251,7 +294,7 @@ HTTP API與OTA均未設應用層認證／密碼，同熱點可連線裝置可存
 
 攝影站以 WiFi station (STA) 模式連線手機熱點。
 
-- 熱點 SSID / 密碼設定於 [../include/wifi_config.h](../include/wifi_config.h)（`WIFI_SSID` / `WIFI_PASSWORD`）
+- 熱點 SSID / 密碼設定於 [範例設定](../include/wifi_config.h.example)（本機建立 `include/wifi_config.h`）（`WIFI_SSID` / `WIFI_PASSWORD`）
 - 攝影站開機會自動連線，IP 由手機分配，開機時顯示於 OLED
 
 以下 endpoint 透過瀏覽器或任何 HTTP client 存取，基底 URL 為攝影站的 IP（例：`http://192.168.x.x`）。
@@ -271,7 +314,11 @@ Station 內嵌頁是 HTTP，不能自行保證取得瀏覽器定位；使用者�
 
 GET 回 T096 最近 STATE：`supported`（90 秒內有綁定 STATE）、`client_id`、`boot_id`、`state`、`age_ms`、
 battery/charging、`command`／`command_id`、RF test `tx_packets`／`test_received`／`test_missing`／RSSI／SNR／
-max gap，以及 group/frequency。POST 僅接受 `action=start|stop|test|store`。
+max gap，以及 group/frequency、`ready_poll_ms=30000`、`storage_after_hours=0`（已取消自動SystemOFF）。
+POST 接受 `action=start|stop|test|store`；2026-10-09 起 `store` 是舊API的Stop別名，發出的LoRa命令為Stop，
+預期回覆Ready。Web只提供啟動GPS／回待機及RF測試；直接舊LoRa Store也由新版T096轉Ready，
+但舊Station仍期待Storage時會判確認錯誤。封包數值／長度／wire v5保留。`charging`僅USB VBUS，非太陽能充電狀態。
+低电保護停止RF，因此supported=false只代表近期STATE不足，不能推斷實際電源狀態。
 
 新鮮且綁定的 STATE、沒有 pending command 且未被其他 Station 指派時，POST 回 **202**。202 只表示
 pending 等待下一個 STATE window，絕不表示 Client 已收包、已切換 state 或已開始儲存；須看後續完全
@@ -421,7 +468,7 @@ mDNS 可用性仍取決於操作手機所在網路，現有 IP 入口仍可用�
 | `client.rx_age_ms` / `source_age_ms` / `sample_age_ms` | 接收後時間／null／null；v5 不量測完整定位延遲 |
 | `client.age_basis` | 固定`nmea_epoch_aligned_arrival`，是估計時間基準，非GNSS測量時鐘同步 |
 | `client.last_rx_sec` | 距上次收到DATA的秒數；從未收到為`-1`，失聯後仍累計 |
-| `telemetry.batt_mv` | Surfer端電池電壓mV（約每60秒排送，忙碌時延後）|
+| `telemetry.batt_mv` | Surfer端電池電壓mV；採90秒內最新有效TEL或T096 STATE電量，unknown/過期0。此欄有值不代表收到溫濕度TEL |
 | `telemetry.temp_c` | Surfer 端溫度，`null` = 無感測器 |
 | `telemetry.humidity_pct` | Surfer 端濕度 %，`null` = 無感測器 |
 | `station.fix` | 攝影站本身的 GPS fix 狀態 |
@@ -634,10 +681,11 @@ GPS 定位／連線／未校正的操作提醒只在 GPS 模式顯示；UART 不
 |---|---|
 | `station_gps.satellites` | 定位使用中的衛星數，`-1` = 無效 |
 | `station_gps.hdop` | 水平精度因子，數值越小越好，`-1` = 無效 |
-| `lora.rssi` | 最近一筆位置封包 RSSI（dBm）|
-| `lora.snr` | 最近一筆位置封包 SNR（dB）|
-| `lora.rssi_avg` | 近 20 筆 RSSI 滾動平均，`null` = 無資料 |
-| `lora.snr_avg` | 近 20 筆 SNR 滾動平均，`null` = 無資料 |
+| `lora.rssi` | 最近接受的綁定Client任一有效RF封包RSSI（dBm），無資料或90秒過期null |
+| `lora.snr` | 同一最新有效RF封包SNR（dB），無資料或90秒過期null |
+| `lora.signal` | Good／OK／Bad／Miss，與Station OLED同一任意有效RF封包分級；不依GPS DATA |
+| `lora.rssi_avg` | 近20筆DATA RSSI滾動平均，`null`=無DATA |
+| `lora.snr_avg` | 近20筆DATA SNR滾動平均，`null`=無DATA |
 | `lora.pkt_rate` | DATA的60秒統計；首次完成前0，距最後DATA滿5秒回0；不是GNSS epoch更新率 |
 | `lora.rx_data` | 成功解析的 DATA 封包累計 |
 | `lora.rx_telemetry` / `lora.rx_diagnostic` | 成功接受的TEL／DIAG累計 |
@@ -1187,12 +1235,12 @@ UART session 重新進入後需新的完整 SET。PWM 不可用回 503；成功�
 | 無 | v5 DATA | `client.source_age_ms` | 固定 null，來源延遲未量測 |
 | 無 | v5 DATA | `client.sample_age_ms` | 固定 null，不再合成推算定位年齡 |
 | DATA RxDone時間 | Station | `client.rx_age_ms`／`last_rx_sec` | 距接收的ms／秒，不等於來源測量年齡 |
-| batteryMv | TEL | `telemetry.batt_mv` | 直接mV；未知0 |
+| batteryMv | TEL／T096 STATE | `telemetry.batt_mv` | 90秒內最新有效mV；未知0；TEL溫濕度接收年齡不變 |
 | tempC／humidityPct | TEL | `telemetry.temp_c`／`humidity_pct` | 整數°C／%；未知→null |
 | satellites | TEL | `client.satellites` | 精確低頻顆數；未知或TEL滿90秒→null，不作即時gate |
 | TEL RxDone時間 | Station | `client.satellites_age_ms`／`telemetry.last_rx_sec` | TEL接收年齡，不代表衛星數精確測量時間 |
 | epochIntervalMs等 | DIAG | `/api/debug.client_diagnostic` | Client低頻解析／排程快照，帶獨立接收年齡 |
-| RSSI／SNR | Station收到DATA時的radio量測 | `/api/status.lora.rssi`／`snr` | dBm／dB，不是Station從ACK反解 |
+| RSSI／SNR | Station接受綁定Client任意有效封包的radio量測 | `/api/status.lora.rssi`／`snr` | dBm／dB，過期null；DATA平均與FPS另列 |
 | ACK | 已移除 | `ack_enabled=false` | 不再傳回RSSI／SNR；Station仍保留上行接收品質 |
 | uint16 DATA seq | DATA | `/api/debug`序號與event欄位 | 只由DATA使用，TEL／DIAG不占它的序號 |
 

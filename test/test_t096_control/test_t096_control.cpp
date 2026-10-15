@@ -7,26 +7,26 @@ static client_control::Command command(uint32_t boot, client_control::Action act
   return {boot, action, station};
 }
 
-void test_default_ready_period_and_storage_wrap_are_bounded() {
+void test_retained_ready_deadlines_wrap_and_never_auto_store() {
   t096_control::Controller control(77); control.setClientId(0x20);
-  control.resetReadyTimer(0xFFFF0000U);
-  TEST_ASSERT_FALSE(control.storageDue(0x0000FFFFU, false));
-  TEST_ASSERT_TRUE(control.storageDue(0xFFFF0000U + client_control::kStorageAfterMs, false));
-  TEST_ASSERT_FALSE(control.storageDue(0xFFFF0000U + client_control::kStorageAfterMs, true));
-  TEST_ASSERT_TRUE(control.pollDue(client_control::kReadyPollMs));
-  control.notedState(client_control::kReadyPollMs);
-  TEST_ASSERT_FALSE(control.pollDue(client_control::kReadyPollMs + 1));
+  TEST_ASSERT_EQUAL_UINT32(30000,control.pollWaitMs(0));
+  control.notedState(0xFFFFFFF0U);
+  TEST_ASSERT_EQUAL_UINT32(29968,control.pollWaitMs(16));
+  TEST_ASSERT_TRUE(control.pollDue(0xFFFFFFF0U+30000));
+  TEST_ASSERT_EQUAL(client_control::State::Ready,control.state());
+  TEST_ASSERT_TRUE(control.pollDue(13UL*60*60*1000));
+  TEST_ASSERT_EQUAL(client_control::State::Ready,control.state());
 }
 
-void test_charger_removal_restarts_ready_12h_budget() {
+void test_legacy_store_returns_retained_ready() {
   t096_control::Controller control(77); control.setClientId(0x20);
-  control.resetReadyTimer(100);
-  TEST_ASSERT_TRUE(control.storageDue(100 + client_control::kStorageAfterMs, false));
-  // The application calls this on VBUS falling; it must not carry over the
-  // time that USB power inhibited SystemOFF.
-  control.resetReadyTimer(500);
-  TEST_ASSERT_FALSE(control.storageDue(500 + client_control::kStorageAfterMs - 1, false));
-  TEST_ASSERT_TRUE(control.storageDue(500 + client_control::kStorageAfterMs, false));
+  control.apply(commandHeader(1),command(77,client_control::Action::Start,10),0);
+  control.notedState(100);
+  TEST_ASSERT_EQUAL_UINT32(4999,control.pollWaitMs(101));
+  TEST_ASSERT_EQUAL(t096_control::CommandResult::Applied,
+    control.apply(commandHeader(2),command(77,client_control::Action::Store,10),200));
+  TEST_ASSERT_EQUAL(client_control::State::Ready,control.state());
+  TEST_ASSERT_EQUAL_UINT32(29900,control.pollWaitMs(200));
 }
 
 void test_boot_station_and_old_command_are_rejected() {
@@ -45,14 +45,13 @@ void test_boot_station_and_old_command_are_rejected() {
                     control.apply(commandHeader(11), command(77, client_control::Action::Stop, 11), 4));
 }
 
-void test_duplicate_confirms_without_restarting_ready_timer() {
+void test_duplicate_confirms_without_postponing_poll() {
   t096_control::Controller control(77); control.setClientId(0x20);
   TEST_ASSERT_EQUAL(t096_control::CommandResult::Applied,
                     control.apply(commandHeader(65535), command(77, client_control::Action::Stop, 10), 100));
   TEST_ASSERT_EQUAL(t096_control::CommandResult::Duplicate,
                     control.apply(commandHeader(65535), command(77, client_control::Action::Stop, 10), 1000));
-  TEST_ASSERT_FALSE(control.storageDue(100 + client_control::kStorageAfterMs - 1, false));
-  TEST_ASSERT_TRUE(control.storageDue(100 + client_control::kStorageAfterMs, false));
+  TEST_ASSERT_TRUE(control.pollDue(30000));
   TEST_ASSERT_EQUAL(t096_control::CommandResult::Applied,
                     control.apply(commandHeader(0), command(77, client_control::Action::Test, 10), 200));
   TEST_ASSERT_TRUE(control.probeDue(700));
@@ -81,10 +80,10 @@ void test_sx1262_begin_keeps_preamble_and_tcxo_in_their_real_api_slots() {
 
 int main() {
   UNITY_BEGIN();
-  RUN_TEST(test_default_ready_period_and_storage_wrap_are_bounded);
-  RUN_TEST(test_charger_removal_restarts_ready_12h_budget);
+  RUN_TEST(test_retained_ready_deadlines_wrap_and_never_auto_store);
+  RUN_TEST(test_legacy_store_returns_retained_ready);
   RUN_TEST(test_boot_station_and_old_command_are_rejected);
-  RUN_TEST(test_duplicate_confirms_without_restarting_ready_timer);
+  RUN_TEST(test_duplicate_confirms_without_postponing_poll);
   RUN_TEST(test_sx1262_begin_keeps_preamble_and_tcxo_in_their_real_api_slots);
   return UNITY_END();
 }

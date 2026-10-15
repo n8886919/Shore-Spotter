@@ -58,6 +58,7 @@ cpp = r'''
 #include "tracking_policy.h"
 #include "command_freshness.h"
 #include "servo_profile.h"
+#include "servo_controller.h"
 #define F(x) x
 #define ESP_ARDUINO_VERSION_MAJOR 3
 struct String : std::string {
@@ -83,8 +84,11 @@ uint32_t esp_random() {
   return randomValues[randomIndex++];
 }
 command_freshness::HttpGate commandGate;
-bool servoPwmReady = false, attachSucceeds = false, centreSucceeds = false;
-float servoAngleDeg = 90, servoTargetDeg = 90;
+bool servoOutputReady = false, attachSucceeds = false, centreSucceeds = false;
+float servoAngleDeg = 179.5, servoTargetDeg = 179.5;
+#define SERIAL_8N1 0
+struct SerialStub {void setTxBufferSize(int){}void begin(uint32_t,int,int,int){}explicit operator bool(){return attachSucceeds;}}servoSerial;
+struct OutputStub {int channel(){return 0;}}servoOutput;
 bool ledcAttach(int, uint32_t, uint8_t) { return attachSucceeds; }
 bool setServoAngle(float angle) {
   if (!centreSucceeds) return false;
@@ -95,6 +99,7 @@ struct LogStub {
   template<class T> void print(T) {}
   template<class T> void println(T) {}
   void println() {}
+  template<class...T>void printf(const char*,T...){}
 } Log;
 uint16_t gpsClientId = 0xE91C;
 uint32_t dataAirtimeMs = 330, telemetryAirtimeMs = 289, gnssDiagnosticAirtimeMs = 494, diagnosticAirtimeMs = 330;
@@ -128,7 +133,7 @@ struct Http {
 for name in [
     "RF_FREQUENCY", "RF_BW", "RF_SF", "RF_CR", "SEND_INTERVAL_MS", "TELEMETRY_INTERVAL_MS",
     "GPS_BAUD", "GPS_BACKLOG_GUARD_MS", "GPS_FIX_MAX_AGE_MS", "LOG_BUF_BYTES",
-    "SERVO_PIN", "SERVO_PWM_HZ", "SERVO_PWM_RES_BITS",
+
 ]:
     match = re.search(r"constexpr[^;\n]*\b" + name + r"\b[^;]*;", SOURCE)
     if not match:
@@ -315,16 +320,16 @@ int main() {
   emitLog("cursor_wrap_overwritten", logTotal - LOG_BUF_BYTES - 1);
   // Hardware failure cannot prevent a distinct diagnostic boot identity.
   resetLog(); attachSucceeds = false; centreSucceeds = false;
-  assert(!initServo() && !servoPwmReady && controlBootId == 101 && commandGate.epoch() == 102);
+  assert(!initServo() && !servoOutputReady && controlBootId == 101 && commandGate.epoch() == 102);
   emitLog("attach_failure_boot", 0);
   attachSucceeds = true;
-  assert(!initServo() && !servoPwmReady && controlBootId == 201 && commandGate.epoch() == 202);
+  assert(!initServo() && !servoOutputReady && controlBootId == 201 && commandGate.epoch() == 202);
   emitLog("centre_failure_boot", 0);
   attachSucceeds = false;
   assert(!initServo() && controlBootId == 1 && commandGate.epoch() == 302);
   emitLog("zero_random_boot", 0);
   attachSucceeds = true; centreSucceeds = true;
-  assert(initServo() && servoPwmReady && controlBootId == 401 && commandGate.epoch() == 402);
+  assert(initServo() && servoOutputReady && controlBootId == 401 && commandGate.epoch() == 402);
   emitLog("successful_init_boot", 0);
   // Metadata scalars from the real headers let the Python assertions detect
   // later hard-coded JSON constants drifting away from the wire definitions.
@@ -511,4 +516,4 @@ print("PASS actual log GET UTF-8 byte cursors, overflow/future recovery, UINT32 
 for name, boot in [("attach_failure_boot", 101), ("centre_failure_boot", 201),
                    ("zero_random_boot", 1), ("successful_init_boot", 401)]:
     assert logs[name] == dict(boot=boot, next=0, dropped=False, body=b"")
-print("PASS actual initServo creates nonzero boot identity and control epoch before either PWM failure path")
+print("PASS actual initServo creates nonzero boot identity and control epoch before either UART failure path")

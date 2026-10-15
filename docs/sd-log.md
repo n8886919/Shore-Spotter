@@ -1,5 +1,7 @@
 # Station／Client SD 循環記錄
 
+> **板型範圍：** 本文的 SD 流程適用於有 SD 的 LilyGO T-Beam Client／Station；T096 正常版無 SD，Heltec V4 Station 用有限容量 [Flash 診斷](heltec-field-ready.md)。目前 T096 F035 外測以 LilyGO Station SD 為主要記錄來源，現況見 [交接入口](assistant-handoff.md)。
+
 2026-09-23，0.6-dev，LoRa v5／SF10、Client 發送節奏不變。部署結果見 CHANGELOG.md。
 
 Station 插卡開機自動錄製，不需 Wi-Fi、Axiom、Station GPS 定位或 GPS 控制模式。
@@ -194,3 +196,11 @@ I/O errors=0、packet/text dropped=0、sample skipped=4；快照略過不等同 
 - 已燒錄 Client SHA-256：`e472c613f211b98f46c1fc1a4fd584b78139f59fc013166d2347bab28dd42e92`。
 - 已燒錄 Station USB SHA-256：`139927a14937df2e2ab481f6f4a5522df7d23d496a55263da991e4a63182cda8`。
 - 同功能 Station OTA build SHA-256（此次未 OTA 部署）：`548301d97468b3664940ca9eb77c8ccd3b1551e5d98fa07333bcc83bf173fd5c`。
+## SDK console 與 USB 匯出（2026-10-16）
+
+ESP32 的 ESP-IDF task log 經 `sdk_log` 固定佇列，在主迴圈交給 LogTee。
+SD／DIAG 匯出期間沿用既有 USB 隔離，SDK 訊息仍可進入診斷歷史，
+不直接混入 `@SD BEGIN`／`END` 之間。佇列最多 8 筆、每筆 383 bytes，
+超長訊息標示 `SDK log truncated`，溢位明確回報 `log queue overflow: dropped=N`。
+此機制涵蓋 ESP-IDF logger，不宣稱能攔截 ROM panic 或任何第三方直接 `printf`。
+主機工具仍嚴格驗證原始長度與 CRC，不會移除可疑文字後假裝匯出成功。

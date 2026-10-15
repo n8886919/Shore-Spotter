@@ -42,6 +42,7 @@ cpp = r'''
 #include <vector>
 #include "loop_metrics.h"
 #include "protocol.h"
+#include "rf_reception.h"
 #include "gnss_snapshot.h"
 #include "gnss_diagnostics.h"
 #include "gnss_rate.h"
@@ -90,6 +91,7 @@ uint32_t rxGnssDiagnosticCount = 0;
 bool havePkt = false, haveTelemetry = false, haveClientDiagnostic = false;
 uint32_t lastRxMs = 0, lastTelemetryRxMs = 0, lastClientDiagnosticMs = 0;
 float lastRssi = 0, lastSnr = 0, receivedPacketRssi = 0, receivedPacketSnr = 0;
+rf_reception::Latest rfReception;
 float rssiRing[RSSI_WINDOW]{}, snrRing[RSSI_WINDOW]{};
 size_t rssiRingIdx = 0, rssiRingCount = 0;
 uint32_t rxDataCount = 0, rxTelemetryCount = 0, rxDiagnosticCount = 0;
@@ -111,7 +113,7 @@ packet_diagnostics::Ring<64> packetEvents;
 // New control/probe path is exercised with the actual radio lifecycle in
 // test_station_downlink.py; this fixture retains legacy DATA/TELEMETRY scope.
 namespace station_extensions {
-  struct {struct {uint32_t boot=0;}status;bool have=false;}link;
+  struct {struct {uint32_t boot=0;uint16_t batteryMv=0;}status;bool have=false;uint32_t receivedMs=0;}link;
   bool haveRf = false; uint32_t lastRfMs = 0;
   bool accept(const uint8_t *raw,size_t n,uint32_t) {
     PacketHeader h{};client_control::Status status{};
@@ -143,6 +145,7 @@ for marker in [
     "static void recordPacketEvent(",
     "static void acceptRadioPacket(",
     "static uint32_t boundRfAgeMs(",
+    "static uint16_t boundClientBatteryMv(",
     "static uint32_t clientSampleAgeMs(",
     "static bool clientFixFresh(",
 ]:
@@ -173,7 +176,7 @@ struct ClientTxStub {
   bool active() const { return running; }
   int start(const uint8_t *buf, size_t n, uint32_t now, uint32_t) {
     assert(!running); PacketHeader h{}; assert(protocol::decodeHeader(buf, n, h));
-    end = now + (h.msgType == MSG_GNSS_DIAGNOSTIC ? gnssDiagnosticAirtimeMs : h.msgType == MSG_TELEMETRY ? telemetryAirtimeMs : dataAirtimeMs); running = true;
+    end = now + (h.msgType == MSG_GNSS_DIAGNOSTIC ? gnssDiagnosticAirtimeMs : h.msgType == MSG_TELEMETRY ? telemetryAirtimeMs : h.msgType == MSG_DIAGNOSTIC ? diagnosticAirtimeMs : dataAirtimeMs); running = true;
     sent.push_back({now,end,h.msgType,h.seq,buf[6],std::vector<uint8_t>(buf,buf+n)}); return 1;
   }
 } clientTransmitter;
@@ -226,6 +229,8 @@ void reset() {
   lastDataIntervalMs = maxDataIntervalMs = lastSourceEpochIntervalMs = sourceEpochUpdates = lastEstimatedSourceMs = 0;
   invalidFixPackets = invalidVelocityPackets = pktsThisWindow = pktWindowStartMs = 0;
   rssiRingIdx = rssiRingCount = 0; lastRssi = lastSnr = 0;
+  rfReception={};
+  receivedPacketRssi=-70;receivedPacketSnr=8;
   gpsSequence = command_freshness::RadioSequence{}; packetEvents = packet_diagnostics::Ring<64>{};
   stationRxReady = true; diagnosticTxCount = 0; clientDataDeferred = false;
   clientCadence.reset(clockMs); clientTransmitter = ClientTxStub{};
@@ -299,15 +304,20 @@ void test_bound_rf_freshness_is_separate_from_data() {
  // very first DATA fix. Binding/format rejects cannot renew that evidence.
  for(unsigned type=0;type<3;++type) {
   reset();assert(boundRfAgeMs()==UINT32_MAX&&!clientFixFresh());
+  receivedPacketRssi=-110;receivedPacketSnr=1;
   auto build=[&](){return type==0?buildTelemetryPacket(wire):type==1?buildDiagnosticPacket(wire):buildGnssDiagnosticPacket(wire);};
   clockMs=1000;auto n=build();acceptRadioPacket(wire,n,clockMs);
   assert(boundRfAgeMs()==0&&!havePkt&&lastRxMs==0&&!clientFixFresh());
+  assert(rfReception.signal(clockMs)==geo::SIG_OK);
+  receivedPacketRssi=-70;receivedPacketSnr=8;
   clockMs=4000;nodeId=0xabcd;n=build();acceptRadioPacket(wire,n,clockMs);
   assert(rejectedBinding==1&&boundRfAgeMs()==3000&&!havePkt);
+  assert(rfReception.signal(clockMs)==geo::SIG_OK);
   nodeId=0xe91c;n=build();wire[1]=0x41;clockMs=5000;acceptRadioPacket(wire,n,clockMs);
   assert(rejectedFormat==1&&boundRfAgeMs()==4000&&!havePkt);
   clockMs=1000+kUiRfAliveMs-1;assert(boundRfAgeMs()==89999&&boundRfAgeMs()<kUiRfAliveMs);
   clockMs=1000+kUiRfAliveMs;assert(boundRfAgeMs()==90000&&!(boundRfAgeMs()<kUiRfAliveMs));
+  assert(rfReception.signal(clockMs)==geo::SIG_MISS);
  }
  // Newest accepted packet wins across all four message types, while a fresh
  // TEL does not revive the old DATA position or the original two-second gate.
@@ -324,6 +334,13 @@ void test_bound_rf_freshness_is_separate_from_data() {
  reset();pair();n=buildDataPacket(wire);clockMs=1300;acceptRadioPacket(wire,n,clockMs);
  clockMs=1400;acceptRadioPacket(wire,n,clockMs);
  assert(rejectedGpsSequence==1&&boundRfAgeMs()==100);
+ assert(rfReception.signal(clockMs)==geo::SIG_GOOD);
+ // Ready battery comes from STATE, never from fabricated temperature/humidity.
+ reset();station_extensions::link.have=true;station_extensions::link.receivedMs=1000;
+ station_extensions::link.status.batteryMv=3700;assert(boundClientBatteryMv()==3700);
+ lastTelemetry.batteryMv=4000;haveTelemetry=true;lastTelemetryRxMs=1001;clockMs=1002;
+ assert(boundClientBatteryMv()==4000);station_extensions::link.receivedMs=1002;
+ assert(boundClientBatteryMv()==3700);clockMs=91002;assert(boundClientBatteryMv()==0);
  // All timestamps use unsigned elapsed time, including the GNSS report cache.
  reset();const uint32_t base=0xfffffff0U;
  clockMs=base;n=buildTelemetryPacket(wire);acceptRadioPacket(wire,n,clockMs);
@@ -348,7 +365,7 @@ void test_scheduler_two_hz_latest_only_and_diagnostic_guard() {
   if(tx.type==MSG_DATA){DecodedData d;assert(parseDataPacket(tx.wire.data(),tx.wire.size(),d)&&d.fix);
    if(lastDataAt) maxGap=std::max(maxGap,tx.at-lastDataAt);
    lastDataAt=tx.at;++data;
-  }else{++extras;if(tx.type==MSG_GNSS_DIAGNOSTIC){assert(tx.wire.size()==36&&tx.finish-tx.at==494);}}
+  }else{++extras;if(tx.type==MSG_GNSS_DIAGNOSTIC){assert(tx.wire.size()==36&&tx.finish-tx.at==gnssDiagnosticAirtimeMs);}}
  }
  assert(data>250&&data<=270&&extras==9&&maxGap<1200);
  std::cout<<"PASS 135s source2Hz simulation DATA="<<data<<" diagnostics="<<extras<<" max DATA interval="<<maxGap<<" ms, all TX guards >=80ms\n";
@@ -397,7 +414,10 @@ void test_t096_boot_discards_old_live_source() {
  assert(havePkt&&lastData.seq==0&&rxDataCount==2&&sequenceMissing==0);
  std::cout<<"PASS T096 new boot clears stale live source and accepts new DATA baseline without resetting receiver counters\n";
 }
-int main(){test_t096_boot_discards_old_live_source();test_ten_second_packet_rate();test_codec_dispatch_and_weak_quality();test_latest_and_observed_age();test_bound_rf_freshness_is_separate_from_data();test_scheduler_two_hz_latest_only_and_diagnostic_guard();}
+int main(){test_t096_boot_discards_old_live_source();test_ten_second_packet_rate();test_codec_dispatch_and_weak_quality();test_latest_and_observed_age();test_bound_rf_freshness_is_separate_from_data();test_scheduler_two_hz_latest_only_and_diagnostic_guard();
+ // SF9/BW125/CR4/5, preamble8, explicit header and CRC: ceil airtime ms.
+ dataAirtimeMs=186;telemetryAirtimeMs=145;diagnosticAirtimeMs=165;gnssDiagnosticAirtimeMs=268;
+ test_scheduler_two_hz_latest_only_and_diagnostic_guard();}
 
 '''
 

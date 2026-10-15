@@ -109,7 +109,7 @@ static String controlJson() {
   js+=F(",\"last_error\":");js+=String(link.lastError);
   js+=F(",\"rf_group\":");js+=String(radio_profile::group);
   js+=F(",\"frequency_mhz\":");js+=String(radio_profile::frequencyMhz,1);
-  js+=F(",\"storage_after_hours\":12}");return js;
+  js+=F(",\"storage_after_hours\":0,\"ready_poll_ms\":30000}");return js;
 }
 static bool numberArg(const char *key,double &v) {
   if(!httpServer.hasArg(key))return false;
@@ -143,11 +143,9 @@ static void registerRoutes() {
     if(a=="start")action=client_control::Action::Start;
     else if(a=="stop")action=client_control::Action::Stop;
     else if(a=="test")action=client_control::Action::Test;
-    else if(a=="store")action=client_control::Action::Store;
+    // Legacy API clients now stop into retained Ready, never SystemOFF.
+    else if(a=="store")action=client_control::Action::Stop;
     else {httpServer.send(400,"application/json","{\"error\":\"unknown client action\"}");return;}
-    if(action==client_control::Action::Store && link.have && link.status.charging) {
-      httpServer.send(409,"application/json","{\"error\":\"disconnect USB power before deep sleep; stop remains available\"}");return;
-    }
     if(!link.request(action,millis(),nodeId)) {
       httpServer.send(409,"application/json","{\"error\":\"fresh paired client state required; another command or station may own the client\"}");return;
     }

@@ -1,4 +1,13 @@
 ## DOCS
+- `docs/health-check-2026-10-16.md` — 目前 WIP 深度健檢、建置重現性修正與 E91C／F035 更新驗證
+- `include/sdk_log.h` / `src/sdk_log.cpp` / `tools/test_sdk_log.py` — ESP-IDF task log 固定佇列，主迴圈 LogTee 與 SD／DIAG USB 匯出隔離
+- `docs/servo-controller-youmi-2026-10-10.md` — 已指定 Youmi 35 kg＋9600 baud 雙路串口控制板；現行 M0 固定、9600 baud TX43 單向輸出、359°／中位179.5；舊外部 UART 輸入移除
+- `demo/info-page/` — 2026-10-10 資訊頁獨立 mock demo，無實機請求、不燒錄；手機權限延後、不加複製摘要
+- `docs/assistant-handoff.md` — 其他助手交接入口、最新 WIP 位置、現行行為與驗證界線（2026-10-10）
+- `docs/t096-field-validation-2026-10-10.md` — 帶殼內建 GNSS 外測、手機對照、DATA／速度／RF 證據與外接天線未決項目
+- `docs/t096-rtc-standby-2026-10-09.md` — T096 Ready 保留 RAM 的 RTC 待機、30 秒時序、TX 喚醒修正與實機驗證
+- `docs/t096-controls-2026-10-05.md` / `docs/t096-power-validation-2026-10-08.md` — 顯示／電源歷史驗證；舊 SystemOFF 流程已由 RTC 待機取代
+- `docs/sf9-field-pair-2026-10-07.md` / `docs/lilygo-station-2026-10-06.md` — B 組 SF9 與 LilyGO Station／SD 部署
 - `include/firmware_version.h` — Client／Station 共用版本號唯一來源；發版時同步 `CHANGELOG.md`
 - `CHANGELOG.md` — 從 0.1 開始的版本紀錄（不等同 LoRa 協定版本）
 - `docs/interface.md` — LoRa 封包格式 + 攝影站 HTTP API + 欄位對應表
@@ -28,7 +37,7 @@
 - `include/uart_target.h` — UART 最新目標與 250 ms lease，不執行 PWM
 - `include/command_freshness.h` — HTTP／SET2 世代、序號、期限與 LoRa seq 重同步
 - `docs/motion-control.md` — 共用控制設定、來源有效性與新 HTTP／UART 契約
-- `docs/uart-servo.md` — GPS / UART 獨立控制與鏡頭指南針校正操作
+- `docs/uart-servo.md` — 手動／GPS 共用串口控制板與鏡頭指南針校正操作
 - `include/uart_servo_mode.h` / `src/uart_servo_mode.cpp` — UART 控制端點與輸入生命週期
 - `include/uart_set_parser.h` — SET／SET2／SYNC 分行、逾時與非法指令檢查
 - `include/loop_metrics.h` — wrap-safe deadline、服務間隔與同步操作耗時
@@ -43,7 +52,7 @@
 - `include/web_icon.h` — 分頁圖示 PNG（**產生檔，勿手改**）
 - `tools/make_icon.py` — 圖示的唯一來源；改設計後重跑會更新 web_icon.h
 - `tools/test_servo_slider.js` — `node tools/test_servo_slider.js` 驗證滑桿排程與模式切換
-- `tools/test_motion_backend.py` — 擷取實際 HTTP／PWM／GPS gate／NVS 讀寫做主機整合測試
+- `tools/test_motion_backend.py` — 擷取實際 HTTP／UART 輸出／GPS gate／NVS 讀寫做主機整合測試
 - `tools/test_motion_ui.js` — 資訊頁速度自動保存、GPS 選取門檻與完整頁面模擬
 - `tools/test_packet_backend.py` — 實際封包建立／解析與 GNSS 主機整合
 - `tools/test_debug_backend.py` / `tools/test_debug_ui.js` — 實際診斷 JSON／log cursor 與網頁錄製匯出

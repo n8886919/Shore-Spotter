@@ -1,109 +1,40 @@
-# GPS / UART 獨立控制
+# 手動／GPS 與串口 Servo 控制板
 
-正式映像為 `tbeam-station`。開機 Servo 置中 90°，初始化完成後預設手動。
-網頁選「手動／GPS／UART」，只有所選模式能控制 Servo，訊號變差不切換到另一模式。
-UART 模式可由 Jetson 或其他 3.3 V TTL 控制端使用。Wi-Fi 提供監控頁、手動 HTTP
-控制與 OTA；外部 UDP 控制已移除。
+## 2026-10-11 現行控制與介面
 
-| 模式 | 行為 | 訊號失效 |
-|---|---|---|
-| 手動 | slider 控制；GPS／UART 均不自動移動 | 保持最後輸出角度 |
-| GPS | 使用單一綁定 client 的位置與鏡頭指南針校正 | 停止外推，轉完最後有效目標再停住，不切 UART |
-| UART | 僅使用 UART SET，不要求 GPS 或指南針校正 | SET 過期後保持，不切 GPS |
+正式原始碼已整合 Youmi 35 kg（5–8.4 V、359°）＋串口控制板，固定 **M0**。
+Station UART2 **9600 8N1、TX GPIO43、RX 不配置**；`#00P0500!`～`#00P2500!`，無換行。
+`include/servo_controller.h` 合併最新目標、去重、最多 50 Hz 非阻塞送出；控制板自行產生 50 Hz PWM。
+角度 0～359°，中位 **179.5°／1500 μs**；開機輸出中位、預設手動。沒有 ACK 或實際角度回授。
+UART 寫入成功只證明 Station 交給 UART，不能證明控制板接受或 Servo 到位。
+只留手動／GPS；舊 115200 SET／SET2／SYNC 外部輸入不再編入正常 Station，`mode=uart/jetson` 回 400。
+GPS α UI、預測運算與設定 API 已移除；`/api/track/prediction` 回 404，舊 NVS 鍵不讀寫。
+GPS 仍使用兩端有效且新鮮的位置、磁偏角與校正，失效轉完最後有效目標；不自動切換來源。
+共用速限預設 30°/s、整數 1～90，NVS `servospd` 保存；GPS 目標每 50 ms 重算。
 
-切換模式會清除舊目標、關閉舊 UART session。只在 UART 模式開啟 UART；重新進入後
-需收到新的完整 SET 才移動，重複選取相同模式不重置。保持是維持最後 PWM 角度，
-不會回 90°或關閉 Servo 電源。Manual、pause、OTA、關機與 PWM 故障會撤銷自動控制。
+資訊頁四區：**定位資訊／Station Info／控制板／Surfer Info**。
+座標只顯示 Google Maps 連結；手填欄位由上至下經度／緯度／誤差。
+卫星顯示無／少／中／多；HDOP 下方說明其為幾何指標，不能換算成已知實際誤差。
+手機回報半徑、Station 30 秒 RMS 散布、實際誤差分開；真實誤差需對照已知參考位置。
+Station 顯示自有溫濕度與 SD 記錄狀態，無運行時間／Servo 來源／SD 錯誤計數；
+Surfer 顯示電池、GPS 開啟／關閉、STATE／DATA 年齡與 RF 品質，無 USB 供電列。
+GPS 狀態只依近期 STATE；未知或過期不假裝為關閉。
+控制板區顯示 M0、串口、命令角度／脈寬／字串與 UART 計數，實際角度為未知。
+磁偏角移到定位資訊；速度點數字開視窗、儲存成功才關閉，指南針整數 0～359、預設 90。
+「鏡頭置中」回 179.5°；停穩後填北 0°、東 90°、南 180°、西 270°重新校正（只存 RAM）。
+手動完整圓軌道 0～359°，0／359 在下、90 左、180 上、270 右，放開才送、端點不環繞。
+UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw 角度；地理方位另依校正計算。
+手機定位權限流程延後、不加複製診斷摘要。
 
-## UART 接線與指令
+部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；OTA 結果另見本次驗證記錄。
+主機通過 140 項 native、實際 HTTP／UART／GPS gate／NVS、圓形操作及地圖回歸。
+實體 M0 接線、UART 接受、轉向、端點、帶載及戶外 GPS 精度仍待驗收。
 
-UART2，115200 8N1；GPS 使用另一組 UART1（RX9/TX8）。
+## 接線及目視驗收
 
-- USB-to-TTL TX → LilyGo GPIO44 RX
-- USB-to-TTL RX → LilyGo GPIO43 TX
-- GND → GND；3.3 V TTL；各自供電時不接 adapter VCC/5V
-
-只接受每行一個 ASCII 指令，以 LF 或 CRLF 結束：
-
-```text
-SET 90000
-```
-
-Station 開機預設手動，切到 UART 後等待新 SET；資訊頁速限 1–90°/s，修改自動保存。
-單位毫度，範圍 0..180000。建議持續 20 Hz；不再需要 ARM，也不再接受 STOP。
-停送 SET 後，最後有效指令滿 250 ms 便撤銷 UART 目標。新 SET 可直接恢復，第一步
-從最後輸出角度開始；預設限速 30°/s；所有模式按微秒實際時間推進，只共用最高速度限制。
-預設速限下，持續有效指令的 90° → 150° 命令約需 2 秒；沒有額外加減速規劃。角度限制、watchdog 與 PWM 故障保護仍在 ESP32。
-開機首次歸中 90° 沒有實際位置回饋，無法保證該次動作的物理速度。
-
-無效、過長、含 NUL／符號／雜字的命令不刷新期限；未完成的一行也有 250 ms 期限。
-主 loop 停頓 ≥250 ms 後丟棄已排隊的 bytes，並等到下一個換行才接受新完整命令，
-避免把緩衝截斷的後半句當新資料。恢復時因此可能略過第一行 SET。
-250 ms 由主 loop 檢查；它不是獨立硬體中斷保證。
-
-## GPS 與鏡頭校正
-
-GPS 按鈕與 API 要求兩端有效位置且新資料未滿 2 秒；品質差只警告，外推另需衛星 ≥6、HDOP ≤3；
-Bad／Miss 不可選。開機即採用 90°有效鏡頭校正，追蹤仍需有效磁偏角；條件恢復即於下個控制週期追蹤，
-沒有額外 2 秒等待。失效停止更新目標，按速限轉完最後有效目標再停住，不啟用 UART。
-手動暫停、模式切換與 PWM 故障仍立即撤銷；`finishing_last_gps_target` 明示正在轉完舊目標。
-
-資訊頁新增 GPS 位置預測 α 開關（未發行）：開啟沿速度方向外推，關閉使用最後收到位置；
-預設關閉、自動保存。兩者仍共用 Servo 速限，切換不更改模式或校正；UART 不使用此設定。
-詳見 [GPS 預測說明](motion-control.md#gps-位置預測開關α未發行)。
-
-固定腳架，先按「回到 90°」：切為手動，依共用速限回到 Servo 90°，不自動恢復追蹤。
-等鏡頭與磁針停穩，再填鏡頭朝向：北 0°、東 90°、南 180°、西 270°；其他方向填實際讀數。
-僅命令位置與目標均為 90°、且限速器不再移動時接受校正；不需兩端 GPS 定位或地標。
-非 90°／移動中按校正會通知，後端重查並回 409，保留原校正。校正不切模式，完成後可再選 GPS。
-角度是 PWM 命令而非機械回饋；仍需自行確認鏡頭停穩。
-請求仍檢查角度與命令新鮮度，失敗顯示原因，可再次提交；校正不解除 PWM 故障。
-RAM 參考在 start/resume／模式切換間保留，重開機恢復 90°有效偏移；需要其他參考時再重新校正。
-只使用這個參考，沒有板上 QMC 航向補償；腳架轉動、重新架設或移動指南針後請重校。
-
-```text
-mount_offset = compass_bearing + servo_angle
-true_camera_bearing = mount_offset + declination - servo_angle
-```
-
-磁偏角東正西負，依攝影站 GPS 位置與 UTC 日期使用 WMM2025 離線表，適用北緯 18–28°、
-東經 116–124°、2025–2029 年、海平面。位置／日期無效或超出模型範圍時，GPS 不更新目標，最多轉完最後有效目標後保持。
-UART 模式完全不依賴此校正。來源與更新方式見 `tools/make_declination.py`。
-
-## ACK 與阻塞診斷
-
-ACK 非阻塞 startTransmit → TxDone／timeout → RX；處理太晚（RxDone 後 >50 ms）的 ACK
-略過、不排隊。主迴圈在 HTTP／感測器／OLED／LoRa 工作之間服務控制，所有模式運動輸出不限頻，GPS 目標重算保持 20 Hz，OLED 分段刷新。
-
-Wire 與 PMUWire 每筆交易 timeout 10 ms（原預設 50 ms）。單次裝置操作可能含多筆交易，
-因此 10 ms 不是整段感測器操作的上限。移除板上磁力計後，不再有其週期 I2C 取樣。
-WebServer 仍是同步實作；本批沒有把它改成非同步，也不保證服務間隔一定小於 250 ms。
-
-`GET /api/status` 的 `timing` 保存最大控制服務間隔、HTTP／BME280／PMU／OLED／LoRa／OTA
-與主 loop 的耗時、超時服務與 UART 丟棄／拒絕計數；不逐次寫 log。數值自開機累計，
-HTTP 與 loop 的本次耗時在返回後才更新，讀到的可能是上一筆。先在實機確認主要阻塞來源，
-若仍超過控制期限，再評估有界 HTTP 接收／傳送或獨立控制 task。
-
-## 單一 GPS client 與相容性
-
-GPS 綁定在 NVS 保存一個 `gpsclient`（0 = 未綁定）。`/api/whitelist` 容量 1；set 明確替換，
-add 不覆寫不同 ID。成功變更後清空舊 client 狀態並回手動。
-舊多筆 `wl` 只遷移第一個有效 ID；刻意清空保持清空。
-鏡頭與板上校正都不讀寫 NVS；舊 mount*／mag* 鍵留存但忽略，不做整區清除。
-
-`POST /api/servo/mode?mode=manual|gps|uart` 是模式入口；舊 mode=auto 回 400。
-舊 `mode=jetson` 保留為 UART 的輸入別名，所有模式回應與 status／track 統一回 `uart`。
-HTTP `/api/track/stop` 與 `/api/mag/calibrate` 已移除，回 404。
-`/api/track/start` 選 GPS；`/api/track/resume` 恢復上次選取的 GPS／UART（未選過自動來源時以 UART 為候選，開機模式為手動）；
-`/api/track/pause` 暫停；要手動調整請先明確選 manual。舊 UART 程式若依賴 ARM／STOP，應同步改用 SET
-與停送；本專案不會修改或部署外部控制端程式。
-
-## 共用後端與設定（2026-09-13，0.6-dev）
-
-所有來源只共用預設 30°/s 速限；資訊頁可調 1–90°/s，修改自動保存，重開機沿用。
-加速度、jerk、死區與頻率調參已移除，詳見 [共用控制器](motion-control.md)。
-資訊頁提供 GPS 預測 α 開關；離線資料存 SD 並由 USB 匯出，見 [操作指南](debug-export.md)。
-HTTP 控制需要 epoch／seq／stamp，模式 API 保留 jetson 別名。GPS 的 mode／start／resume
-入口都檢查兩端有效且持續更新的位置；拒絕時保留來源。舊 SET 保留，SYNC／SET2 可檢查 session、
-序號與期限；接受 SET2 後該 session 不再接受裸 SET。指南針校正仍只存 RAM。
-UART 契約保留；LoRa 已改為 v5／18-byte DATA，Client、Station 必須一起更新才能互通。
+LilyGO GPIO43 TX → 控制板 RX；GND 共地；Servo 固定接 M0，控制板保持手動燈亮，旋鈕不動。
+控制板 TX 不需回傳，RX GPIO44 不配置；圖片未提供控制板 TX 電平，軟體停用 RX 不等於隔離實體 5 V。
+控制板 8.4 V 電源不接進 Station UART／3.3 V。
+OTA 開機先送 `#00P1500!`；查看資訊頁控制板是否 M0／9600／1500 μs、寫入錯誤是否為 0，
+再目視 Servo 是否到中位。先以中位附近小幅度檢查方向，再驗證端點；不能由 UART 計數判定已動作。
+硬體圖片、脈寬模型與限制見 [控制板契約](servo-controller-youmi-2026-10-10.md)。

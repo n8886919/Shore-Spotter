@@ -10,16 +10,16 @@
 // Operator flow:
 // Calibration: type the heading read from the compass attached to the camera.
 // North=0, East=90; automatic start/resume preserves the saved reference.
-// GPS and UART are exclusive modes; a missing input holds the current angle.
+// Manual and GPS are the only control modes; a missing input holds the current angle.
 // Manual stops tracking and allows adjustment on the radar's outer ring.
 // Layout: full-height radar/map with an overlaid Info button and
-//   雷達/地圖 + 手動/GPS/UART controls over the canvas) and
+//   雷達/地圖 + 手動/GPS controls over the canvas) and
 //   資訊 (shared speed limit, GPS prediction, compass calibration and telemetry).
 //   The canvas auto-sizes to its container, and the
 //   surfer marker carries a GPS-status tag (衛星 少/普通/好, 預期精度 ±N m,
 //   Good/OK/Bad).
 // GPS is reported in operator terms, not receiver terms: the satellite count
-//   becomes 少/普通/好 and HDOP becomes 預期精度 in metres (see accM() below).
+//   becomes 無/少/中/多; HDOP remains dimensionless, never a measured error radius.
 // Manual is the boot default; GPS is selectable with current valid positions; quality gates prediction only.
 static const char WEB_UI_HTML[] = R"rawlit(
 <!DOCTYPE html>
@@ -165,6 +165,20 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .al.error .t{color:var(--bad)}
 .al.warn .t{color:var(--warn)}
 .al .d{font-size:12px;color:var(--mut);line-height:1.55}
+.infoCard{flex:none;width:100%;max-width:900px;margin-inline:auto;background:#fff}
+.infoCard h3{margin:0 0 14px;font-size:20px}
+.positionTable{width:100%;border-collapse:collapse;table-layout:fixed;font-size:14px}
+.positionTable th,.positionTable td{padding:12px 6px;border-bottom:1px solid #e3ebe5;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+.positionTable th:first-child{width:36%}.positionTable thead th{font-weight:700}
+.positionTable small{display:block;font-size:12px;line-height:1.5;color:#6b756f;font-weight:400;margin-top:5px}
+.infoCard .r{gap:12px}.infoCard .r b{overflow-wrap:anywhere;text-align:right;min-width:0}
+.infoCard details{margin-top:16px}.infoCard summary{cursor:pointer;color:var(--acc)}
+.verticalFields{display:flex;flex-direction:column;gap:12px}.verticalFields label{display:flex;flex-direction:column;gap:5px}
+.verticalFields input{width:100%;min-width:0}.positionToggle{display:flex;gap:0}.positionToggle .seg{flex:1}
+.numberButton{flex:none;min-width:0;border:0;background:transparent;padding:4px;color:var(--acc);text-decoration:underline}
+.infoCard a{color:var(--acc)}.infoCard .hint3{color:#6b756f;line-height:1.6}
+#controllerFrame{font-size:13px}dialog{border:1px solid var(--line);border-radius:12px;width:min(360px,90vw);padding:20px;color:var(--fg)}
+dialog::backdrop{background:#11251a66}dialog input{display:block;width:100%;margin-top:8px}
 </style>
 </head>
 <body>
@@ -172,7 +186,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
   <section id="pgRadar" class="page on">
     <div id="radarWrap">
       <canvas id="radar"></canvas>
-      <input id="sld" class="ringInput" aria-label="Servo 外圈角度，方向鍵調整，放開生效" type="range" min="0" max="180" step="1" value="90" disabled>
+      <input id="sld" class="ringInput" aria-label="Servo 外圈角度，方向鍵調整，放開生效" type="range" min="0" max="359" step="1" value="90" disabled>
       <svg id="servoRing" class="servoRing is-disabled" style="display:none" aria-hidden="true">
         <g id="servoRingTrack">
           <path id="servoRingRail" class="ringRail"></path>
@@ -204,7 +218,6 @@ button:disabled{opacity:.4;cursor:not-allowed}
       <span class="segwrap">
         <button id="mManual" class="seg on" type="button">手動</button>
         <button id="mGps" class="seg" type="button" disabled>GPS</button>
-        <button id="mUart" class="seg" type="button">UART</button>
       </span>
     </div>
       </div>
@@ -213,101 +226,80 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
   <section id="pgInfo" class="page">
     <button id="tabRadar" type="button">← 返回雷達</button>
-    <div class="card" style="flex:none">
-      <table class="cmp">
-        <thead><tr><th></th><th>站 Station</th><th>Surfer Client</th></tr></thead>
-        <tbody>
-          <tr><td>定位</td><td id="sFix">--</td><td id="cFix">--</td></tr>
-          <tr><td>衛星</td><td id="sSat">--</td><td id="cSat">--</td></tr>
-          <tr><td>預期精度</td><td id="sAcc">--</td><td id="cAcc">--</td></tr>
-          <tr><td>電量</td><td id="sBattV">--</td><td id="cBattV">--</td></tr>
-          <tr><td>溫度</td><td id="sTemp">--</td><td id="cTemp">--</td></tr>
-          <tr><td>濕度</td><td id="sHum">--</td><td id="cHum">--</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div class="infoCols">
-      <div class="col card">
-        <h3>站 專屬</h3>
-        <div class="r"><span>RSSI</span><b id="sRssi">--</b></div>
-        <div class="r"><span>SNR</span><b id="sSnr">--</b></div>
-        <div class="r"><span>丟包率</span><b id="sDrop">--</b></div>
-        <div class="sub">其他</div>
-        <div class="r"><span>韌體版本</span><b id="sVersion">--</b></div>
-      </div>
-      <div class="col card">
-        <h3>Surfer 專屬</h3>
-        <div class="r"><span>距離</span><b id="cDist">--</b></div>
-        <div class="r"><span>方位</span><b id="cBrg">--</b></div>
-        <div class="sub">LoRa 連線</div>
-        <div class="r"><span>連線</span><b id="cLink">--</b></div>
-        <div class="r"><span>距上次封包</span><b id="cAge">--</b></div>
+    <div class="card infoCard">
+      <h3>定位資訊</h3>
+      <table class="positionTable"><thead><tr><th>項目</th><th>Station</th><th>Surfer</th></tr></thead><tbody>
+        <tr><th>衛星</th><td id="sSat">--</td><td id="cSat">--</td></tr>
+        <tr><th>HDOP<small>衛星幾何造成的水平誤差放大倍率；越低越好，沒有公尺單位。</small></th><td id="sAcc">--</td><td id="cAcc">--</td></tr>
+        <tr><th>座標</th><td id="sMap">--</td><td id="cMap">--</td></tr>
+        <tr><th>位置更新</th><td id="sPositionAge">--</td><td id="cPositionAge">--</td></tr>
+        <tr><th>回報誤差半徑</th><td id="stationPositionAccuracy">--</td><td>未提供</td></tr>
+        <tr><th>30 秒散布</th><td id="stationSpread">--</td><td>未計算</td></tr>
+        <tr><th>實際位置誤差</th><td colspan="2">未測得<small>需與已知真實座標比較；手機半徑、HDOP 與散布不能代替真實誤差。</small></td></tr>
+      </tbody></table>
+      <div id="stationPositionSettings">
+        <div class="r"><span>Station 位置來源</span><b id="stationPositionSource">讀取中</b></div>
+        <div class="extensionActions positionToggle"><button id="btnGnssPosition" class="seg" type="button">Station GPS</button><button id="btnPhonePosition" class="seg" type="button">手機位置</button></div>
+        <div class="r"><span>手機快照時間</span><b id="stationPositionTime">--</b></div>
+        <div class="r"><span>磁偏角補償</span><b id="mcDeclination">--</b></div>
+        <div class="r"><span>校正偏移</span><b id="mcOff">--</b></div>
+        <details><summary>GNSS 診斷</summary><div class="r"><span>Station 實測 epoch／RMC／GGA</span><b id="gnssRate">--</b></div><div class="r"><span>Station checksum／時間錯誤</span><b id="gnssErrors">--</b></div><div class="r"><span>Surfer GNSS 快照</span><b id="gnssClientAge">--</b></div><p class="hint3">Surfer 是低頻診斷快照；GPS 關閉或回報過期時，舊資料不能當作目前狀態。</p></details>
+        <details><summary>手動輸入 Station 座標</summary>
+          <div class="extensionFields verticalFields">
+            <label>經度<input id="stationPhoneLon" type="text" inputmode="decimal" placeholder="例：121.00000" aria-label="Station 手動經度"></label>
+            <label>緯度<input id="stationPhoneLat" type="text" inputmode="decimal" placeholder="例：24.00000" aria-label="Station 手動緯度"></label>
+            <label>估計誤差（m）<input id="stationPhoneAccuracy" type="text" inputmode="decimal" placeholder="自行估計，非實測" aria-label="Station 手動估計誤差，公尺"></label>
+          </div>
+          <button id="btnManualPhonePosition" type="button">套用座標</button>
+        </details>
+        <p id="stationPositionState" class="extensionStatus" role="status" aria-live="polite">沿用原本 HTTPS 手機定位頁。</p>
       </div>
     </div>
-    <div class="card calCard" style="flex:none">
-      <h3>鏡頭指南針校正</h3>
-      <div class="calRow">
-        <button id="btnCompassCenter" type="button">回到 90°</button>
-        <input id="compassBearing" type="number" inputmode="decimal" min="0" max="359.9" step="0.1" placeholder="指南針角度 0–359.9°" aria-label="鏡頭指南針角度">
-        <button id="btnCompassCal" type="button" aria-describedby="compassCalState">校正</button>
-      </div>
-      <p class="hint3">開機採用 90° 偏移。需重新校正時，先回到 Servo 90° 並停穩，再填鏡頭朝向：北 0°、東 90°、南 180°、西 270°。其他方向填指南針實際讀數。</p>
-      <p id="compassCalState" class="hint2" role="status" aria-live="polite">回到 90° 會切為手動；校正後再選 GPS。</p>
-      <div class="r"><span>校正偏移</span><b id="mcOff">90.0°</b></div>
-      <div class="r"><span>岸端 30 秒座標散布</span><b id="stationSpread">--</b></div>
-      <div class="r"><span>磁偏角補償</span><b id="mcDeclination">--</b></div>
-
+    <div class="card infoCard">
+      <h3>Station Info</h3>
+      <div class="r"><span>溫度／濕度</span><b><span id="sTemp">--</span>／<span id="sHum">--</span></b></div>
+      <div class="r"><span>韌體版本</span><b id="sVersion">--</b></div>
+      <div class="r"><span>SD 記錄</span><b id="stationSd">讀取中</b></div>
+      <div id="servoSpeedSettings"><div class="r"><span>Servo 最高速度</span><button id="speedValue" class="numberButton" type="button" disabled>30°／秒</button></div><span id="speedSaveState" class="hint3">讀取速度中</span></div>
+      <div class="calRow"><span>鏡頭指南針校正</span><button id="btnCompassCenter" type="button">鏡頭置中</button></div>
+      <div class="calRow"><input id="compassBearing" type="text" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" value="90" aria-label="鏡頭指南針角度"><span>°</span><button id="btnCompassCal" type="button">校正</button></div>
+      <p class="hint3">北 0°、東 90°、南 180°、西 270°</p>
+      <p id="compassCalState" class="hint3" role="status">先置中、等鏡頭停穩，再校正；校正後再選 GPS。</p>
     </div>
-    <div id="servoSpeedSettings" class="card calCard" style="flex:none">
-      <h3>Servo 最高速度</h3>
-      <div class="calRow">
-        <input id="cfgSpeed" type="number" inputmode="decimal" min="1" max="90" step="0.1" value="30" disabled aria-label="Servo 最高速度，每秒度數">
-        <span>°／秒</span>
-      </div>
-      <span class="hint3">手動、GPS、UART 共用。可調 1–90°／秒，修改後自動儲存，重開機保留。</span>
-      <span id="speedSaveState" class="hint3">讀取速度中</span>
+    <div class="card infoCard" id="controllerSettings">
+      <h3>控制板</h3>
+      <div class="r"><span>Servo</span><b>Youmi 35 kg · 0–359°</b></div>
+      <div class="r"><span>串口輸出</span><b id="controllerSerial">讀取中</b></div>
+      <div class="r"><span>控制通道</span><b>M0（固定）</b></div>
+      <div class="r"><span>指令角度／目標</span><b id="controllerAngles">--</b></div>
+      <div class="r"><span>脈寬／最後指令</span><b id="controllerFrame">--</b></div>
+      <div class="r"><span>已送指令</span><b id="controllerSent">--</b></div>
+      <div class="r"><span>延後／寫入錯誤</span><b id="controllerErrors">--</b></div>
+      <p class="hint3">Servo 接 M0。控制板沒有已知 ACK 或角度回授，送出成功仍需目視確認；8.4 V 是接線供電值，沒有電壓感測。</p>
+      <p id="controllerState" class="hint3" role="status"></p>
     </div>
-    <div id="gpsPredictionSettings" class="card calCard" style="flex:none">
-      <label class="calRow" for="cfgPrediction"><input id="cfgPrediction" type="checkbox" disabled aria-describedby="predictionHelp predictionSaveState"> GPS 位置預測（α）</label>
-      <span id="predictionHelp" class="hint3">預設關閉。僅影響 GPS 模式。開啟（α＝1）：兩端品質合格且速度有效時，依接收後時間外推；品質差時仍追最新位置。關閉（α＝0）：追蹤最近收到的位置。切換可能改變追蹤目標，共用最高速度維持不變。修改後自動儲存，重開機保留。</span>
-      <span id="predictionSaveState" class="hint3" role="status" aria-live="polite">讀取預測設定中</span>
-    </div>
-    <div id="stationPositionSettings" class="card extensionCard" style="flex:none">
-      <h3>Station 位置</h3>
-      <div class="r"><span>目前來源</span><b id="stationPositionSource">讀取中</b></div>
-      <div class="r"><span>位置時間</span><b id="stationPositionTime">--</b></div>
-      <div class="r"><span>精度</span><b id="stationPositionAccuracy">--</b></div>
-      <div class="extensionActions">
-        <button id="btnPhonePosition" type="button">用手機更新位置</button>
-        <button id="btnGnssPosition" type="button">改用 Station GNSS</button>
-      </div>
-      <div class="extensionFields">
-        <input id="stationPhoneLat" type="number" inputmode="decimal" step="any" placeholder="緯度 lat" aria-label="Station 手動緯度">
-        <input id="stationPhoneLon" type="number" inputmode="decimal" step="any" placeholder="經度 lon" aria-label="Station 手動經度">
-        <input id="stationPhoneAccuracy" type="number" inputmode="decimal" min="0" step="any" placeholder="精度 m" aria-label="Station 手動精度，公尺">
-      </div>
-      <div class="extensionActions"><button id="btnManualPhonePosition" type="button">送出手動位置</button></div>
-      <p id="stationPositionState" class="extensionStatus" role="status" aria-live="polite">手機定位需從 HTTPS 手機定位頁明確按下開始；關閉或背景化後，Station 保留最後一次有效位置到重新開機。</p>
-    </div>
-    <div id="clientControlSettings" class="card extensionCard" style="flex:none">
-      <h3>T096 Client 遠端控制</h3>
-      <div class="r"><span>組別／頻率</span><b id="clientRadioGroup">--</b></div>
-      <div class="r"><span>配對 Client</span><b id="clientPairedId">--</b></div>
-      <div class="r"><span>裝置狀態</span><b id="clientControlState">讀取中</b></div>
+    <div id="clientControlSettings" class="card infoCard">
+      <h3>Surfer Info</h3>
+      <div class="r"><span>配對 Surfer</span><b id="clientPairedId">--</b></div>
+      <div class="r"><span>GPS</span><b id="clientControlState">未確認</b></div>
+      <div class="r"><span>電池</span><b id="cBattV">--</b></div>
       <div class="r"><span>距上次 STATE</span><b id="clientControlAge">--</b></div>
+      <div class="r"><span>距上次定位 DATA</span><b id="cAge">--</b></div>
+      <div class="r"><span>LoRa</span><b id="cLink">--</b></div>
+      <div class="r"><span>DATA FPS（10 s）</span><b id="cFps">--</b></div>
+      <div class="r"><span>RSSI／SNR</span><b><span id="sRssi">--</span>／<span id="sSnr">--</span></b></div>
+      <div class="r"><span>DATA 缺號比例</span><b id="sDrop">--</b></div>
+      <div class="r"><span>距離／方位</span><b><span id="cDist">--</span>／<span id="cBrg">--</span></b></div>
+      <div class="r"><span>組別／頻率</span><b id="clientRadioGroup">--</b></div>
       <div class="r"><span>命令</span><b id="clientControlCommand">--</b></div>
-      <div id="clientControlTest" class="extensionStatus">測試：--</div>
-      <div class="extensionActions">
-        <button id="btnClientStart" type="button" disabled>開始追蹤</button>
-        <button id="btnClientStop" type="button" disabled>停止為待命</button>
-        <button id="btnClientTest" type="button" disabled>LoRa RF 測試</button>
-        <button id="btnClientStore" type="button" disabled>請求深度休眠</button>
-      </div>
-      <p id="clientControlHint" class="extensionStatus" role="status" aria-live="polite">等待 T096 Client 的近期 STATE；離線時不會假稱為待命或深度休眠。</p>
+      <div class="extensionActions"><button id="btnClientStart" type="button" disabled>開啟 GPS</button><button id="btnClientStop" type="button" disabled>關閉 GPS</button></div>
+      <details><summary>LoRa RF 測試</summary><div id="clientControlTest" class="extensionStatus">--</div><button id="btnClientTest" type="button" disabled>RF 測試（GPS 關閉）</button></details>
+      <p id="clientControlHint" class="extensionStatus" role="status" aria-live="polite">等待近期 STATE。</p>
     </div>
   </section>
 </main>
 
+<dialog id="speedDialog"><form id="speedForm"><h3>Servo 最高速度</h3><label>每秒角度（1–90）<input id="cfgSpeed" type="text" inputmode="numeric" pattern="[0-9]{1,2}" maxlength="2" value="30"></label><p id="speedError" class="hint3" role="status"></p><div class="extensionActions"><button id="cancelSpeed" type="button">取消</button><button type="submit">儲存</button></div></form></dialog>
 <div id="alertBar" class="alertBar"></div>
 <div id="toast"></div>
 
@@ -345,34 +337,10 @@ var motionContext=null;
 // One entry per observed board reboot during this page's lifetime. A delayed
 // reply from a retired boot must never become the current command context again.
 var retiredControlBoots=[];
-function servoUiAngle(raw){return 180-Number(raw);}
-function servoRawAngle(ui){return 180-Number(ui);}
+function servoUiAngle(raw){return 359-Number(raw);}
+function servoRawAngle(ui){return 359-Number(ui);}
 var compassServoState=null;
 var speedLoaded=false,speedSaving=false,lastSavedSpeed=30;
-var predictionLoaded=false,predictionSaving=false,lastSavedPrediction=null,pendingPrediction=null;
-var predictionContext=null;
-// Keep a delayed poll/load from reverting a setting already confirmed by POST.
-function showPredictionSetting(j,confirmed){
-  var enabled=j.enabled;
-  if(typeof enabled!=='boolean'||j.alpha!==(enabled?1:0))return false;
-  if(!syncMotionContext(j))return false;
-  if(predictionSaving&&!confirmed)return false;
-  if(predictionContext&&j.control_boot_id===predictionContext.control_boot_id){
-    var elapsed=(j.clock_ms-predictionContext.clock_ms)|0;
-    if(elapsed<0)return false;
-    if(j.control_epoch===predictionContext.control_epoch&&
-       ((j.command_seq-predictionContext.command_seq)|0)<0)return false;
-    if(elapsed===0&&((j.control_epoch-predictionContext.control_epoch)|0)<0)return false;
-  }
-  var changed=!predictionLoaded||enabled!==lastSavedPrediction;
-  predictionContext={control_boot_id:j.control_boot_id,control_epoch:j.control_epoch,
-    command_seq:j.command_seq>>>0,clock_ms:j.clock_ms>>>0};
-  lastSavedPrediction=enabled;predictionLoaded=true;
-  $('cfgPrediction').checked=enabled;$('cfgPrediction').indeterminate=false;
-  $('cfgPrediction').disabled=controlChanging||predictionSaving;
-  if(changed||confirmed)$('predictionSaveState').textContent=enabled?'已記住：開啟（α＝1）':'已記住：關閉（α＝0）';
-  return true;
-}
 function syncMotionContext(j){
   if(retiredControlBoots.indexOf(j.control_boot_id)>=0)return false;
   if(j.control_epoch==null||j.clock_ms==null)return true;
@@ -544,13 +512,12 @@ function controlAction(url){
     .then(function(){controlChanging=false;return refresh();});
 }
 $('mGps').onclick=function(){controlAction('/api/servo/mode?mode=gps');};
-$('mUart').onclick=function(){controlAction('/api/servo/mode?mode=uart');};
 $('mManual').onclick=function(){controlAction('/api/servo/mode?mode=manual');};
 
 $('vRadar').onclick=function(){setView('radar');};
 $('vMap').onclick=function(){setView('map');};
 function radarHeading(d){
-  var angle=d&&d.servo.mount_offset_deg;
+  var angle=d&&d.servo.mount_offset_deg-179.5;
   return Number.isFinite(angle)?((angle%360)+360)%360:90;
 }
 function setView(m){
@@ -690,7 +657,7 @@ function layoutRadarOverlays(){
   document.documentElement.style.setProperty('--alert-list-height',Math.max(54,Math.min(c.height*.45,space-49))+'px');
 }
 function servoRingGeometry(){
-  var c=$('radar'),g=viewMode==='map'?{cx:c.width/2,cy:c.height/2,r:Math.max(24,Math.min(c.width,c.height)/2-26)}:radarGeometry();g.start=-90;
+  var c=$('radar'),g=viewMode==='map'?{cx:c.width/2,cy:c.height/2,r:Math.max(24,Math.min(c.width,c.height)/2-26)}:radarGeometry();g.start=180;
   return g;
 }
 function ringPoint(g,angle,radius){
@@ -708,16 +675,16 @@ function renderServoRing(){
   ring.setAttribute('viewBox','0 0 '+c.width+' '+c.height);
   ring.classList.toggle('is-disabled',!enabled);ring.classList.toggle('is-dragging',!!ringGesture);
   var p=ringPoint(g,0),q=ringPoint(g,180);
-  var path='M'+p.x+' '+p.y+' A'+g.r+' '+g.r+' 0 0 1 '+q.x+' '+q.y;
+  var path='M'+p.x+' '+p.y+' A'+g.r+' '+g.r+' 0 1 0 '+q.x+' '+q.y+' A'+g.r+' '+g.r+' 0 1 0 '+p.x+' '+p.y;
   ['servoRingRail','servoRingAccent','servoRingHit'].forEach(function(id){$(id).setAttribute('d',path);});
   var ticks='';
-  for(var a=0;a<=180;a+=15){
+  for(var a=0;a<360;a+=30){
     p=ringPoint(g,a,g.r-5);q=ringPoint(g,a,g.r+5);
     ticks+='<line x1="'+p.x+'" y1="'+p.y+'" x2="'+q.x+'" y2="'+q.y+'" stroke="#116238" stroke-width="2"/>';
-    if(a%45===0){p=ringPoint(g,a,g.r-20);ticks+='<text x="'+p.x+'" y="'+(p.y+4)+'" text-anchor="middle">'+a+'°</text>';}
+    if(a%90===0){p=ringPoint(g,a,g.r-20);ticks+='<text x="'+p.x+'" y="'+(p.y+4)+'" text-anchor="middle">'+(a===0?'0 / 359':a)+'°</text>';}
   }
   $('servoRingTicks').innerHTML=ticks;
-  var angle=clamp(Number($('sld').value)||0,0,180);p=ringPoint(g,angle);
+  var angle=clamp(Number($('sld').value)||0,0,359);p=ringPoint(g,angle);
   $('servoRingHandle').setAttribute('transform','translate('+p.x+' '+p.y+')');
   var line=$('servoRingPreview');
   line.setAttribute('x1',g.cx);line.setAttribute('y1',g.cy);line.setAttribute('x2',p.x);line.setAttribute('y2',p.y);
@@ -737,8 +704,10 @@ function updateRingPointer(ev){
   var dx=(ev.clientX-box.left)*$('radar').width/box.width-g.cx;
   var dy=(ev.clientY-box.top)*$('radar').height/box.height-g.cy;
   if(Math.hypot(dx,dy)<g.r*.35)return;
-  var angle=((Math.atan2(dx,-dy)*180/Math.PI-g.start)%360+360)%360;
-  if(angle>180)angle=angle<270?180:0;
+  var pointer=((Math.atan2(dx,-dy)*180/Math.PI-g.start)%360+360)%360;
+  if(ringGesture.last==null){ringGesture.preview=clamp(pointer,0,359);}
+  else{var delta=((pointer-ringGesture.last+540)%360)-180;ringGesture.preview=clamp(ringGesture.preview+delta,0,359);}
+  ringGesture.last=pointer;var angle=ringGesture.preview;
   $('sld').value=Math.round(angle);$('angTxt').textContent=$('sld').value;
   dragging=true;servoDragEnded=false;renderServoRing();
 }
@@ -746,7 +715,7 @@ $('servoRing').addEventListener('pointerdown',function(ev){
   if(ringGesture){cancelRingGesture();return;}
   if($('sld').disabled||controlChanging||Object.keys(activePointers).length||ev.button>0)return;
   ev.preventDefault();servoGestureCancelled=false;
-  ringGesture={id:ev.pointerId,geometry:servoRingGeometry()};
+  ringGesture={id:ev.pointerId,geometry:servoRingGeometry(),last:null,preview:Number($('sld').value)};
   try{this.setPointerCapture(ev.pointerId);}catch(_e){}
   updateRingPointer(ev);
 });
@@ -763,11 +732,11 @@ $('servoRing').addEventListener('pointercancel',cancelRingGesture);
 $('servoRing').addEventListener('lostpointercapture',cancelRingGesture);
 
 function showSpeedSetting(j){
-  if(!Number.isFinite(j.speed)||!syncMotionContext(j))return;
+  if(!Number.isFinite(j.speed)||!syncMotionContext(j))return false;
   lastSavedSpeed=j.speed;speedLoaded=true;
   $('cfgSpeed').value=j.speed;
-  $('cfgSpeed').disabled=false;
-  $('speedSaveState').textContent='已記住 '+j.speed+'°／秒';
+  $('cfgSpeed').disabled=false;$('speedValue').disabled=false;$('speedValue').textContent=j.speed+'°／秒';
+  $('speedSaveState').textContent='已記住 '+j.speed+'°／秒';return true;
 }
 function loadSpeedSetting(){
   return httpRequest('/api/servo/settings',1,'speed')
@@ -777,15 +746,18 @@ function saveSpeedLimit(){
   if(controlChanging||speedSaving||!speedLoaded)return;
   var raw=$('cfgSpeed').value.trim(),speed=Number(raw);
   if(raw===''||!Number.isFinite(speed)||speed<1||speed>90){
-    $('cfgSpeed').value=lastSavedSpeed;toast('最高速度請填 1–90°／秒');return;
+    if(!$('speedDialog').open)$('cfgSpeed').value=lastSavedSpeed;
+    $('speedValue').textContent=lastSavedSpeed+'°／秒';toast('最高速度請填 1–90°／秒');return;
   }
   var intent=controlIntent();
   speedSaving=true;controlChanging=true;$('cfgSpeed').disabled=true;
   $('speedSaveState').textContent='儲存中…';
   if(last.track)applyMode(last.track.servo);
   return servoRequest.then(function(){return post('/api/servo/settings?speed='+encodeURIComponent(speed),intent);})
-    .then(showSpeedSetting).catch(function(e){
-      $('cfgSpeed').value=lastSavedSpeed;
+    .then(function(j){if(!showSpeedSetting(j))throw new Error('速度回覆過期或無效');$('speedDialog').close();}).catch(function(e){
+      $('speedError').textContent=e.message||'速度未儲存';
+      if(!$('speedDialog').open)$('cfgSpeed').value=lastSavedSpeed;
+    $('speedValue').textContent=lastSavedSpeed+'°／秒';
       $('speedSaveState').textContent='儲存未完成，請重試';
       toast(e.message||e.error||'速度未儲存');
     }).finally(function(){
@@ -793,69 +765,29 @@ function saveSpeedLimit(){
       sendPendingServoAngle();return refresh();
     });
 }
-$('cfgSpeed').onchange=saveSpeedLimit;
-$('cfgSpeed').onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();this.blur();}};
-
-function loadPredictionSetting(){
-  return httpRequest('/api/track/prediction',1,'prediction').then(function(j){
-    if(j.ok!==true||typeof j.enabled!=='boolean'||j.alpha!==(j.enabled?1:0))throw new Error('預測設定讀取失敗');
-    showPredictionSetting(j,false);
-  }).catch(function(e){
-    if(!predictionLoaded){
-      $('cfgPrediction').disabled=true;$('cfgPrediction').indeterminate=true;
-      $('predictionSaveState').textContent=e.status===404?'目前韌體不支援預測開關':'預測設定讀取失敗：'+(e.message||'');
-    }
-  });
-}
-function savePredictionSetting(){
-  if(controlChanging||predictionSaving||!predictionLoaded){
-    $('cfgPrediction').checked=predictionSaving?pendingPrediction:lastSavedPrediction===true;
-    $('cfgPrediction').indeterminate=!predictionLoaded;return;
-  }
-  var enabled=$('cfgPrediction').checked;
-  if(enabled===lastSavedPrediction)return;
-  var intent=controlIntent();
-  pendingPrediction=enabled;predictionSaving=true;controlChanging=true;
-  $('cfgPrediction').disabled=true;$('predictionSaveState').textContent='儲存中…';
-  if(last.track)applyMode(last.track.servo);
-  return servoRequest.then(function(){return post('/api/track/prediction?enabled='+(enabled?1:0),intent);})
-    .then(function(j){
-      if(j.ok!==true||typeof j.enabled!=='boolean'||j.alpha!==(j.enabled?1:0))throw new Error('預測設定回覆無效');
-      if(!showPredictionSetting(j,true))throw new Error('設定狀態已更新，請重試');
-    }).catch(function(e){
-      $('cfgPrediction').checked=lastSavedPrediction;
-      $('predictionSaveState').textContent='儲存未完成，請重試';
-      toast(e.message||e.error||'預測設定未儲存');
-    }).finally(function(){
-      predictionSaving=false;pendingPrediction=null;controlChanging=false;
-      $('cfgPrediction').disabled=!predictionLoaded;
-      sendPendingServoAngle();return refresh();
-    });
-}
-$('cfgPrediction').indeterminate=true;
-$('cfgPrediction').onchange=savePredictionSetting;
+$('speedValue').onclick=function(){$('cfgSpeed').value=String(lastSavedSpeed);$('speedError').textContent='';$('speedDialog').showModal();$('cfgSpeed').focus();$('cfgSpeed').select();};
+$('cancelSpeed').onclick=function(){$('speedDialog').close();};
+$('speedForm').onsubmit=function(e){e.preventDefault();var v=$('cfgSpeed').value;if(!/^[0-9]+$/.test(v)||Number(v)<1||Number(v)>90){$('speedError').textContent='請輸入 1–90 的整數';return;}return saveSpeedLimit();};
+['cfgSpeed','compassBearing'].forEach(function(id){$(id).addEventListener('beforeinput',function(e){if(e.data&&!/^[0-9]+$/.test(e.data))e.preventDefault();});});
 
 function applyMode(sv){
   if(!syncMotionContext(sv))return;
   compassServoState=sv;
-  var gps=sv.mode==='gps',uart=(sv.mode==='uart'||sv.mode==='jetson'),tracking=gps||uart;
+  var gps=sv.mode==='gps',tracking=gps;
   $('mGps').classList.toggle('on',gps);
-  $('mUart').classList.toggle('on',uart);
   $('mManual').classList.toggle('on',!tracking);
   $('mGps').disabled=controlChanging||!sv.gps_available;
   $('mGps').title=sv.gps_available?'':'Station 與 Client 都需有持續更新的有效位置';
-  $('mUart').disabled=$('mManual').disabled=controlChanging;
+  $('mManual').disabled=controlChanging;
   $('sld').disabled=controlChanging||tracking;
   if($('sld').disabled)cancelRingGesture();
   if(!speedSaving && document.activeElement!==$('cfgSpeed') && Number.isFinite(sv.speed_limit_deg_s)) {
     lastSavedSpeed=sv.speed_limit_deg_s;speedLoaded=true;
-    $('cfgSpeed').value=lastSavedSpeed;
+    if(!$('speedDialog').open)$('cfgSpeed').value=lastSavedSpeed;
+    $('speedValue').textContent=lastSavedSpeed+'°／秒';
   }
   $('cfgSpeed').disabled=controlChanging||speedSaving||!speedLoaded;
-  showPredictionSetting({enabled:sv.prediction_enabled,alpha:sv.prediction_alpha,
-    control_boot_id:sv.control_boot_id,control_epoch:sv.control_epoch,
-    command_seq:sv.command_seq,clock_ms:sv.clock_ms},false);
-  $('cfgPrediction').disabled=controlChanging||predictionSaving||!predictionLoaded;
+  $('speedValue').disabled=$('cfgSpeed').disabled;
   if(!dragging&&document.activeElement!==$('sld')){
     var shown=sv.mode==='manual'&&sv.target!=null?sv.target:sv.angle;
     $('sld').value=Math.round(servoUiAngle(shown));$('angTxt').textContent=Math.round(servoUiAngle(shown));
@@ -863,35 +795,34 @@ function applyMode(sv){
   renderServoRing();
 }
 
-// HDOP is a dimensionless multiplier, which nobody on a beach can act on.
-// Horizontal accuracy ~= HDOP x UERE, and 2.5 m is the usual 1-sigma UERE for a
-// consumer single-band module like the ATGM336H, so HDOP 1.2 reads as +-3 m.
-// The wire format still carries HDOP (protocol.h unchanged) — this is display
-// only, so the number stays comparable with any other GPS tool.
-var UERE_M=2.5;
-function accM(hdop){return Number.isFinite(hdop)&&hdop>=0?hdop*UERE_M:null;}
-// Whole metres only: UERE is a rule of thumb, so a decimal would claim accuracy
-// the estimate does not have.
-function fmtAcc(hdop){var a=accM(hdop);
-  return a==null?'--':('\u00b1'+Math.round(a)+' m');}
-// Satellite count as words for the same reason: 8 vs 11 changes no decision,
-// "夠不夠" does. Thresholds match gpsGrade() below so the two never disagree.
-function satWord(sats){
-  if(!Number.isFinite(sats)||sats<0)return '--';
-  if(sats>=8)return '好';
-  if(sats>=6)return '普通';
-  return '少';
+function fmtAcc(hdop){return Number.isFinite(hdop)&&hdop>=0?'HDOP '+hdop.toFixed(1):'--';}
+function satWord(sats){return !Number.isFinite(sats)||sats<0?'--':sats===0?'無':sats>=8?'多':sats>=6?'中':'少';}
+function satelliteClassWord(cls){return ['無','少','中','多'][cls]||'--';}
+function clientSatelliteWord(client){return Number.isFinite(client.satellite_class)?satelliteClassWord(client.satellite_class):satWord(client.satellites);}
+function clientSatelliteGradeCount(client){return Number.isFinite(client.satellite_class)?[null,1,6,8][client.satellite_class]:client.satellites;}
+function mapLink(point){
+  if(!point||!point.fix||!Number.isFinite(point.lat)||!Number.isFinite(point.lon)||Math.abs(point.lat)>90||Math.abs(point.lon)>180)return '--';
+  return '<a href="https://www.google.com/maps/search/?api=1&amp;query='+encodeURIComponent(point.lat+','+point.lon)+'" target="_blank" rel="noopener noreferrer">Google Maps ↗</a>';
 }
-function satelliteClassWord(cls){return cls===3?'≥8 顆':cls===2?'6–7 顆':cls===1?'≤5 顆':'未知';}
-function clientSatelliteWord(client){
-  if(Number.isFinite(client.satellite_class))return satelliteClassWord(client.satellite_class);
-  return satWord(client.satellites);
+function ageLabel(ms){return Number.isFinite(ms)&&ms>=0?(ms/1000).toFixed(1)+' s':'--';}
+function renderController(sv){
+  var c=sv.controller||{};
+  $('controllerSerial').textContent=sv.output_ready?'TX GPIO'+c.tx_gpio+' · '+c.baud+' · 8N1':'輸出未就緒';
+  $('controllerAngles').textContent=Number(sv.angle).toFixed(1)+'°／'+Number(sv.target).toFixed(1)+'°';
+  $('controllerFrame').textContent=c.pulse_us?c.pulse_us+' μs · '+c.last_frame:'--';
+  $('controllerSent').textContent=Number.isFinite(c.tx_commands)?String(c.tx_commands):'--';
+  $('controllerErrors').textContent=Number.isFinite(c.tx_deferred)?c.tx_deferred+'／'+c.tx_errors:'--';
 }
-function clientSatelliteGradeCount(client){
-  // Class comes with each position; an exact telemetry count can be 30 s old.
-  if(Number.isFinite(client.satellite_class))return [null,1,6,8][client.satellite_class];
-  return client.satellites;
-}
+function refreshGnssDebug(){return httpRequest('/api/debug?limit=1',2,'gnss-debug').then(function(j){
+  var g=j.gps||{},c=j.client_gnss||{},stream=g.stream||{};
+  $('gnssRate').textContent=[g.observed_hz,g.rmc_hz,g.gga_hz].map(function(n){return Number.isFinite(n)?n.toFixed(2):'--';}).join('／')+' Hz';
+  $('gnssErrors').textContent=(g.checksum_errors==null?'--':g.checksum_errors)+'／'+(stream.missing_or_invalid_time==null?'--':stream.missing_or_invalid_time);
+  $('gnssClientAge').textContent=c.received?ageLabel(c.rx_age_ms)+(c.fresh?'':'（過期）'):'尚未收到';
+}).catch(function(){$('gnssRate').textContent='讀取失敗';});}
+function refreshSd(){return httpRequest('/api/sd/status',2,'sd-status').then(function(j){
+  var label=({recording:'記錄中',stopped:'已停止',error:'異常',unavailable:'無 SD',idle:'待命',ready:'就緒'})[j.state]||j.state||'未確認';
+  $('stationSd').textContent=label;
+}).catch(function(){$('stationSd').textContent='讀取失敗';});}
 // GPS quality grade (same thresholds as the firmware, shared by both ends).
 function gpsGrade(sats,hdop){
   if(!Number.isFinite(sats)||!Number.isFinite(hdop)||sats<0||hdop<0||sats<=0)return 'miss';
@@ -982,11 +913,11 @@ function refresh(){
     applyMode(d.servo);
     var dist=geoDist(d.station,d.client);
     // --- Station block ---
-    $('sFix').textContent=d.station.fix?'有':'無';
-    $('sSat').textContent=satWord(d.station.satellites);
-    $('sAcc').textContent=fmtAcc(d.station.hdop);
-    $('sBattV').textContent=(d.station.batt_pct>=0?d.station.batt_pct+'%':'--')+
-      (d.station.charging?' \u26a1':'');
+    $('sSat').textContent=last.position&&last.position.source==='phone'?'--':satWord(d.station.satellites);
+    $('sAcc').textContent=last.position&&last.position.source==='phone'?'--':d.station.fix&&Number.isFinite(d.station.hdop)?d.station.hdop.toFixed(1):'--';
+    $('sMap').innerHTML=mapLink(d.station);$('cMap').innerHTML=mapLink(d.client);
+    $('sPositionAge').textContent=last.position&&last.position.source==='phone'?ageLabel(last.position.age_ms):ageLabel(d.station.position_age_ms);
+    $('cPositionAge').textContent=ageLabel(d.client.rx_age_ms);renderController(d.servo);
     $('sTemp').textContent=d.station.temp_c==null?'--':d.station.temp_c+'°C';
     $('sHum').textContent=d.station.humidity_pct==null?'--':d.station.humidity_pct+'%';
     $('mcOff').textContent=d.servo.calibrated?d.servo.mount_offset_deg.toFixed(1)+'°':'未校正';
@@ -997,16 +928,15 @@ function refresh(){
     $('mcDeclination').textContent=d.servo.declination_deg==null?'等待有效 GPS 位置／日期':
       d.servo.declination_deg.toFixed(1)+'°（自動）';
     // --- Client block ---
-    $('cFix').textContent=d.client.fix?'有':'無';
-    $('cSat').textContent=clientSatelliteWord(d.client);
-    $('cAcc').textContent=fmtAcc(d.client.hdop);
+    $('cSat').textContent=last.clientControl&&last.clientControl.state==='ready'?'無':clientSatelliteWord(d.client);
+    $('cAcc').textContent=d.client.fix&&Number.isFinite(d.client.hdop)?d.client.hdop.toFixed(1):'--';
     $('cDist').textContent=(d.station.fix&&d.client.fix&&dist!=null)?dist.toFixed(0)+' m':'--';
     $('cBrg').textContent=d.bearing>=0?d.bearing.toFixed(0)+'°':'--';
     $('cLink').textContent=rfAlive(d)?(d.linked?'ONLINE':'收到遙測，等待 DATA'):'離線';
     $('cAge').textContent=d.client.last_rx_sec>=0?d.client.last_rx_sec+' s':'--';
-    $('cBattV').textContent=d.telemetry.batt_mv>0?battPct(d.telemetry.batt_mv)+'%':'--';
-    $('cTemp').textContent=d.telemetry.temp_c==null?'--':d.telemetry.temp_c+'°C';
-    $('cHum').textContent=d.telemetry.humidity_pct==null?'--':d.telemetry.humidity_pct+'%';
+    var mv=last.clientControl&&last.clientControl.supported&&last.clientControl.battery_mv||d.telemetry.batt_mv;
+    $('cBattV').textContent=mv>0?(mv/1000).toFixed(3)+' V · '+battPct(mv)+'%（估計）':'--';
+    $('cFps').textContent=Number.isFinite(d.lora_fps_10s)?d.lora_fps_10s.toFixed(1):'--';
     if(page==='radar')drawRadar(d,dist);
   }).catch(function(){}).then(function(){refreshing=false;});
 }
@@ -1049,14 +979,11 @@ function refreshStatus(){
   return httpRequest('/api/status',2,'status').then(function(s){
     last.status=s;
     last.status_received_at=new Date().toISOString();
-    if(s.servo)showPredictionSetting({enabled:s.servo.prediction_enabled,alpha:s.servo.prediction_alpha,
-      control_boot_id:s.servo.control_boot_id,control_epoch:s.servo.control_epoch,
-      command_seq:s.servo.command_seq,clock_ms:s.servo.clock_ms},false);
     last.alerts=s.alerts||[];
     renderAlerts(last.alerts);
-    $('sRssi').textContent=s.lora.rssi?s.lora.rssi.toFixed(0)+' dBm':'--';
+    $('sRssi').textContent=s.lora.rssi!=null?s.lora.rssi.toFixed(0)+' dBm':'--';
     $('sSnr').textContent=s.lora.snr!=null?s.lora.snr.toFixed(1)+' dB':'--';
-    $('sDrop').textContent=(s.lora.drop_rate*100).toFixed(1)+'%';
+    $('sDrop').textContent=s.lora.rx_data>0&&Number.isFinite(s.lora.drop_rate)?(s.lora.drop_rate*100).toFixed(1)+'%':'--';
     $('sVersion').textContent=s.health.firmware_version?'v'+s.health.firmware_version:'未標版';
   }).catch(function(){});
 }
@@ -1343,8 +1270,9 @@ function positionTime(ms){
   var d=new Date(ms);return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
 function renderStationPosition(j){
-  j=j||{};var valid=!!j.valid,source=j.source==='phone'?'手機':'Station GNSS';
-  $('stationPositionSource').textContent=valid?source:'無有效位置';
+  last.position=j||{};j=j||{};var valid=!!j.valid,source=j.source==='phone'?'手機':'Station GNSS';
+  $('stationPositionSource').textContent=source+(valid?'':'（無有效位置）');
+  $('btnGnssPosition').classList.toggle('on',j.source!=='phone');$('btnPhonePosition').classList.toggle('on',j.source==='phone');
   $('stationPositionTime').textContent=valid?positionTime(j.updated_utc_ms):'--';
   $('stationPositionAccuracy').textContent=valid&&Number.isFinite(j.accuracy_m)?j.accuracy_m.toFixed(1)+' m':'--';
   if(j.helper_url&&/^https:\/\/n8886919\.github\.io\/Shore-Spotter\/phone-location\.html(?:$|[?#])/.test(j.helper_url))PHONE_HELPER_URL=j.helper_url;
@@ -1389,27 +1317,26 @@ $('btnGnssPosition').onclick=function(){
     .catch(function(e){$('stationPositionState').textContent='切換未確認：'+(e.message||'連線失敗');toast(e.message||'切換未確認');})
     .finally(function(){$('btnGnssPosition').disabled=false;});
 };
-function clientStateText(state){return ({ready:'停止待命（網頁最遲約 30 秒可啟動）',tracking:'追蹤中',test:'RF 測試中',storage:'已回覆收納請求',unknown:'未知／未確認'})[state]||'未知／未確認';}
+function clientStateText(state){return ({ready:'關閉',tracking:'開啟',test:'關閉',storage:'關閉',unknown:'未確認'})[state]||'未確認';}
 function clientCommandText(command){return ({idle:'無待命令',pending:'等待 Client 確認',confirmed:'Client 已確認',timeout:'等待逾時',error:'命令錯誤'})[command]||'--';}
 function renderClientControl(j){
+  last.clientControl=j||{};
   j=j||{};var supported=j.supported===true,command=clientCommandText(j.command);
   $('clientRadioGroup').textContent=Number.isFinite(j.frequency_mhz)?(j.rf_group===0?'A':j.rf_group===1?'B':'?')+' / '+j.frequency_mhz.toFixed(1)+' MHz':'--';
   $('clientPairedId').textContent=j.client_id>0?Number(j.client_id).toString(16).toUpperCase().padStart(4,'0'):'未配對';
   $('clientControlState').textContent=supported?clientStateText(j.state):'未收到近期 STATE';
   $('clientControlAge').textContent=supported&&Number.isFinite(j.age_ms)?(j.age_ms/1000).toFixed(1)+' s':'--';
-  $('clientControlCommand').textContent=(j.state==='storage'&&j.command==='confirmed'?'已回覆收納請求':command)+(j.command_id!=null?' #'+j.command_id:'');
+  $('clientControlCommand').textContent=command+(j.command_id!=null?' #'+j.command_id:'');
   var test=Number.isFinite(j.test_received)?'RF：收 '+j.test_received+'／漏 '+(Number.isFinite(j.test_missing)?j.test_missing:'--')+
     '，'+(Number.isFinite(j.test_rssi)?j.test_rssi.toFixed(0)+' dBm':'--')+'，'+(Number.isFinite(j.test_snr)?j.test_snr.toFixed(1)+' dB':'--')+
     '，最大間隔 '+(Number.isFinite(j.test_max_gap_ms)?j.test_max_gap_ms+' ms':'--'):'RF：尚無測試結果';
   $('clientControlTest').textContent=test;
   $('clientControlHint').textContent=supported?(j.last_error?'最後錯誤：'+j.last_error:
     j.command==='pending'?'命令已入隊，等待 T096 STATE 確認。':
-    j.charging===true?'USB 供電中：待命 12 小時自動深度休眠會抑制；請先移除 USB 才能請求深度休眠。':
-    j.state==='storage'?'Client 已回覆收納請求；這不證明已進入深度休眠。深度休眠後須由外部喚醒，網頁不能喚醒。':
-    '停止後為待命，網頁最遲約 30 秒可重新啟動；未接 USB 時待命 12 小時會自動請求深度休眠。開始／停止 Client 不會切換 Servo GPS 模式。'):
-    '尚未收到近期 T096 STATE；離線不會被標示為待命或深度休眠。';
+    j.state==='storage'?'收到舊版收納回覆，請核對 Client 韌體；無法由這筆回覆確認睡眠或喚醒。':
+    '待機保留程式狀態，多數時間睡眠，每 30 秒交換指令；無線條件正常時通常約 30 秒內可啟動 GPS。啟動／待機不會切換 Servo GPS 模式。'):
+    '尚未收到近期 T096 STATE；目前狀態未確認。';
   ['btnClientStart','btnClientStop','btnClientTest'].forEach(function(id){$(id).disabled=!supported||clientControlBusy;});
-  $('btnClientStore').disabled=!supported||clientControlBusy||j.charging===true;
 }
 function refreshClientControl(){return httpRequest('/api/client/control',2,'client-control').then(renderClientControl).catch(function(){renderClientControl({supported:false});});}
 function sendClientControl(action){
@@ -1421,14 +1348,13 @@ function sendClientControl(action){
 $('btnClientStart').onclick=function(){sendClientControl('start');};
 $('btnClientStop').onclick=function(){sendClientControl('stop');};
 $('btnClientTest').onclick=function(){sendClientControl('test');};
-$('btnClientStore').onclick=function(){sendClientControl('store');};
 
 showPage('radar');
 refresh();refreshStatus();
 // ---- camera compass calibration ----
 var compassRequestId=0;
 $('btnCompassCenter').onclick=function(){
-  if(controlChanging){toast('控制操作處理中，請稍後再回到 90°');return;}
+  if(controlChanging){toast('控制操作處理中，請稍後再鏡頭置中');return;}
   cancelRingGesture();
   var requestId=++compassRequestId,intent=controlIntent();
   controlChanging=true;$('btnCompassCenter').disabled=true;
@@ -1437,13 +1363,13 @@ $('btnCompassCenter').onclick=function(){
   renderServoRing();
   // Invalidate the cached centre state before sending the move.
   compassServoState=null;
-  $('compassCalState').textContent='正在切為手動並回到 90°…';
+  $('compassCalState').textContent='正在切為手動並鏡頭置中…';
   return servoRequest.then(function(){return post('/api/servo/center',intent);})
     .then(function(j){
-      if(j.ok!==true||j.mode!=='manual'||j.target!==90)
+      if(j.ok!==true||j.mode!=='manual'||j.target!==179.5)
         throw new Error('回中回覆不完整');
       if(requestId===compassRequestId)
-        $('compassCalState').textContent='已送出回到 90°；等鏡頭停穩後再按校正';
+        $('compassCalState').textContent='已送出鏡頭置中；等鏡頭停穩後再按校正';
     }).catch(function(e){
       if(requestId===compassRequestId)$('compassCalState').textContent='回中未確認：'+(e.message||'連線失敗')+'，可重試';
     }).then(function(){
@@ -1454,13 +1380,13 @@ $('btnCompassCal').onclick=function(){
   var requestId=++compassRequestId;
   var text=$('compassBearing').value.trim();
   var bearing=Number(text);
-  if(text.length>16||!/^(?:\d+\.?\d*|\.\d+)$/.test(text)||!Number.isFinite(bearing)||bearing<0||bearing>=360){
-    $('compassCalState').textContent='請輸入 0 到未滿 360 度的十進位角度';
+  if(text.length>16||!/^[0-9]+$/.test(text)||!Number.isFinite(bearing)||bearing<0||bearing>=360){
+    $('compassCalState').textContent='請輸入 0–359 的整數角度';
     toast($('compassCalState').textContent);return;
   }
   if(controlChanging||servoSending||servoPendingAngle!==null||dragging||
      !compassServoState||compassServoState.calibration_ready!==true){
-    var hint='請先回到 90° 並等鏡頭停穩，再按校正';
+    var hint='請先鏡頭置中 並等鏡頭停穩，再按校正';
     $('compassCalState').textContent=hint;toast(hint);return;
   }
   // The backend rechecks centre after queueing, so stale UI cannot calibrate
@@ -1488,7 +1414,8 @@ setInterval(refreshStatus,3000);
 setInterval(refreshStationPosition,3000);
 setInterval(refreshClientControl,3000);
 loadSpeedSetting();
-loadPredictionSetting();
+refreshSd();refreshGnssDebug();
+setInterval(refreshSd,3000);setInterval(refreshGnssDebug,10000);
 </script>
 </body>
 </html>

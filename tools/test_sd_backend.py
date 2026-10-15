@@ -181,7 +181,19 @@ def main():
                 text=next(r for r in rows[1:] if r['kind']=='text_log');assert text['text']=='hello "world"\n'
                 snap=next(r for r in rows[1:] if r['kind']=='station_snapshot');assert snap['_time'] is None
                 assert len([r for r in rows[1:] if r['kind']=='session'])==2
+                for session in [r for r in rows[1:] if r['kind']=='session']:
+                    assert session['sf']==10 and session['frequency_mhz']==923.2,session
             print('PASS SD',scenario)
+        # B builds must record actual SF9/923.8, including after stop/restart.
+        subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-DARDUINO','-DROLE_STATION',
+                        '-DSHORE_RF_GROUP=1','-DSHORE_RF_FREQUENCY_MHZ=923.8f','-DSHORE_RF_SPREADING_FACTOR=9',
+                        '-I'+str(folder),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'src'),str(folder/'main.cpp'),'-o',str(folder/'test-b')],check=True)
+        rows=[json.loads(line) for line in subprocess.check_output([str(folder/'test-b'),'success'],text=True).splitlines()]
+        sessions=[r for r in rows[1:] if r['kind']=='session']
+        assert len(sessions)==2
+        for session in sessions:
+            assert (session['sf'],session['frequency_mhz'],session['bw_khz'],session['cr'],session['protocol'])==(9,923.8,125,5,5),session
+        print('PASS SD group B SF9/923.8 metadata and unchanged wire v5 after restart')
     print('PASS real SD worker: zero-wait queue, 255-byte CRC raw, offline snapshots, escaping, stop/restart, rotation, no format, I/O failure visibility')
 
 if __name__ == "__main__":

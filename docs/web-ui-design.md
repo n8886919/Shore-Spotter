@@ -1,7 +1,79 @@
 # 網頁設計規格
 
-最後確認：2026-09-23。這是使用者逐次確認後的**現行設計基準**，不是待辦提案。
+## 2026-10-11 現行控制與介面
+
+正式原始碼已整合 Youmi 35 kg（5–8.4 V、359°）＋串口控制板，固定 **M0**。
+Station UART2 **9600 8N1、TX GPIO43、RX 不配置**；`#00P0500!`～`#00P2500!`，無換行。
+`include/servo_controller.h` 合併最新目標、去重、最多 50 Hz 非阻塞送出；控制板自行產生 50 Hz PWM。
+角度 0～359°，中位 **179.5°／1500 μs**；開機輸出中位、預設手動。沒有 ACK 或實際角度回授。
+UART 寫入成功只證明 Station 交給 UART，不能證明控制板接受或 Servo 到位。
+只留手動／GPS；舊 115200 SET／SET2／SYNC 外部輸入不再編入正常 Station，`mode=uart/jetson` 回 400。
+GPS α UI、預測運算與設定 API 已移除；`/api/track/prediction` 回 404，舊 NVS 鍵不讀寫。
+GPS 仍使用兩端有效且新鮮的位置、磁偏角與校正，失效轉完最後有效目標；不自動切換來源。
+共用速限預設 30°/s、整數 1～90，NVS `servospd` 保存；GPS 目標每 50 ms 重算。
+
+資訊頁四區：**定位資訊／Station Info／控制板／Surfer Info**。
+座標只顯示 Google Maps 連結；手填欄位由上至下經度／緯度／誤差。
+卫星顯示無／少／中／多；HDOP 下方說明其為幾何指標，不能換算成已知實際誤差。
+手機回報半徑、Station 30 秒 RMS 散布、實際誤差分開；真實誤差需對照已知參考位置。
+Station 顯示自有溫濕度與 SD 記錄狀態，無運行時間／Servo 來源／SD 錯誤計數；
+Surfer 顯示電池、GPS 開啟／關閉、STATE／DATA 年齡與 RF 品質，無 USB 供電列。
+GPS 狀態只依近期 STATE；未知或過期不假裝為關閉。
+控制板區顯示 M0、串口、命令角度／脈寬／字串與 UART 計數，實際角度為未知。
+磁偏角移到定位資訊；速度點數字開視窗、儲存成功才關閉，指南針整數 0～359、預設 90。
+「鏡頭置中」回 179.5°；停穩後填北 0°、東 90°、南 180°、西 270°重新校正（只存 RAM）。
+手動完整圓軌道 0～359°，0／359 在下、90 左、180 上、270 右，放開才送、端點不環繞。
+UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw 角度；地理方位另依校正計算。
+手機定位權限流程延後、不加複製診斷摘要。
+
+部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；已 application OTA 更新，HTML 比對、M0 輸出與持續 STATE 通過；見 [部署驗證](servo-ui-deployment-2026-10-11.md)。
+主機通過 140 項 native、實際 HTTP／UART／GPS gate／NVS、圓形操作及地圖回歸。
+實體 M0 接線、UART 接受、轉向、端點、帶載及戶外 GPS 精度仍待驗收。
+
+## 以下為前版規格／歷史紀錄（控制與 UI 差異以上節為準）
+
+版面基準確認：2026-09-23；Client控制／RF狀態文件核對更新至2026-10-10。
+這是使用者逐次確認後的**現行設計基準**，不是待辦提案；日期更新不代表另改版面。
 適用於 `include/web_ui.h` 的 Station 操作網頁；功能入口見 [function-entrypoints.md](function-entrypoints.md)。
+
+## 2026-10-10 資訊頁 demo（待評閱，未部署）
+
+最新使用者指示優先：先作可操作 demo，不燒錄；本節是新預覽規格，下文保留正式 UI 基準。
+檔案 [demo/info-page](../demo/info-page/README.md)，啟動後預設 Ready；完全使用 mock、CSP禁止 API連線。
+正式 `include/web_ui.h`、雷達／地圖、追蹤／Servo韌體與裝置設定本次未改，未編譯／燒錄。
+使用者後續確認完整圓形0～359°軌道、停用外部UART輸入；demo追加雷達預覽，只留手動／GPS。
+
+| 區塊 | 新 demo 內容 |
+|---|---|
+| 定位資訊 | Station／Surfer對照；拿掉獨立「定位」列，狀態併衛星；原始HDOP、座標、位置更新時間；Station來源左右toggle、手機精度、30秒RMS散布、磁偏角 |
+| Station Info | Station溫濕度、韌體／運行時間、SD記錄／錯誤、Servo來源與指令／目標、新串口控制板；速度點數字開視窗、指南針校正／鏡頭置中 |
+| Surfer Info | 電池電壓＋估計百分比、USB狀態、Ready／Tracking、STATE／DATA分開年齡、DATA FPS、RSSI/SNR、DATA缺號、距離／方位、命令pending／confirmed與Client控制 |
+
+- HDOP×2.5 m 的「預期精度」在 demo 移除；HDOP／手機回報半徑／RMS散布明確分開。
+- Ready明示GPS關閉，過期GNSS快照不假裝為即時診斷；沒有DATA樣本時漏包顯示`--`。
+- Client position更新顯示**Station收到DATA後的時間**，不宣稱已量到來源內部延遲；來源年齡仍不在DATA。
+- 電量只放Surfer；溫濕度為Station自己的感測值，不能把Client量測改標Station。
+- 控制板是 [Youmi新指定組合](servo-controller-youmi-2026-10-10.md)；demo角度是指令值，
+  脈寬示意不代表ACK／實際位置。M0是demo假定，不代表已查出接在哪一路。
+- 指南針輸入text＋numeric，整數0～359、預設90；灰字「北 0°、東 90°、南 180°、西 270°」。
+- 回到90°改為「鏡頭置中」；demo以待驗行程中點179.5°示意，與指南針預設90°分開。
+- Servo最高速度只顯示可點數字；視窗輸入整數1～90、預設30、取消／儲存，無spinners；本頁保存，重載即重置。
+- GPS α 不在demo；正式預測功能／API／NVS使用移除仍待實作，不宣稱已完成。
+- Station來源左右分段toggle只預覽顯示，**手機定位權限提示先不處理**，既有HTTPS watchPosition流程未改。
+- 不加複製診斷摘要；保留手動Station座標折疊項。GNSS／控制板／Client診斷按需展開。
+- Demo確認Client指令要手動點上方「模擬收到STATE」，不把送出就當完成；啟動後先Tracking無fix，Station仍手動。
+- 雷達demo採完整圓形0～359°：0／359兩端在下方、中位約179.5在上、90在左、270在右。
+  指令刻度與指南針方位分開；轉向／校準待驗。拖曳預覽、放開套用；跨端點夾住，不自動環繞。
+  切模式／頁面／取消／第二觸點／尺寸變動撤銷未完成手勢。GPS只顯示不可拖曳角度標記。
+  使用者已指定取消外部UART輸入，demo只保留手動／GPS，正式移除待實作；地圖demo未提供。
+- Station SD recording/write errors目前需補唯讀API；Client診斷/版本等以實際wire/API可用欄位為限，不能讓mock代替真實資料。
+
+驗證：JavaScript語法通過；瀏覽器七情境、速度超限／儲存／取消、pending→STATE確認、
+指南針360拒絕／359接受、來源toggle與診斷展開通過。
+320與360 px手機斷點沒有橫向溢出，速度視窗可操作；瀏覽器JS error為0。
+完整圓形手機把手44px、拖曳至90°、鍵盤Home／End、跨端點仍停0／359、GPS不可拖曳通過；
+demo只有手動／GPS。指令刻度與地理方位映射是demo示意，實機待驗。
+均為mock/UI證據，不是硬體驗收；沒有韌體build／燒錄或實機試轉。
 
 ## 修改原則
 
@@ -37,12 +109,21 @@
 資訊頁保留裝置遙測、韌體版本、校正偏移、回到 90°、指南針校正、共用 Servo 最高速度、GPS 預測 α，及下列 Station／Client 擴充卡。
 沒有另外新增除錯或 SD log 操作 UI；SD 透過 USB 讀取。
 
+資訊頁即時 RSSI／SNR 使用最近接受的綁定 Client RF 封包，與 GPS DATA freshness 分開；
+90秒無有效 RF 顯示 `--`，有效的 0 dBm 仍顯示數值。DATA 平均／FPS 的定義不變（2026-10-05）。
+
 ### Station 手機位置與 T096 Client
 
 - 資訊頁在既有 Servo／GPS 設定卡後，保留簡短的「Station 位置」卡：顯示目前來源、位置時間及精度；可切回 Station GNSS、由手機更新，或在無法開手機定位頁時手填緯度／經度／精度。手機通常放在 Station 旁邊，故可作為 Station 位置來源。
 - Station 內嵌頁是 HTTP，不能宣稱可直接取得瀏覽器定位。使用者按「用手機更新位置」才開啟 GitHub Pages 的 HTTPS 手機定位頁 `phone-location.html`；它用 `watchPosition` 持續回傳。頁面背景化／鎖屏／被瀏覽器節電時可能停止，Station 只在 RAM 保留最後成功 snapshot 到重新開機，不能說成背景定位保證。
 - 手機定位頁不會上傳位置；它只會回傳給本次開啟它的 Station 頁面。主頁只收固定 `https://n8886919.github.io` origin 與當次開啟頁面的有效位置。return URL 放於 fragment，避免傳到 GitHub HTTP 請求；僅可為 HTTP 私有 IP、localhost 或 `.local` Station 位址；手動輸入仍會走同一個 Station local API。
-- 資訊頁另有「T096 Client 遠端控制」卡。僅在近期收到 T096 `STATE` 時啟用開始、停止為待命、無 GPS 的 LoRa RF 測試及深度休眠請求；送出後要顯示等待 Client 確認，不能把已入隊當成完成。停止後是可由 Web 最遲約 30 秒重新啟動的待命；未接 USB 時待命 12 小時會自動請求深度休眠，USB 供電時抑制。Client 回覆收納請求不證明已經睡眠；深度休眠後需外部喚醒，Web 不能喚醒，充電板上的實際休眠仍未驗證。USB 供電時禁用深度休眠請求並顯示先移除 USB。顯示 Client state、STATE 年齡、命令結果、RF 收／漏包、RSSI、SNR 與最大間隔。離線只顯示未收到近期 STATE，不可假稱待命或深度休眠；開始／停止 Client 也不能切換 Servo／GPS 模式。
+- 資訊頁另有「T096 Client 遠端控制」卡。2026-10-09 使用者確認日常只有「啟動 GPS／回待機」；
+  移除深度休眠請求，保留無 GPS 的 LoRa RF 測試診斷。Ready 多數時間保留狀態睡眠，每30秒交換指令，
+  不再12小時自動SystemOFF。近期STATE才啟用控制；送出顯示pending，收到匹配STATE才confirmed。
+  UI的「每30秒交換指令」為排程值；由上次STATE TX_DONE起算，純電池啟動confirmed實測30.776秒，
+  正常約一輪、約31秒，不保證失聯時期限。顯示STATE年齡、命令結果、RF收／漏包、RSSI/SNR及最大間隔。
+  USB供電仍可啟動／回待機；`charging`不作太陽能充電判定。舊Storage回覆提示核對韌體、不宣稱睡眠成功。
+  離線只顯示未收到近期STATE；啟動／待機不能切換Station Servo／GPS模式。
 
 ## 雷達與地圖
 
@@ -89,7 +170,7 @@ LoRa 的狀態行顯示 `1.8 FPS · 10s` 形式的最近 10 秒平均；連線�
 |---|---|---|
 | Station GPS | `/api/track.station.fix` 有效 | 無有效定位 |
 | Client GPS | `/api/track.client.fix` 有效 | 無有效定位 |
-| LoRa | `/api/track.rf_alive` 為真：90 秒內接受過綁定 Client 的 DATA／TEL／DIAG／GNSS 任一封包 | 不符合 RF 活動條件 |
+| LoRa | `/api/track.rf_alive` 為真：90 秒內接受過綁定 Client 的 DATA／TEL／DIAG／GNSS／STATE／RF probe 任一有效封包 | 不符合 RF 活動條件 |
 
 - LoRa 綠燈不表示 GPS 有效，也不表示 RF 沒有丟包。GPS 綠燈不表示預期精度一定合格。
 - RF 仍活躍但 `linked=false` 時，提示、可存取名稱與資訊頁連線文字顯示「收到遙測，等待 DATA」。

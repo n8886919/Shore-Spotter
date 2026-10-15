@@ -7,7 +7,7 @@ using uart_set_parser::Result;
 void setUp() {} void tearDown() {}
 void test_uart_mailbox_latest_and_timeout() {
   uart_target::Mailbox m;
-  TEST_ASSERT_FALSE(m.ready());TEST_ASSERT_FALSE(m.set(-1,0));TEST_ASSERT_FALSE(m.set(180001,0));
+  TEST_ASSERT_FALSE(m.ready());TEST_ASSERT_FALSE(m.set(-1,0));TEST_ASSERT_FALSE(m.set(359001,0));
   m.set(120000,10);m.set(30000,20);TEST_ASSERT_EQUAL_INT32(30000,m.target());
   m.expire(269);TEST_ASSERT_TRUE(m.ready());m.expire(270);TEST_ASSERT_FALSE(m.ready());
   TEST_ASSERT_EQUAL_STRING("watchdog_hold",m.state());
@@ -30,7 +30,7 @@ void test_parser_accepts_set_only() {
   TEST_ASSERT_EQUAL_INT32(0, angle);
   TEST_ASSERT_TRUE(line(p, "SET 180000\n", 0, angle) == Result::Target);
   TEST_ASSERT_EQUAL_INT32(180000, angle);
-  for (const char *bad : {"ARM\n", "STOP\n", "SET -1\n", "SET 180001\n", "SET 9x\n", "SET 99999999999\n"})
+  for (const char *bad : {"ARM\n", "STOP\n", "SET -1\n", "SET 359001\n", "SET 9x\n", "SET 99999999999\n"})
     TEST_ASSERT_TRUE(line(p, bad, 1, angle) == Result::Rejected);
   TEST_ASSERT_TRUE(line(p, "SET 90000\n", 2, angle) == Result::Target);
 }
@@ -61,7 +61,7 @@ void test_parser_sequenced_command_and_sync() {
   TEST_ASSERT_TRUE(line(p,"SET2 42 3 100 91000\n",110,angle)==Result::Target);
   TEST_ASSERT_EQUAL_INT32(91000,angle);TEST_ASSERT_TRUE(p.frame().sequenced);
   TEST_ASSERT_EQUAL_UINT32(42,p.frame().epoch);TEST_ASSERT_EQUAL_UINT32(100,p.frame().stamp);
-  for(const char *bad:{"SET2 42 3 100 180001\n","SET2 42 3 100 -1\n","SET2 42 3 100 90000 extra\n","SET2 42 3 4294967296 90000\n"})
+  for(const char *bad:{"SET2 42 3 100 359001\n","SET2 42 3 100 -1\n","SET2 42 3 100 90000 extra\n","SET2 42 3 4294967296 90000\n"})
     TEST_ASSERT_TRUE(line(p,bad,120,angle)==Result::Rejected);
   TEST_ASSERT_TRUE(line(p,"SET 90000\n",130,angle)==Result::Target);TEST_ASSERT_FALSE(p.frame().sequenced);
 }

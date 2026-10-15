@@ -1,12 +1,50 @@
 # 硬體說明（Hardware）
 
+## 2026-10-11 現行控制與介面
+
+正式原始碼已整合 Youmi 35 kg（5–8.4 V、359°）＋串口控制板，固定 **M0**。
+Station UART2 **9600 8N1、TX GPIO43、RX 不配置**；`#00P0500!`～`#00P2500!`，無換行。
+`include/servo_controller.h` 合併最新目標、去重、最多 50 Hz 非阻塞送出；控制板自行產生 50 Hz PWM。
+角度 0～359°，中位 **179.5°／1500 μs**；開機輸出中位、預設手動。沒有 ACK 或實際角度回授。
+UART 寫入成功只證明 Station 交給 UART，不能證明控制板接受或 Servo 到位。
+只留手動／GPS；舊 115200 SET／SET2／SYNC 外部輸入不再編入正常 Station，`mode=uart/jetson` 回 400。
+GPS α UI、預測運算與設定 API 已移除；`/api/track/prediction` 回 404，舊 NVS 鍵不讀寫。
+GPS 仍使用兩端有效且新鮮的位置、磁偏角與校正，失效轉完最後有效目標；不自動切換來源。
+共用速限預設 30°/s、整數 1～90，NVS `servospd` 保存；GPS 目標每 50 ms 重算。
+
+資訊頁四區：**定位資訊／Station Info／控制板／Surfer Info**。
+座標只顯示 Google Maps 連結；手填欄位由上至下經度／緯度／誤差。
+卫星顯示無／少／中／多；HDOP 下方說明其為幾何指標，不能換算成已知實際誤差。
+手機回報半徑、Station 30 秒 RMS 散布、實際誤差分開；真實誤差需對照已知參考位置。
+Station 顯示自有溫濕度與 SD 記錄狀態，無運行時間／Servo 來源／SD 錯誤計數；
+Surfer 顯示電池、GPS 開啟／關閉、STATE／DATA 年齡與 RF 品質，無 USB 供電列。
+GPS 狀態只依近期 STATE；未知或過期不假裝為關閉。
+控制板區顯示 M0、串口、命令角度／脈寬／字串與 UART 計數，實際角度為未知。
+磁偏角移到定位資訊；速度點數字開視窗、儲存成功才關閉，指南針整數 0～359、預設 90。
+「鏡頭置中」回 179.5°；停穩後填北 0°、東 90°、南 180°、西 270°重新校正（只存 RAM）。
+手動完整圓軌道 0～359°，0／359 在下、90 左、180 上、270 右，放開才送、端點不環繞。
+UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw 角度；地理方位另依校正計算。
+手機定位權限流程延後、不加複製診斷摘要。
+
+部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；OTA 結果另見本次驗證記錄。
+主機通過 140 項 native、實際 HTTP／UART／GPS gate／NVS、圓形操作及地圖回歸。
+實體 M0 接線、UART 接受、轉向、端點、帶載及戶外 GPS 精度仍待驗收。
+
+## 以下為前版規格／歷史紀錄（控制與 UI 差異以上節為準）
+
 本文件彙整 Shore Spotter 的硬體規格與接線：
+
+> **2026-10-10 使用者指定的新 Servo 組合**：Youmi 35 kg、5–8.4 V、359°＋雙路串口控制板，
+> LilyGO 透過 TX/RX 控制，控制板輸出 PWM。控制板供電 8.4 V、共地、手動燈亮，
+> 旋鈕兩端接近一整圈為使用者確認；M0/M1 與 GPIO 未核定。9600 baud／指令／接線及首輪測試見
+> [Youmi 控制板契約](servo-controller-youmi-2026-10-10.md)。本輪未改韌體／燒錄，
+> 下方 GXServo、IO21 PWM、180°／333 Hz、回到90°為**舊軟體與歷史硬體**，不能當新組合接法。
 
 1. **腳位圖（Pins Map）** — T-Beam Supreme GPIO 分配
 2. **I2C 裝置位址** — OLED / 感測器 / PMU
 3. **電氣參數與電源通道** — AXP2101 各路供電
 4. **按鈕說明** — PWR / BOOT / RST
-5. **Servo 規格** — GXServo Brushless 42KG (QY3242BLS / GX3242)
+5. **Servo 規格** — 新 Youmi＋串口控制板；下方保留舊 GXServo 規格／驗證
 6. **鏡頭指南針校正** — 磁針讀數、腳架固定與磁場干擾
 7. **接線圖** — 電池直供 Servo / 攝影機（2026-09-09 使用者確認）
 
@@ -152,9 +190,9 @@ Client環境不變；記憶體配置與驗證見[本輪筆記](lilygo-t096-2026-
 
 > 韌體用法（本專案）：Client 端**短按 PWR** 喚醒 OLED 顯示狀態 10 秒；**長按 PWR** 顯示關機畫面後由 PMU 斷電。Station 端長按 PWR 同樣為關機。Client 第一次完整讀取／清除啟動 IRQ 只建立基準；其後新的按下沿，在動畫／資訊頁內也能接受一般短／長按。初始殘留或持續按住開機鍵不算新按壓；硬體長按關斷仍由 PMU 自身設定決定，韌體未更改該設定。
 
-# GXServo Brushless 42KG (QY3242BLS / GX3242)
+# 舊 GXServo Brushless 42KG (QY3242BLS / GX3242)：歷史硬體／尚未遷移的程式
 
-> 本專案目前使用：**500–2500us, 180°**（與韌體 `SERVO_MIN_US=500`, `SERVO_MAX_US=2500` 對應）。
+> 舊組合與現行程式：**500–2500us, 180°**。新指定硬體見本文件開頭；本輪未部署串口輸出。
 
 > [!IMPORTANT]
 > **旋轉方向：實機已確認為「角度增加 = 從上方看逆時針」**，與韌體追蹤公式的假設一致
@@ -197,7 +235,7 @@ Client環境不變；記憶體配置與驗證見[本輪筆記](lilygo-t096-2026-
 - https://hobbyant.com/p/sale-268576
 - https://offthegridsun.com/Servo-Robot-Motor/GXservo-GX3242-42KG-Brushless-Steering-Gear-High-Speed-Servo
 
-# 鏡頭指南針校正
+# 舊韌體鏡頭指南針校正（新中位待驗）
 
 目前只使用黏在鏡頭上的普通磁針指南針；韌體不初始化／取樣板上 QMC，不做 hard-iron，
 也不保存板上校正到 NVS。上方表格仍記錄板子實際裝有的元件與位址。
@@ -211,7 +249,7 @@ Servo 角度增加為逆時針的方向；台灣磁偏角依 GPS 位置／日期
 若磁針讀數隨 Servo 上電／轉動明顯變化，先拉開指南針與馬達／金屬的距離。
 UART 只傳 Servo 絕對角度，不要求 GPS 或指南針校正。
 
-# 接線圖
+# 歷史接線圖（新串口控制板接線見本文件開頭）
 ```mermaid
 flowchart TD
     B[2S 2000mAh 35C 鋰電池]
@@ -264,12 +302,13 @@ Station 每次初始化／復原開啟 SX1262 boosted RX gain，較高接收耗�
 不是提高 Client 發射功率，也不能保證穿透水、人體、地形遮蔽。這次只驗證設定路徑與錯誤處理；
 實際改善幅度須同位置、天線、姿態、頻率與 SF 的現場對照。ALDO3 讀回亦非供電電壓實測。
 
-## Heltec V4 Station 與 T096 Client（2026-10-02，USB 桌上部署）
+## Heltec V4 Station 與 T096 Client（更新至 2026-10-10）
 
-配置兩個獨立 RF group：A 保留原本的 923.2 MHz（group 0），B 是目前接線的
-Heltec V4 Station／T096 Client（group 1、923.8 MHz）。兩塊 LilyGO 預定都當 Station；
-未連線，尚未改寫實體角色，A 的 Client 待實際硬體登記配對。兩組均用 BW 125 kHz、SF10、CR 4/5、Sync
-Word `0x12`，但不會掃描、協商或互通。兩塊 Heltec 已燒錄並完成桌上雙向命令；LilyGO 未連接，僅 build，沒有外測。
+配置兩個獨立 RF group：A 是923.2 MHz／SF10（group 0），B 是923.8 MHz／SF9（group 1）。
+兩組均用 BW125 kHz、CR4/5、sync word `0x12`，不掃描／協商，SF9與SF10不互通。
+10/2完成Heltec V4／T096桌上部署；10/6 LilyGO E91C已改Station／SD，10/7 E91C／F035同步更新B組SF9。
+10/10 T096 RTC修正版已部署，帶殼內建GNSS外測定位／速度品質未通過。
+其他Station的版本須分別核對，不能由同組配置推定已更新；狀態見 [交接入口](assistant-handoff.md)。
 
 Heltec V4 Station 使用 ESP32-S3 N16R2（16 MB flash、內嵌 2 MB QSPI PSRAM，不是 R8/OPI）。
 
@@ -292,24 +331,37 @@ FEM power 為 GPIO7、CSD 為 GPIO2。auto profile 依 Meshtastic 的 runtime pr
 T096 是獨立 nRF52840 Client，沒有 ESP Web/Wi-Fi，也不以 fake GNSS 冒充定位：SX1262 NSS 5、DIO1 21、
 RESET 16、BUSY 19，SPI SCK 40/MISO 14/MOSI 11，FEM power 30/CSD 12/CTX 41，chip drive 0 dBm；
 GNSS enable 6（low active）、reset 46、PPS 43、RX 23、TX 25，115200 baud；battery ADC 3/control 47、
-button 42、LED 28、Vext 26。RF 收發與 USB VBUS 回報已在桌上確認；GNSS fix、ADC 電量、
-SystemOFF 電流與喚醒尚未實測。USB VBUS 抑制 Ready 12 小時後的 SystemOFF，拔除後重新計時；
-現有充電板未接，不能稱為已驗證無線充電或 VBUS wake。
+button 42、LED 28、Vext 26。RF 收發與 USB VBUS 回報已在桌上確認。
+2026-10-09起改為保留RAM的SystemON／RTC定時待機，取消Ready 12小時SystemOFF及日常深度休眠操作。
+WOUT接太陽能接口、PCB BAT留空、電池接T096；WOUT充電與離座接手已於前輪觀察，
+但該solar路徑沒有送MCU VBUS，因此原SystemOFF放座自動喚醒未通過。RTC版本不再依賴這條喚醒路徑。
+電池1,000mAh，使用者提供4.2V過充／2.7V過放保護板；韌體3.2V先停止GPS／新RF，每60秒檢查，
+穩定3.5V回Ready。硬體保護切斷後的充電恢復、整機電流與續航尚待量測。
+USB VBUS只是USB供電訊號，不可用`charging:false`判solar沒有充電。
 
-收納 UX 預定採「充電座喚醒 → Web 開始／停止 → 待命 12 小時自動收納」。
-避免充電短暫斷續造成反覆關機，不以拔離充電座作為睡眠開關。封殼前需確認接收板 5 V 路徑
-確實能觸發本板喚醒，以及接收板／充電器反向漏電；若無法喚醒，再考慮磁簧外部喚醒。
-本版配置使用者按鍵 GPIO wake；nRF52840 另有 VBUS 上升自動離開 SystemOFF 的硬體能力，
-不需要用 Web／LoRa 持續聽候。Nordic 規格的 RESETREAS.VBUS 可作喚醒原因證據。
-因此先驗證 5 V 接收器到 VBUS 的路徑，再決定是否需要額外磁簧；不能把未接線當作晶片不支援。
-參考：[Nordic POWER／USB supply／System OFF](https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/power.html)。
-充電座實測尚未完成；1000／2500 mAh 的月數仍須以整機休眠電流量測估算。
+歷史SystemOFF／USER修正與實機結果見[t096-power-validation-2026-10-08.md](t096-power-validation-2026-10-08.md)，
+本次RTC待機狀態見[t096-rtc-standby-2026-10-09.md](t096-rtc-standby-2026-10-09.md)。
+
+### T096 外接 GNSS 天線（2026-10-10 規劃）
+
+[Heltec官方T096頁面](https://heltec.org/project/t096/)說明預設GNSS RF路徑接LDS內建天線。
+使用GNSS ANT IPEX前，須依[官方選路圖](https://heltec.org/wp-content/uploads/2026/06/t096-gns-1024x494.png)
+將選路電阻從紅框①移焊至綠框②；不是只插外接天線便自動切換。實作前核對實際板版／焊位。
+GNSS和LoRa的IPEX 1.0接口不同，不可互換；UC6580使用L1＋L5，天線頻段、主動／被動與偏壓供電
+要依實際天線型號和電路核對，尚未選定。外接天線是否仍放殼內，取決於天線／殼材與擺位，不能保證效果。
+原廠建議TFT側朝天空、避免金屬遮蔽；需和電池／無線充電線圈的殼內位置一併驗證。
+本輪尚未移焊或換天線；[10/10外測](t096-field-validation-2026-10-10.md)支持測試這個方向，但不能單獨判內建天線故障。
+
 
 ### T096 GNSS 上游供電（2026-10-02 桌上確認）
 
 T096 V0.2 電路圖中 Vext 供應 GNSS 的 Q3 load switch。HT-n5262G variant 腳位
 26 HIGH 與 GNSS_EN 6 LOW 必須同時成立；只拉 GNSS_EN 而關 Vext 會完全收不到 UART。
-Vext 也供應 TFT，不可用關閉共用 Vext 作為追蹤時的省螢幕電方案。Ready/SystemOFF 才關兩者。
+Vext也供應TFT，不可用關閉共用Vext作為追蹤時的省螢幕電方案。10/5加入畫面後，Ready保留Vext，
+以ST7735 SLPIN與backlight GPIO44 HIGH省電，GNSS enable GPIO6 HIGH切掉GNSS；RTC待機保留TFT供電。
+TFT是ST7735 MINI160x80_PLUGIN，CS22/DC15/RST13/SCK20/MOSI17、backlight44 active-low。
+stock nRF SPI要求有效MISO pin，TFT write-only使用未用的外露P0.31輸入；獨立SPIM2、不共用LoRa SPIM3。
+電池ADC為P0.03、control P1.15 HIGH enable；原廠3.0V reference／12bit／BAT_AMPLIFY4.9。
 本次恢復 UART 後讀到 UC6580I-00／R6.0.0.0Build3700；2 Hz NMEA 已量到，室內尚無衛星 fix。
 參考：[原廠電路圖](https://resource.heltec.cn/download/Mesh_Node_T096/Schematic/Mesh_Node_T096_V0.2.pdf)、
 [UFirebird II 協定](https://en.unicore.com/uploads/file/UFirebirdII%20Series%20Protocol%20Specification_EN_R1.6.pdf)。

@@ -9,6 +9,123 @@
 
 ## 未發行
 
+- **2026-10-16 USB 匯出隔離 SDK log**：ESP-IDF 訊息改由固定容量、跨 task 保護的佇列，
+  在主迴圈經既有 LogTee 寫入診斷紀錄；SDK 不再直接寫入 SD／DIAG 的 USB 封裝串流。
+  過長訊息加截斷標記，佇列溢位回報遺失筆數，不改正式匯出工具的長度／CRC 驗證。
+  新增實際 callback／LogTee 的 SD、DIAG 隔離、正常輸出、並行 producer、溢位與截斷測試。
+  140 native＋37 Python/Node 與三種 ESP32 角色 build 通過；E91C application-only USB 更新及晶片 hash 驗證成功。
+  Wi-Fi 離線重試期間，同一舊檔連續兩次與新 session 標準匯出均通過原始長度／CRC，
+  SDK 錯誤仍在紀錄內；新 boot／F035 Ready／SD 恢復錄製已確認。
+  使用者確認 Youmi＋控制板 Servo 實體驗收完成；熱點與 GNSS 留待會面處理。
+  本輪回歸、build 與部署結果見 [深度健檢](docs/health-check-2026-10-16.md)。
+
+- **2026-10-16 深度健檢／建置重現性**：空白 PlatformIO core 實測
+  `espressif32@55.3.39` 無法由 registry 取得，改為本機原已使用的 pioarduino
+  55.03.39 release URL；空白 core 已成功安裝該 platform（未宣稱空白 OS 全工具鏈驗證）。
+  固定本次實際解析的函式庫版本與 native platform，移除 OTA 的私人 LAN 預設目標。
+  加入 `requirements-dev.txt` 與 `tools/verify_project.py --prepare`，先準備測試所需第三方
+  原始碼再執行 native／Python／Node 回歸；不操作實機、不上傳。
+  保留韌體 `0.6-dev`、wire v5、SF9、GPS／Servo／電源行為；以來源 manifest／binary SHA-256
+  識別本輪驗證來源。RadioLib 此次兩端固定 7.8.1，先前 Station 本機快取為 7.7.1，
+  已重新 build／部署 E91C、F035；140 native、36 Python/Node 與五種 firmware build 通過，
+  桌上 RF 61.1 秒新增 109 probes 無新增缺號。最終新 boot／Ready STATE／SD 恢復錄製已確認；
+  專用熱點尚未連線，發現 Wi-Fi SDK log 混入 USB 匯出導致 CRC 失敗，列為未修正缺陷。
+  GNSS／Servo 物理驗收仍未完成。結果與部署界線見
+  [深度健檢](docs/health-check-2026-10-16.md)。
+
+- **2026-10-11 正式資訊頁與 M0 串口輸出**：四區定位資訊／Station Info／控制板／Surfer Info；座標 Maps 連結、衛星分級、HDOP 說明與真實誤差界線、手填經度／緯度／誤差直排；移除 uptime、USB 及多餘 SD／來源欄位。固定 Youmi 359°＋控制板 M0、TX43／9600 8N1，最多50Hz合併去重非阻塞输出，中位179.5°；移除直接LEDC、外部UART模式及 GPS α UI／運算／API。完整圓形操作、點數字速度視窗、鏡頭置中；新增唯讀 SD status、UART counters 與無回授欄位。140 native、實際HTTP／UART／NVS／GPS與UI回歸通過；584C application OTA 完成，新boot／M0中位／保存速限／持續STATE／SD記錄與HTML比對通過；[部署驗證](docs/servo-ui-deployment-2026-10-11.md)，物理轉向／端點仍待驗收。
+
+- **2026-10-10 資訊頁獨立 demo／Youmi 控制板需求**：新增 `demo/info-page/`，三區整理、
+  HDOP／GPS狀態與診斷年齡、Client電量／STATE／DATA、Station溫濕度／SD／Servo、
+  點數字改速限、整數指南針輸入／鏡頭置中、來源toggle、七種mock情境與pending→STATE確認。
+  使用者進一步確認完整圓形0～359°軌道與只留手動／GPS；demo追加放開才套用、端點不環繞的雷達預覽。
+  demo不含GPS α、複製摘要或手機權限流程變更；CSP禁止API連線，無實機請求／持久化。
+  使用者指定Youmi 35kg 5–8.4V 359°＋9600baud雙路控制板；圖片協定、8.4V／共地／手動燈／
+  旋鈕接近全圈目視確認已記錄，通道／GPIO／TX電平／ACK與角度映射待驗。
+  正式後續取消115200外部UART輸入，改9600控制板輸出；本輪正式180°LEDC／GPS α功能／雷達未修改。
+  JS語法及瀏覽器七情境／速度超限／儲存／取消／指令確認／指南針範圍／來源toggle／展開通過；
+  320／360px無橫向溢出、速度視窗可操作，JS error為0。
+  圓形把手44px、拖曳90°、Home／End與跨端點夾住0／359、GPS不可拖曳通過。
+  本輪無韌體修改、build／燒錄或實機試轉；見 [控制板契約](docs/servo-controller-youmi-2026-10-10.md)
+  與 [UI新預覽規格](docs/web-ui-design.md)。
+
+- **2026-10-10 交接文件與帶殼外測分析**：補交接入口、最新 WIP／舊 worktree 差異與分享快照說明；
+  README／功能／介面／硬體／入口同步 B 組 SF9、T096 診斷節奏及 RTC 30 秒計時／指令確認界線。
+  帶殼內建 GNSS 外測約 61 分鐘才見有效位置，157 有效 DATA、速度旗標全無效；seq 0–160 全收，
+  保留 GNSS checksum／快照遺失與攜帶關係未知，不單憑手機對照判天線故障。
+  外接 GNSS 需核對官方選路電阻／天線規格，尚未改硬體。私人原始路線不納入 Git／分享包。
+  本次僅更新文件與準備分享包，驗證連結／快照完整性；沒有程式修改、重新 build 或部署。
+  現況見 [交接入口](docs/assistant-handoff.md)、[10/10 外測摘要](docs/t096-field-validation-2026-10-10.md)。
+
+- **2026-10-10 T096 RTC 待機實機部署／radio 喚醒修正**：實機發現 RadioLib 7.8.1 的 TX 路徑
+  在喚醒前讀取 packet type，導致 warm-start sleep 後無法繼續發送；送出前明確 `standby()`，
+  喚醒失敗不開 FEM TX、安排重試，失敗發送也遵守500 ms guard。
+  實際 sendBuffered 主機測試新增睡眠時禁止 TX 讀取、喚醒失敗與失敗 guard 回歸；
+  radio／idle／power／position 通過，Client build 與 F035 application-only DFU 完成。
+  新 boot 2126673892 持續 Ready，每30秒增量 STATE；啟動GPS／回待機分別 confirmed，最後錯誤0。
+  Station 配對、B 組 SF9、手動90°及SD錄製保持；首次候選失敗與修正原始紀錄保留。
+  純電池RTC待機120.944秒／5筆增量STATE、同boot與Ready通過，該段HTTP無錯誤。
+  電池下啟動GPS30.776秒／回待機5.399秒均confirmed；額外指令觀測前有2次HTTP讀取逾時，恢復後完成，原失敗log保留。
+  按鍵／充電座切換、低電恢復與整機電流／續航仍待驗；詳見[RTC待機驗證](docs/t096-rtc-standby-2026-10-09.md)。
+
+- **2026-10-09 T096 保留狀態的 RTC 待機**：日常改為啟動GPS／待機；移除12小時及USER長按SystemOFF，
+  Ready每30秒交換指令，以FreeRTOS tickless RTC阻塞loop，DIO1／USER中斷可提前喚醒。
+  SX1262空閒warm-start sleep／FEM關閉；健康待機ADC每30秒、警告／Tracking每秒。
+  三次<3.2V停止GPS／新RF，每60秒檢查，三次≥3.5V回Ready、不自動恢復GPS；保護板切斷後恢复待實測。
+  Web啟動GPS／回待機移除深度休眠，舊store API轉Stop，wire v5數值與長度保留，Servo／GNSS定位流程不變。
+  native139/139、9組主機回歸與雙端build通過；E91C應用區已更新並核對配對／API／SD恢復。
+  當日F035未接USB；10月10日接上後部署及修正見上方紀錄。狀態見 [RTC待機驗證](docs/t096-rtc-standby-2026-10-09.md)；整機電流與續航仍待量測。
+
+- **2026-10-08 T096 收納後 USER 喚醒修正**：進入 SystemOFF 前依 nRF52 bootloader 契約設定
+  一次性的 skip-DFU 標記，避免 USER 喚醒仍按住時被判為進入 BLE OTA。
+  SoftDevice 啟用／停用路徑分開；SDK 準備失敗時保留供電、取消關機並回報 Ready，不帶錯誤標記進入 SystemOFF。
+  USB identity 補上 bootloader 原始版本與 reset reason。保留 USER 短按／長按、12 小時收納、
+  螢幕 5 秒、電量顯示、SF9／wire v5 與應用程式之外的開機器／SoftDevice。
+  power／radio／GNSS／display／position 回歸與 build 通過，F035 application-only DFU 已完成，
+  實機 bootloader 0.9.0、新 boot／持續 Ready 已確認；純電池按鍵／網頁收納→USER 喚醒兩輪均通過
+  使用者目視與新 boot／持續 STATE；另通過 WOUT 充電座上短按 USER 喚醒，40 秒內持續 Ready，
+  移離充電座後 60 秒同 boot／持續 Ready、HTTP 無錯誤，電池接手驗收通過。
+  收納後單純放上充電座未觀察到自動喚醒；收納電流、充電電流與續航另待驗。狀態見
+  [T096 電源與喚醒紀錄](docs/t096-power-validation-2026-10-08.md)。
+
+- **2026-10-07 B 組改 SF9，保留 18-byte DATA**：T096／對應 Station 由 RF group 設定取得 SF9，
+  A 組維持 SF10；923.8 MHz、BW125／CR4/5、wire v5、全部欄位／長度與 T096 500 ms 排程不變。
+  RF loader 明確傳入並檢查 SF，拒絕重複 macro 與未驗證值；T096 USB identity 顯示 SF。
+  SD session 原先硬寫 SF10／923.2 MHz，改記實際 radio profile，舊檔不修改。
+  SF9 DATA airtime 185.344 ms（SF10 為329.728 ms），GNSS DIAG 267.264 ms；
+  RX window／控制時限與 Servo 行為不變。SF9／SF10 無法互通，其他未更新 B 組 Station 仍需另行部署。
+  native139/139、10組主機回歸與雙端build通過；E91C application-only USB與F035 DFU已完成。
+  桌上110個18B probes counter無缺號，Test／Stop confirmed、SD CRC匯出與恢復錄製已確認；
+  戶外／海面仍待驗。完整驗證及部署界線見 [SF9 更新紀錄](docs/sf9-field-pair-2026-10-07.md)。
+
+- **2026-10-06 LilyGO E91C 改為 Station／SD 記錄**：核對 USB 身分後，以本機
+  `station-lilygo-e91c` profile build／application-only 燒錄，保留 0.6-dev、wire v5 與 B 組923.8 MHz。
+  NVS 綁定 T096 F035，實際 Ready 接收及 Stop 命令 confirmed；重啟後綁定保留、SD 自動恢復錄製。
+  依使用者更正不填 log server key，Axiom 停用。SD 匯出541,224 bytes、277筆JSON、CRC正確，
+  包含5筆F035 STATE原始封包；驗證與備份界線見[部署紀錄](docs/lilygo-station-2026-10-06.md)。
+
+- **2026-10-06 T096 TFT 面板偏移修正**：通用 Adafruit 1.11.0 的
+  `MINI160x80_PLUGIN` 預設 offset 為 (26,1)，Heltec T096 原廠 fork 為 (24,0)。
+  新增板專用 display wrapper，在初始化後、rotation 前套用原廠 offset；保留160×80、
+  rotation 1、色彩反轉、單行buffer與5秒亮屏。修正及部署驗證見
+  [T096 控制筆記](docs/t096-controls-2026-10-05.md)。display／power／GNSS／radio回歸與build通過，
+  F035 application-only DFU成功，新boot與Station Ready已核對；使用者目視確認文字正常、不再斜著錯位。
+
+- **2026-10-05 T096 按鍵／螢幕／電量與 Station LoRa 分級**：兩種 Station OLED 移除 `TEL` 替代字，
+  依最近接受的綁定 Client DATA／TEL／DIAG／GNSS／STATE／RF probe RSSI/SNR 顯示 Good／OK／Bad；
+  90 秒無有效 RF 才 Miss，位置與 GPS freshness gate 不變。資訊 API 的即時 RSSI/SNR 同步改為任一有效封包，
+  DATA 的平均／FPS 保持原定義；網頁有效的0 dBm不再誤顯示為未知。T096 新增 160×80 TFT、5秒亮屏、USER短按重計時／長按2秒放開才收納；
+  USB供電時長按改回Ready，RST仍為硬體重啟。採原廠3.0V／12bit／4.9倍ADC換算，每秒在非收發時取樣；
+  <3.5V提醒、三次有效讀值<3.2V顯示5秒後SystemOFF，USB抑制且未知值不誤關機。STATE／TEL帶電壓；
+  Station畫面／提醒／cloud採90秒內最近STATE或TEL電量，不把STATE冒充溫濕度遙測。
+  TFT以5KiB單行buffer送出，背光5秒GPIO期限不等RF frame；Ready保留Vext但TFT睡眠、GNSS load switch關閉，
+  SystemOFF才切Vext。主機驗證與三裝置部署狀態見[本輪筆記](docs/t096-controls-2026-10-05.md)；ADC先信任原廠值，電錶與實體按鍵／畫面驗收仍分開。
+  LilyGO USB、V4 OTA與T096 application-only DFU均已部署；兩台Station前一輪短RF測試各收100 probes且counter無缺號。
+  T096實機驗證補上自建SPIM2的`begin()`：Adafruit不會自動啟用未宣告為variant SPI介面的物件，
+  首次新版因此未走到持續radio／ADC回報；回歸新增TFT初始化前SPI必須ready的外部函式庫契約檢查。
+  修正後T096 raw ADC換算約4.14V、STATE／TEL電量正常；V4收70個新Client probes無counter缺號，Web開始／停止均確認並回Ready。
+  本輪GNSS UART設定可回讀，但室內無有效epoch／位置DATA，定位與實際2Hz仍待室外驗收；面板與純電池電流／關機另待實測。
+
 - **2026-10-04 LilyGO Station 共用 T096（桌上部署）**：device manifest 允許多個 Station profile
   指向同一 Client，保留同 RF group 與 USB／名稱唯一性檢查。T096 每次開機只接受第一個 Station
   控制的規則不變；切換控制 Station 需重啟 Client。原板有效 NVS 中的 Axiom ingest 設定已取回至本機私人檔案。

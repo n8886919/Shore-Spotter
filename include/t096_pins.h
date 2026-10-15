@@ -11,5 +11,9 @@ constexpr int kGnssRx = 23, kGnssTx = 25;
 constexpr int kBatteryAdc = 3, kBatteryAdcControl = 47;
 constexpr int kUserButton = 42, kLed = 28;
 constexpr int kVextControl = 26;
+constexpr int kTftNss = 22, kTftReset = 13, kTftDc = 15;
+constexpr int kTftSck = 20, kTftMosi = 17, kTftBacklight = 44; // backlight active-low
+// Stock nRF SPI requires a valid MISO pin even for this write-only display.
+constexpr int kTftUnusedMiso = 31; // unused exposed P0.31 input
 constexpr int kFemDriveDbm = 0;  // SX1262 drive only; antenna output is unmeasured.
 }  // namespace t096_pins

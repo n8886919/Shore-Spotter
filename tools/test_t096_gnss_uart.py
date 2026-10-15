@@ -36,7 +36,7 @@ def main() -> None:
 #include "gnss_rate.h"
 #include "t096_gnss_config.h"
 gnss_rate::Monitor gpsRate; t096_gnss::Setup gnssSetup;
-bool gnssEnabled=false,dataWaiting=false; uint32_t gpsLastServiceMs=0,nextExtraMs=0; uint8_t extraKind=0;
+bool gnssEnabled=false,dataWaiting=false,displayPowered=false; uint32_t gpsLastServiceMs=0,nextExtraMs=0; uint8_t extraKind=0;
 namespace t096_pins {{ constexpr int kGnssEnable = 6, kVextControl = 26; }}
 constexpr int OUTPUT = 1, LOW = 0, HIGH = 1;
 int pinModeCalls = 0, digitalWriteCalls = 0, lastPin = -1, lastValue = -1, pins[48]={{}};
@@ -67,6 +67,10 @@ int main() {{
   setGnssEnabled(true);
   setGnssEnabled(false);
   if (Serial2.beginCalls != 2 || Serial2.endCalls != 2 || gnss.resetCalls != 2 || cadence.resetCalls != 2) return 5;
+  displayPowered=true;setGnssEnabled(false);
+  if (pins[6] != HIGH || pins[26] != HIGH) return 6;
+  setGnssEnabled(true);setGnssEnabled(false);
+  if (pins[6] != HIGH || pins[26] != HIGH || Serial2.begun) return 7;
   return 0;
 }}
 """

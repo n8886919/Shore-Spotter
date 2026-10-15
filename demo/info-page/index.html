@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; form-action 'none'; base-uri 'none'">
+  <meta name="theme-color" content="#ffffff">
+  <title>Shore Spotter · 資訊頁 Demo</title>
+  <link rel="stylesheet" href="demo.css">
+  <script src="demo.js" defer></script>
+</head>
+<body>
+  <main>
+    <aside class="demo-bar" aria-label="Demo 設定">
+      <div><strong>UI DEMO</strong><span>模擬資料與操作 · 不連接實機</span></div>
+      <div class="demo-tools">
+        <label for="scenario">情境</label>
+        <select id="scenario">
+          <option value="ready">Ready 待機</option>
+          <option value="tracking">Tracking 定位正常</option>
+          <option value="no_fix">Tracking 無定位</option>
+          <option value="stale">定位資料過期</option>
+          <option value="offline">RF 失聯</option>
+          <option value="sd_error">SD 寫入異常</option>
+          <option value="test">RF 測試（無 GPS）</option>
+        </select>
+        <button id="receiveState" class="small" disabled>模擬收到 STATE</button>
+      </div>
+    </aside>
+    <div id="infoPage">
+    <div class="page-top"><button id="returnRadar" class="back">← 返回雷達</button><span>Shore Spotter</span></div>
+
+    <section class="card" aria-labelledby="positionTitle">
+      <header><h2 id="positionTitle">定位資訊</h2><span class="subtle">原始品質與資料時間</span></header>
+      <table class="position-table">
+        <thead><tr><th scope="col">項目</th><th scope="col">Station</th><th scope="col">Surfer</th></tr></thead>
+        <tbody id="positionRows"></tbody>
+      </table>
+      <div class="setting-row source-row">
+        <div><strong>Station 位置來源</strong><small id="sourceNote"></small></div>
+        <div class="seg" role="group" aria-label="Station 位置來源">
+          <button id="stationSource" aria-pressed="true">Station GPS</button><button id="phoneSource" aria-pressed="false">手機位置</button>
+        </div>
+      </div>
+      <div id="positionMeta" class="kv"></div>
+      <details>
+        <summary>GNSS 診斷</summary>
+        <div id="gnssDetails" class="kv"></div>
+        <p class="hint">HDOP 反映衛星幾何；30 秒散布反映穩定性，兩者都不是實際位置誤差。Client 診斷是低頻快照，需同時看回報時間。</p>
+      </details>
+      <details>
+        <summary>手動輸入 Station 座標</summary>
+        <div class="manual-fields">
+          <label>緯度<input id="latitude" type="text" inputmode="decimal" placeholder="例：24.00000"></label>
+          <label>經度<input id="longitude" type="text" inputmode="decimal" placeholder="例：121.00000"></label>
+          <label>估計誤差（m）<input id="accuracy" type="text" inputmode="decimal" placeholder="例：10"></label>
+        </div>
+        <button id="manualPosition" class="small">套用座標（Demo）</button>
+        <p id="manualError" class="error" role="status"></p>
+      </details>
+    </section>
+
+    <section class="card" aria-labelledby="stationTitle">
+      <header><h2 id="stationTitle">Station Info</h2><span class="badge neutral">LilyGO Station</span></header>
+      <div id="stationRows" class="kv"></div>
+      <div class="divider"></div>
+      <div class="setting-row"><strong>Servo 最高速度</strong><button id="speedValue" class="value-button" aria-label="修改 Servo 最高速度">30°／秒 <span>修改</span></button></div>
+      <div class="setting-row"><strong>鏡頭指南針校正</strong><button id="center" class="small">鏡頭置中</button></div>
+      <form id="compassForm" novalidate>
+        <div class="cal-row"><label class="sr-only" for="compassBearing">鏡頭指南針角度</label><input id="compassBearing" type="text" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" value="90" autocomplete="off"><span>°</span><button type="submit" class="small">校正</button></div>
+        <p class="hint">北 0°、東 90°、南 180°、西 270°</p>
+        <p id="compassError" class="error" role="status"></p>
+      </form>
+      <p class="hint" id="calibrationNote">先置中、等鏡頭停穩，再填指南針讀數。Demo 暫以行程中點 179.5° 示意，實機中位與方向待測。</p>
+      <details><summary>Station／控制板診斷</summary><div id="stationDetails" class="kv"></div><p class="hint">控制板文件未提供 ACK 或位置回授。指令已送出，仍需目視確認 Servo 是否動作。</p></details>
+    </section>
+
+    <section class="card" aria-labelledby="surferTitle">
+      <header><h2 id="surferTitle">Surfer Info</h2><span class="badge neutral">T096 · F035</span></header>
+      <div id="surferRows" class="kv"></div>
+      <div class="client-actions"><button id="clientStart">啟動 GPS</button><button id="clientStop">回待機</button><button id="clientTest" class="secondary">LoRa RF 測試</button></div>
+      <p id="commandNote" class="hint" aria-live="polite"></p>
+      <details><summary>Client／LoRa 診斷</summary><div id="surferDetails" class="kv"></div><p class="hint">STATE 用於確認裝置狀態與命令；DATA 用於位置追蹤。Ready 不送定位 DATA，0 FPS 屬預期行為。</p></details>
+    </section>
+    <footer>資訊頁 Demo · 2026-10-10 · 手機定位權限流程本次未處理</footer>
+    </div>
+    <section id="radarDemo" aria-label="完整圓形 Servo 軌道 Demo" hidden>
+      <div class="radar-controls">
+        <div class="radar-left"><button id="showInfo" class="small">資訊</button><div class="seg"><button aria-pressed="true">雷達</button><button disabled title="本 Demo 不提供地圖">地圖</button></div></div>
+        <div class="seg" role="group" aria-label="Servo 控制模式"><button id="modeManual" aria-pressed="true">手動</button><button id="modeGps" aria-pressed="false">GPS</button></div>
+      </div>
+      <div class="signal-panel" id="radarSignals"></div>
+      <svg id="radarSvg" viewBox="0 0 600 600" aria-label="Servo 指令角度完整圓形軌道">
+        <g class="radar-grid"><circle cx="300" cy="300" r="75"/><circle cx="300" cy="300" r="150"/><circle cx="300" cy="300" r="225"/><path d="M75 300H525M300 75V525"/></g>
+        <g class="directions"><text x="300" y="100">E</text><text x="90" y="305">N</text><text x="510" y="305">S</text><text x="300" y="505">W</text></g>
+        <g id="cameraBeam"><path d="M300 300L260 135Q300 120 340 135Z" class="beam"/><path d="M300 300V135" class="beam-axis"/></g>
+        <circle cx="300" cy="300" r="7" class="station-point"/>
+        <g id="surferPoint"><circle cx="213" cy="179" r="7"/><text x="226" y="182">Surfer</text></g>
+        <circle id="ringRail" cx="300" cy="300" r="250" class="ring-rail"/>
+        <circle id="ringHit" cx="300" cy="300" r="250" fill="none" stroke="transparent" stroke-width="44" pointer-events="stroke"/>
+        <g id="circleTicks"></g>
+        <path id="previewLine" d="M300 300L300 50" class="preview-line"/>
+        <g id="circleHandle"><circle r="22"/><text id="circleValue" y="4">180°</text><path d="M-7 10H7M-7 13H7"/></g>
+      </svg>
+      <input id="circleKeyboard" type="range" min="0" max="359" step="1" value="180" class="sr-only" aria-label="Servo 指令角度">
+      <div class="radar-note"><strong id="radarAngleNote">指令角度 179.5°</strong><span>0–359° 有限行程 · 拖曳預覽，放開套用</span><small>刻度是 Servo 指令角度；機械中位、轉向與脈寬對應待實機校準。</small></div>
+    </section>
+  </main>
+
+  <dialog id="speedDialog" aria-labelledby="speedTitle">
+    <form id="speedForm" novalidate>
+      <h2 id="speedTitle">Servo 最高速度</h2>
+      <label for="speedInput">每秒角度（1–90）</label>
+      <div class="dialog-input"><input id="speedInput" type="text" inputmode="numeric" pattern="[0-9]{1,2}" maxlength="2" autocomplete="off"><span>°／秒</span></div>
+      <p class="hint">手動、GPS 共用。</p>
+      <p id="speedError" class="error" role="status"></p>
+      <div class="dialog-actions"><button id="cancelSpeed" type="button" class="secondary">取消</button><button type="submit">儲存</button></div>
+    </form>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

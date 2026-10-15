@@ -145,6 +145,7 @@ class DeviceConfigTest(unittest.TestCase):
                 env = FakeEnv("A")
                 load_rf_profile.apply_profile(env)
                 self.assertIn(("SHORE_RF_GROUP", "1"), env["CPPDEFINES"])
+                self.assertIn(("SHORE_RF_SPREADING_FACTOR", "9"), env["CPPDEFINES"])
                 self.assertIn(("SHORE_DEFAULT_CLIENT_ID", "4660"), env["CPPDEFINES"])
                 self.assertFalse(any(d[0] == "SHORE_STATION_HOSTNAME" for d in env["CPPDEFINES"]))
                 devices["devices"][0]["hostname"] = "shore-b"
@@ -168,8 +169,58 @@ class DeviceConfigTest(unittest.TestCase):
             load_rf_profile.PROFILE_PATH = old_path
         self.assertIn(("SHORE_RF_GROUP", "1"), env["CPPDEFINES"])
         self.assertIn(("SHORE_RF_FREQUENCY_MHZ", "923.8f"), env["CPPDEFINES"])
+        self.assertIn(("SHORE_RF_SPREADING_FACTOR", "9"), env["CPPDEFINES"])
         with self.assertRaisesRegex(ValueError, "already defined"):
             load_rf_profile.apply_profile(FakeEnv("A", [("SHORE_RF_GROUP", "0")]))
+        with self.assertRaisesRegex(ValueError, "already defined"):
+            load_rf_profile.apply_profile(FakeEnv("B", [("SHORE_RF_SPREADING_FACTOR", "10")]))
+
+    def test_group_sf_reaches_radio_and_preserves_wire_contract(self):
+        # Compile the actual radio adapter using the SCons loader's definitions.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            cpp = folder / "profile.cpp"
+            cpp.write_text('''
+#include <cassert>
+#include "radio_profile.h"
+#include "t096_radio_config.h"
+#include "client_control.h"
+struct Radio {
+  int16_t begin(float f, float bw, uint8_t sf, uint8_t cr, uint8_t sync,
+                int8_t power, uint16_t preamble, float tcxo) {
+    assert(f == EXPECTED_FREQUENCY && bw == 125 && sf == EXPECTED_SF);
+    assert(cr == 5 && sync == 0x12 && power == 0 && preamble == 8 && tcxo == 1.8f);
+    return 0;
+  }
+};
+int main() {
+  static_assert(PROTO_VERSION == 5 && DATA_PACKET_LEN == 18 && GNSS_DIAGNOSTIC_PACKET_LEN == 36);
+  static_assert(client_control::kReceiveListenMs == 85 && client_control::kReceiveWindowMs == 800);
+  Radio radio;
+  return t096_radio::begin(radio, radio_profile::frequencyMhz, radio_profile::bandwidthKhz,
+      radio_profile::spreadingFactor, radio_profile::codingRate, radio_profile::syncWord, 0);
+}
+''')
+            for group, sf, frequency in [("A", 10, "923.2f"), ("B", 9, "923.8f")]:
+                env = FakeEnv(group)
+                with patch.dict(os.environ, {}, clear=True):
+                    load_rf_profile.apply_profile(env)
+                defines = [f"-D{k}={v}" for k, v in env["CPPDEFINES"]]
+                binary = folder / group
+                subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                                "-I" + str(ROOT / "include"), *defines,
+                                f"-DEXPECTED_SF={sf}", f"-DEXPECTED_FREQUENCY={frequency}",
+                                str(cpp), "-o", str(binary)], check=True)
+                subprocess.run([str(binary)], check=True)
+
+    def test_unsupported_or_mistyped_sf_is_rejected(self):
+        for sf in [8, 11, 9.0, "9", True, None]:
+            with self.subTest(sf=sf), tempfile.TemporaryDirectory() as tmp:
+                groups = copy.deepcopy(GROUPS)
+                groups["groups"][1]["spreading_factor"] = sf
+                path, _ = self.write(Path(tmp), groups=groups)
+                with self.assertRaisesRegex(ValueError, "SF9 or SF10"):
+                    load_rf_profile.load_groups(path)
 
 
 if __name__ == "__main__":

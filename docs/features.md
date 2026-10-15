@@ -1,9 +1,47 @@
 # 韌體功能說明（Features）
 
+## 2026-10-11 現行控制與介面
+
+正式原始碼已整合 Youmi 35 kg（5–8.4 V、359°）＋串口控制板，固定 **M0**。
+Station UART2 **9600 8N1、TX GPIO43、RX 不配置**；`#00P0500!`～`#00P2500!`，無換行。
+`include/servo_controller.h` 合併最新目標、去重、最多 50 Hz 非阻塞送出；控制板自行產生 50 Hz PWM。
+角度 0～359°，中位 **179.5°／1500 μs**；開機輸出中位、預設手動。沒有 ACK 或實際角度回授。
+UART 寫入成功只證明 Station 交給 UART，不能證明控制板接受或 Servo 到位。
+只留手動／GPS；舊 115200 SET／SET2／SYNC 外部輸入不再編入正常 Station，`mode=uart/jetson` 回 400。
+GPS α UI、預測運算與設定 API 已移除；`/api/track/prediction` 回 404，舊 NVS 鍵不讀寫。
+GPS 仍使用兩端有效且新鮮的位置、磁偏角與校正，失效轉完最後有效目標；不自動切換來源。
+共用速限預設 30°/s、整數 1～90，NVS `servospd` 保存；GPS 目標每 50 ms 重算。
+
+資訊頁四區：**定位資訊／Station Info／控制板／Surfer Info**。
+座標只顯示 Google Maps 連結；手填欄位由上至下經度／緯度／誤差。
+卫星顯示無／少／中／多；HDOP 下方說明其為幾何指標，不能換算成已知實際誤差。
+手機回報半徑、Station 30 秒 RMS 散布、實際誤差分開；真實誤差需對照已知參考位置。
+Station 顯示自有溫濕度與 SD 記錄狀態，無運行時間／Servo 來源／SD 錯誤計數；
+Surfer 顯示電池、GPS 開啟／關閉、STATE／DATA 年齡與 RF 品質，無 USB 供電列。
+GPS 狀態只依近期 STATE；未知或過期不假裝為關閉。
+控制板區顯示 M0、串口、命令角度／脈寬／字串與 UART 計數，實際角度為未知。
+磁偏角移到定位資訊；速度點數字開視窗、儲存成功才關閉，指南針整數 0～359、預設 90。
+「鏡頭置中」回 179.5°；停穩後填北 0°、東 90°、南 180°、西 270°重新校正（只存 RAM）。
+手動完整圓軌道 0～359°，0／359 在下、90 左、180 上、270 右，放開才送、端點不環繞。
+UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw 角度；地理方位另依校正計算。
+手機定位權限流程延後、不加複製診斷摘要。
+
+部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；OTA 結果另見本次驗證記錄。
+主機通過 140 項 native、實際 HTTP／UART／GPS gate／NVS、圓形操作及地圖回歸。
+實體 M0 接線、UART 接受、轉向、端點、帶載及戶外 GPS 精度仍待驗收。
+
+## 下方為前版完整功能紀錄（Servo／UI 差異以上節為準）
+
+> **2026-10-10 待遷移需求**：使用者綁定 Youmi 35 kg＋雙路串口控制板，Station 9600 baud
+> 輸出、控制板產生 50 Hz PWM；[協定與實機 debug](servo-controller-youmi-2026-10-10.md)。
+> 資訊頁三區整理與刪 GPS α 等變更目前只做 [mock demo](../demo/info-page/README.md)。
+> 本文件下文仍描述尚未修改的正式韌體／舊 180°控制，不能把 demo 看成已部署。
+
 目前原始碼版本 **0.6-dev（未發行）**，唯一來源 `include/firmware_version.h`。Client／Station 的開機
 OLED 與序列紀錄皆顯示版本；Station 網頁資訊頁及 `health.firmware_version` 顯示
 實際運行版本。LoRa 沒有傳送 Client 韌體版本，不能從 Station 版本推定 Client 已更新。
-本文件描述原始碼行為；建置、部署與現場驗證狀態另見 [CHANGELOG](../CHANGELOG.md)。
+本文件描述原始碼行為（2026-10-10 核對）；建置、部署與現場驗證狀態另見 [CHANGELOG](../CHANGELOG.md)
+及 [其他助手交接入口](assistant-handoff.md)。第 3 節的 OLED／PMU 操作屬 T-Beam；T096 行為見第 4.0 節。
 
 Station 新增預設關閉的 [Axiom 雲端除錯上傳](axiom-log.md)：透過 `POST /api/axiom` 設定 ingest Token 並啟用後，每秒採樣、約每 5 秒批次上傳。包含定位、LoRa raw events、
 GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續，忙碌／離線允許丟棄，
@@ -30,7 +68,7 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 # 1. 整體架構
 
 - `src/main.cpp` 用 build flag 分兩種角色：`ROLE_CLIENT`（下水端）、`ROLE_STATION`（岸上攝影站）；UART 控制端點位於 `src/uart_servo_mode.cpp`。
-- 共用 LoRa 封包協定抽在 [../include/protocol.h](../include/protocol.h)；硬體腳位與 RF 參數在 `main.cpp` 上方常數區；手機熱點帳密在 [../include/wifi_config.h](../include/wifi_config.h)。
+- 共用 LoRa 封包協定抽在 [../include/protocol.h](../include/protocol.h)；硬體腳位與 RF 參數在 `main.cpp` 上方常數區；手機熱點帳密在 [範例設定](../include/wifi_config.h.example)（本機建立 `include/wifi_config.h`）。
 - 角色由編譯期 `env:tbeam-client` / `env:tbeam-station`決定，未選或同時選兩個角色都會編譯失敗。
   另有 group B 的 Heltec V4 Station 與獨立 T096 Client profile；它們不是 group A 的自動換頻版本。
 
@@ -46,33 +84,35 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 | 類型 | 大小 | 發送節奏與用途 |
 |---|---:|---|
 | DATA | **18 bytes** | 最新有效定位即送；失效只通知一次、無 DATA 心跳；座標、速度／方向、衛星級距、有效旗標、HDOP；無來源年齡 |
-| TELEMETRY（TEL） | **11 bytes** | 約每 60 秒一次；電池、溫濕度、精確衛星數 |
-| DIAGNOSTIC（DIAG） | **17 bytes** | 約每 60 秒一次；Client GNSS 間隔、UART 積壓、NMEA／TX 錯誤、發送延期與狀態 |
-| GNSS DIAGNOSTIC | **36 bytes 單包** | 約每 60 秒一包；GPS 資料流、來源年齡與恢復／拒收計數 |
+| TELEMETRY（TEL） | **11 bytes** | T-Beam 約 60 秒；T096 Tracking 與下列兩類輪替、每類約 15 秒；電池、溫濕度、精確衛星數 |
+| DIAGNOSTIC（DIAG） | **17 bytes** | T-Beam 約 60 秒；T096 Tracking 約 15 秒；GNSS 間隔、UART 積壓、NMEA／TX 錯誤、發送延期與狀態 |
+| GNSS DIAGNOSTIC | **36 bytes 單包** | T-Beam 約 60 秒；T096 Tracking 約 15 秒；GPS 資料流、來源年齡與恢復／拒收計數 |
 | CLIENT CONTROL / STATE / LINK TEST | **13 / 28 / 18 bytes** | T096 command、STATE rendezvous/confirmation、RF probe；codec 見 interface |
 
-- **GPS 請求 2 Hz，不代表實測達標**。雙端以 115200 baud 設定 RMC＋GGA／500 ms；
+- **GPS 請求 2 Hz，不代表實測達標**。T-Beam 雙端以 115200 baud 設定 RMC＋GGA／500 ms；
   L76K 原廠 >1 Hz 要求單語句，這是已確認採用的雙語句驗證版。每 5 秒觀察 epoch／RMC／GGA
   實際頻率，缺語句與頻率不符明示，不靜默降級。Station 診斷 API 可看三值，Client 序列可看三值，
   Client 低頻 DIAG 額外帶量測完成／三者約 2 Hz 旗標。
 - DATA、TEL、DIAG 各自使用序號；GNSS DIAG 每包使用獨立序號，均不消耗 DATA 序號。
-- **單向非阻塞發射**：Client 由 DIO1 TxDone／timeout 推進，完成後 standby；Station
-  只接收、不回 ACK。Client TX 成功只代表發射完成，收包情況看 Station 序號與 RSSI／SNR。
+- **DATA 單向非阻塞發射**：Client 由 DIO1 TxDone／timeout 推進；Station 不回 DATA ACK。
+  T096 STATE 後另開控制下行窗口，並以後續 STATE 確認命令，不是 DATA 收件確認。
+  Client TX 成功只代表發射完成，收包情況看 Station 序號與 RSSI／SNR。
 - **最新有效定位即送**：radio 空閒且 guard 已滿便送，不另加 1 Hz 限制。RMC／GGA
   最多短等 150 ms 配對；同一定位不重傳，忙碌只留最新一筆。有效轉無效通知一次，
   持續無效不送 DATA，恢復直接送新位置；Station 仍用逾時判斷，不依賴一定收到失效通知。
-- **SF10 排程**：BW125／CR4/5 下 DATA／DIAG 約 330 ms、GNSS DIAG 約 494 ms、TEL 約 289 ms，
+- **依組別計算 airtime**：A 組 SF10 的 DATA／DIAG 約 330 ms、GNSS DIAG 約 494 ms、TEL 約 289 ms；
+  B 組 SF9 的 DATA 186／DIAG 165／GNSS 268／TEL 145 ms（向上取整），同為 BW125／CR4/5。既有 T-Beam Client
   實際 TxDone 後至少留 80 ms。TEL、DIAG 各約 60 秒，GNSS 單包約 60 秒；沒有定位也送。
   診斷每秒最多一包；有持續 DATA 時交錯，必要時延後一筆定位。同時到期優先 TEL、DIAG、GNSS；
   GNSS 無分頁組裝；收到單包立即替換診斷。失效通知優先於診斷。
 - `skipped_slots` 保留舊欄名，計 DATA 因 radio 忙碌／未就緒而延期的工作次數；
   同一次等待只計一次。延期不等於 RF 丟包，DATA 序號不受診斷影響。
-- **供電順序**：PMU 先初始化，LoRa 開機與重建都先設定／讀回 ALDO3 3300 mV＋啟用，
+- **T-Beam 供電順序**：PMU 先初始化，LoRa 開機與重建都先設定／讀回 ALDO3 3300 mV＋啟用，
   等 10 ms 穩定再存取 SPI。失敗有明確 log，不依賴前次韌體留下的電源設定。
-  SF／BW／頻率／Sync Word 改動須同步兩端；**SF9 舊板無法與本版 SF10 通訊**。
+  SF／BW／頻率／Sync Word 改動須同步兩端；**SF9 與 SF10 不互通，B 組需同步更新參與收發的裝置**。
   這是單套排程，沒有多套系統同步或自動換頻；尚未新增手機設定入口或 SF 切換功能。
 
-# 3. Client（下水端）
+# 3. T-Beam Client（下水端；T096 差異見第 4.0 節）
 
 - 持續讀取 GPS UART 115200；[GNSS 快照收集器](../include/gnss_snapshot.h) 依 NMEA UTC
   epoch 對齊 RMC／GGA，驗證 checksum、定位狀態與數值。位置、品質與速度不借用其他 epoch
@@ -90,7 +130,7 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 - 電量讀取：透過 AXP2101 PMU，每 5 秒更新。
 - **固定發射功率**：Client 固定 **20 dBm**；Station 只接收，初始化保留 **17 dBm** 設定。
   Client 已移除 ATPC，不依 ACK、RSSI／SNR 或經過時間調整功率，也不讀寫舊
-  `shorespt_client/txpwr`、`atpc` 設定；舊鍵留存但不生效。上行封包格式保留；SF10 時槽安排見上節。
+  `shorespt_client/txpwr`、`atpc` 設定；舊鍵留存但不生效。上行封包格式保留；各組 airtime／時槽安排見上節。
 - OLED 平時進入睡眠省電；**短按 PWR 鍵**喚醒螢幕顯示狀態 10 秒後自動睡回去（非阻塞，不影響定位/發送）。
   - 睡眠是 `u8g2.setPowerSave(1)`（關顯示與升壓電路），不是只清畫面 —— 只清畫面的話
     像素熄了但控制器還在跑，是毫安等級的常態消耗。
@@ -100,7 +140,7 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 
 # 4. Station（岸上攝影站）
 
-## 4.0 Heltec V4、手機位置與 T096（2026-10-02 USB 桌上部署）
+## 4.0 Heltec V4、手機位置與 T096（行為更新至 2026-10-10）
 
 - Heltec V4 Station 是 group B 923.8 MHz profile；無 PMU／SD／BME280／內建 GNSS，battery/charging
   都是 unknown。SSD1306、Servo GPIO4、FEM 和 auto GC1109/KCT8103L probe 的腳位見
@@ -117,9 +157,37 @@ GNSS／控制／耗時診斷，設定保留於獨立 NVS。網頁關閉仍持續
 - V4 開機自動把逐包 RF bytes、RSSI/SNR/錯誤及每 30 秒的 Station/phone 狀態存入 3.375 MiB 內建 Flash，
   無 SD 或網路也可錄。記滿停止且不自動刪除，USB 匯出／清除方式見 [Heltec 外測準備](heltec-field-ready.md)。
   `/api/flash` 顯示 state、剩餘 frame、錯誤及 drops。既有 Axiom API 保留，需獨立 ingest token 才上傳。
-- T096 `start`／`stop`／`store` 只改 Client state；`test` 只送 RF probe。它們不改 Station Servo 或
-  GPS/UART mode，也不以 fake GPS 產生 DATA、方位或追蹤。Ready 12 小時後才請求 Storage/SystemOFF，USB
-  VBUS 在時抑制關機。USB VBUS 狀態回報已確認；無線充電板未接，充電喚醒、深眠電流與續航待實測。
+- T096 日常只有「啟動 GPS」(Tracking) 與「待機」(Ready)：`start`／`stop` 只改 Client，
+  不改 Station Servo 或 GPS/UART mode。`test` 保留為無 GPS 的 RF 診斷工具，不偽造 DATA／方位。
+  待機保留程式狀態，以 FreeRTOS task notification 阻塞 loop，讓 nRF52 tickless RTC 進 SystemON sleep；
+  USER／DIO1 中斷可提前結束等待。每 30 秒傳 STATE、開短 RX 窗交換指令；有 preamble 才延至 800 ms。
+  不再待機 12 小時 SystemOFF，Web 移除深度休眠。舊 API `store` 轉為 Stop；直接舊 LoRa Store 也回 Ready，
+  但舊 Station 若期待 Storage 會判確認錯誤，應更新 Station。重啟仍回 Ready，GPS 不自動恢復。
+  30 秒由上次 STATE TX_DONE 起算；實際確認還含 airtime／窗口／確認 STATE，純電池 Start 實測 30.776 秒，
+  不是 30 秒硬期限。完整時序／驗證界線見 [RTC 待機](t096-rtc-standby-2026-10-09.md)。
+  T096 TEL／DIAG／GNSS_DIAG 僅 Tracking 每5秒輪替一類、各約15秒；Ready 只送 STATE，Test 送 STATE／probe。
+  [10/10 帶殼外測](t096-field-validation-2026-10-10.md)尚未通過定位／速度品質，不能用設定回讀或2Hz epoch代替。
+
+### T096 5秒畫面／按鍵／電量（2026-10-09）
+
+- T096 ST7735 plugin TFT顯示Client ID、Ready/Tracking/Test、USB、電池電壓／約略百分比與GPS狀態。
+  開機亮5秒；USER短按重新計時。逐16px row buffer刷新，背光期限獨立於RF忙碌；SLPOUT等待120ms不阻塞。
+- USER長按2秒、放開後回 Ready，USB／電池行為相同。開機時已按住的按鍵必須先放開再接受新手勢。
+  RST仍為硬體重啟；正常流程不進 SystemOFF，因此定時檢查不經 bootloader／BLE OTA。
+- ADC用原廠3.0V reference、12bit、390k/100k分壓（4.9倍）。健康 Ready 每30秒取樣，Tracking／Test及
+  <3.5V 警告時每秒取樣，低電保護期間每60秒取樣。取樣只在RF idle，開divider後等待10ms、
+  丟首次ADC、平均4次再關divider；0／超出2.5–4.5V為unknown。百分比沿用3.2V=0%、4.15V=100%線性估算。
+- 三次有效讀值<3.2V且無USB進內部低電保護：關GPS、禁止新RF、FEM關閉、TFT顯示5秒後睡眠，
+  RTC每60秒檢查；連續三次有效讀值≥3.5V才回 Ready並重新送STATE，不能自動啟動GPS。
+  USB出現或unknown讀值本身不能解除已進入的保護。使用者提供電池有4.2V／2.7V保護板，
+  這是最後硬體保護；切斷後MCU無法定時檢查，充電恢復仍需實測，不是無限期休眠保證。
+- STATE與TEL皆傳電壓；待機只靠STATE更新Station電量，溫濕度仍unknown。`charging`只表示USB VBUS，
+  不表示太陽能接口是否充電。低電保護不發RF，Station逾90秒顯示未知，不能當成電源狀態證明。
+- Ready保留TFT controller供電但SLPIN／背光off，GNSS load switch關閉；空閒SX1262 warm-start sleep、
+  FEM關閉；10/10 修正 TX 前必須明確 `standby()`，不能假設 `startTransmit()` 自行喚醒。
+  Tracking 熄屏不關共享Vext，維持既有GNSS 2Hz及最新epoch排程。
+  電錶ADC校準、整機電流、淨充電電流、續航與保護板恢復仍待實測；USB的`IDLE blocked_ms`是loop阻塞時間，
+  不是MCU實際睡眠時間或電流量測。
 
 - 接收時保留實際 RF 長度，驗證 magic、v5、類型、固定長度、`clientId` 白名單與數值／保留位元。
   格式、長度、綁定、序號與 RF 錯誤分別計數，並寫入 64 筆結構化事件環形紀錄。
@@ -298,14 +366,14 @@ SH1106 128×64。以下為模擬畫面（`<...>` 為動態數值）。
 ```
 
 + `Client XXXX` 顯示綁定的十六進位 ID；未綁定時顯示 `Unbound`。
-+ `LoRa` & `GPS` 狀態為四級：`Good` / `OK` / `Bad` / `Miss`（`Miss` = 沒訊號/沒連線/無衛星）\
++ `LoRa` & `GPS` 狀態為四級：`Good` / `OK` / `Bad` / `Miss`；LoRa取最近接受的任何綁定Client有效RF封包，90秒未收到才Miss，沒有GPS DATA也能分級。\
   GPS
   + Good = fix 且 HDOP≤1.5 且 sats≥8
   + OK = fix 且 HDOP≤3 且 sats≥6
   + Bad = 有收到衛星但無可用定位
   + Miss = 沒衛星且無定位。
 
-  LoRa：依最近一筆 RSSI/SNR 分 Good/OK/Bad/Miss。
+  LoRa：最近有效DATA/TEL/DIAG/GNSS/STATE/probe的SNR≥7且RSSI≥−105為Good；其餘SNR≥0為OK、<0為Bad；90秒過期為Miss。不再顯示TEL替代字。
 + 溫濕度無資料顯示 `--.-C/--%`
 + `BAT` 顯示電量百分比（左=Station 自身 18650、右=選定 Client 遙測），無資料顯示 `--%`；Station 接著 USB/充電時左側顯示 ⚡。
 + wifi_status

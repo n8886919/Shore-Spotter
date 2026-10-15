@@ -82,64 +82,64 @@ function page(responseMs = 10) {
 test('manual ramp keeps the slider target without locking calibration', () => {
   const p = page();
   p.context.applyMode({ mode: 'manual', angle: 95, target: 120, moving: true });
-  assert.equal(p.context.$('sld').value, 60);
+  assert.equal(p.context.$('sld').value, 239);
   assert.equal(p.context.$('sld').disabled, false);
   assert.equal(p.context.$('btnCompassCal').disabled, false);
   p.context.applyMode({ mode: 'manual', angle: 120, target: 120, moving: false, pwm_ok: false });
   assert.equal(p.context.$('btnCompassCal').disabled, false);
 });
 
-test('mode polling preserves active drag and still disables manual controls for GPS and UART', () => {
+test('mode polling preserves active drag and still disables manual controls for GPS', () => {
   const p = page();
   p.context.dragging = true;
   p.context.$('sld').value = 130;
   p.context.applyMode({ mode: 'manual', angle: 95, target: 120, moving: true });
   assert.equal(p.context.$('sld').value, 130);
-  for (const mode of ['gps', 'uart']) {
+  for (const mode of ['gps']) {
     p.context.applyMode({ mode, source: mode, angle: 95, target: 120 });
     assert.equal(p.context.$('sld').disabled, true);
     assert.equal(p.context.$('btnCompassCal').disabled, false);
   }
 });
 
-test('dragging only previews; releasing sends one inverted target',async()=>{
+test('dragging only previews; releasing sends one camera-direction target',async()=>{
  const p=page();for(let t=0;t<1000;t+=16){await p.advance(t);p.input(t%181);}
  await p.advance(1000);assert.equal(p.posts.length,0);
  p.release(180);await p.advance(1100);
- assert.deepEqual(p.posts,[{kind:'angle',at:1000,angle:0}]);assert.equal(p.context.dragging,false);
+ assert.deepEqual(p.posts,[{kind:'angle',at:1000,angle:179}]);assert.equal(p.context.dragging,false);
 });
 test('slow replies keep only the latest committed release',async()=>{
  const p=page(500);p.input(10);p.release(10);
  await p.advance(20);p.input(30);p.release(30);
  await p.advance(40);p.input(99);p.release(99);
  await p.advance(1000);
- assert.deepEqual(p.posts,[{kind:'angle',at:0,angle:170},{kind:'angle',at:500,angle:81}]);
+ assert.deepEqual(p.posts,[{kind:'angle',at:0,angle:349},{kind:'angle',at:500,angle:260}]);
  assert.equal(p.maxInFlight(),1);
 });
 test('new drag preview never leaks into a pending committed request',async()=>{
  const p=page(100);p.release(20);await p.advance(20);p.input(160);await p.advance(200);
- assert.equal(p.posts.length,1);assert.equal(p.posts[0].angle,160);assert.equal(p.context.dragging,true);
- p.release(160);await p.advance(400);assert.equal(p.posts[1].angle,20);
+ assert.equal(p.posts.length,1);assert.equal(p.posts[0].angle,339);assert.equal(p.context.dragging,true);
+ p.release(160);await p.advance(400);assert.equal(p.posts[1].angle,199);
 });
 test('pointer cancel does not commit a preview',async()=>{
  const p=page();p.input(10);p.context.$('sld').handlers.pointercancel();p.release(10);
  await p.advance(100);assert.equal(p.posts.length,0);
  p.context.$('sld').handlers.pointerdown();p.input(0);p.release(0);await p.advance(200);
- assert.equal(p.posts[0].angle,180);
+ assert.equal(p.posts[0].angle,359);
 });
 test('mode switch cancels committed pending targets and waits for in-flight request',async()=>{
  const p=page(100);p.release(10);await p.advance(20);p.release(30);
  const changed=p.context.controlAction('/api/servo/mode?mode=gps');await p.advance(300);await changed;
- assert.deepEqual(p.posts,[{kind:'angle',at:0,angle:170},{kind:'mode',at:100,url:'/api/servo/mode?mode=gps'}]);
+ assert.deepEqual(p.posts,[{kind:'angle',at:0,angle:349},{kind:'mode',at:100,url:'/api/servo/mode?mode=gps'}]);
  assert.equal(p.context.servoPendingAngle,null);
 });
 test('mode switch during preview sends no manual target',async()=>{
- const p=page();p.input(10);const changed=p.context.controlAction('/api/servo/mode?mode=uart');
+ const p=page();p.input(10);const changed=p.context.controlAction('/api/servo/mode?mode=gps');
  await p.advance(100);await changed;assert.deepEqual(p.posts.map(x=>x.kind),['mode']);
 });
-test('settled small target displays inverted angle and allows calibration',()=>{
+test('settled small target displays commanded angle and allows calibration',()=>{
  const p=page();p.context.applyMode({mode:'manual',angle:90,target:91,moving:false,deadband_hold:true});
- assert.equal(p.context.$('sld').value,89);assert.equal(p.context.$('btnCompassCal').disabled,false);
+ assert.equal(p.context.$('sld').value,268);assert.equal(p.context.$('btnCompassCal').disabled,false);
 });
 
 test('motion request context preserves sequence and rejects stale status rollback',()=>{

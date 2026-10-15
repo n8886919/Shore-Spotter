@@ -36,6 +36,7 @@ def source_dispatch(loop: str) -> str:
 def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
     receive = extract_function(source, "void startReceiveWindow()")
+    send = extract_function(source, "void sendBuffered()")
     transmit = extract_function(source, "void serviceTransmit(uint32_t now)")
     command = extract_function(source, "void serviceReceive(uint32_t now)")
     dispatch = source_dispatch(extract_function(source, "void loop()"))
@@ -44,6 +45,7 @@ def main() -> None:
     harness = f"""
 #include <cstddef>
 #include <cstdint>
+#include <cassert>
 using std::size_t;
 struct PacketHeader;
 constexpr int16_t RADIOLIB_ERR_NONE = 0, RADIOLIB_ERR_PACKET_TOO_LONG = -1;
@@ -71,7 +73,11 @@ struct FakeControl {{
 }} control;
 template<class... T> void usbLog(const char*, T...) {{}}
 struct FakeRadio {{
-  uint32_t flags = 0; bool receiveStarted = false;
+  uint32_t flags = 0; bool receiveStarted = false,asleep=false;
+  int16_t wakeResult=0,transmitResult=0;unsigned wakeCalls=0,startCalls=0;
+  int16_t standby() {{++wakeCalls;if(!wakeResult)asleep=false;return wakeResult;}}
+  // Installed SX126x TX staging reads packet type before waking the chip.
+  int16_t startTransmit(const uint8_t*,size_t) {{++startCalls;return asleep?-2:transmitResult;}}
   int16_t startReceive(uint32_t,uint32_t,uint32_t) {{ receiveStarted = true; flags=0; return RADIOLIB_ERR_NONE; }}
   uint32_t getIrqFlags() {{ return flags; }} size_t getPacketLength() {{ return 12; }}
   int16_t readData(uint8_t*, size_t) {{ return RADIOLIB_ERR_NONE; }}
@@ -80,12 +86,13 @@ struct FakeRadio {{
 enum class AirState : uint8_t {{ Idle, Sending, Receiving }};
 AirState air = AirState::Idle;
 bool radioIrq = false, confirmationPending = false, outOpensReceiveWindow = false, outIsState = false, sleepAfterStateTx = false;
-bool rxPreamble=false; uint32_t txErrors=0;
+bool rxPreamble=false,radioSleeping=false,radioReady=true; uint32_t txErrors=0,nextBatteryMs=0,nextTxStartMs=0,nextRadioRetryMs=0;
 uint8_t out[64] = {{}}; size_t outLength = 0; uint16_t rxErrors = 0; uint32_t airStartedMs = 0, txPackets = 0;
-void femRx() {{ delay(1); }} void femOff() {{}} void setGnssEnabled(bool) {{}} void armSystemOff(uint32_t) {{}}
+void femTx() {{delay(1);}} void femRx() {{ delay(1); }} void femOff() {{}} void setGnssEnabled(bool) {{}} void armSystemOff(uint32_t) {{}}
 bool usbVbusPresent() {{ return false; }} void enterSystemOff() {{}}
 
 {receive}
+{send}
 {command}
 {transmit}
 
@@ -97,6 +104,19 @@ static void resetTxDone() {{
   radio.receiveStarted = false; control.applied = false; rxErrors = 0;
 }}
 int main() {{
+  // Regression: retained sleep must end before RadioLib attempts any TX read.
+  clockMs=10;radio.asleep=radioSleeping=true;outLength=1;outIsState=true;
+  sendBuffered();assert(air==AirState::Sending&&!radio.asleep&&!radioSleeping&&radio.wakeCalls==1);
+  assert(nextTxStartMs==510);
+  // Wake failures start no PA TX, retain confirmation and permit re-init.
+  air=AirState::Idle;clockMs=20;outLength=1;radio.asleep=radioSleeping=true;radio.wakeResult=-2;
+  unsigned starts=radio.startCalls;confirmationPending=false;outIsState=true;
+  sendBuffered();assert(!radioReady&&confirmationPending&&!outLength&&radio.startCalls==starts);
+  assert(nextRadioRetryMs==20&&nextTxStartMs==520&&txErrors==1);
+  // Failed starts also use the 500 ms guard and never count as TX done.
+  radio.wakeResult=0;radioReady=true;clockMs=30;outLength=1;outIsState=true;radio.transmitResult=-7;
+  sendBuffered();assert(air==AirState::Idle&&confirmationPending&&!outLength&&nextTxStartMs==530);
+  assert(txErrors==2&&txPackets==0);radio.transmitResult=0;
   clockMs = 100; resetTxDone(); actualDispatch();
   if (air != AirState::Receiving || !radio.receiveStarted || airStartedMs != 101) return 1;
   radio.flags = RADIOLIB_SX126X_IRQ_RX_DONE; radioIrq = true; actualDispatch();
@@ -122,7 +142,7 @@ int main() {{
         cpp.write_text(harness, encoding="utf-8")
         subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
-    print("PASS: actual T096 TX-done/FEM-RX/command/wrap lifecycle")
+    print("PASS: actual retained-radio wake before TX, failure guards, TX-done/FEM-RX/command/wrap lifecycle")
 
 
 if __name__ == "__main__":

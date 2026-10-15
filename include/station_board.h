@@ -30,6 +30,7 @@ constexpr int kLoraBusy = 13;
 constexpr int kOledSda = 17;
 constexpr int kOledScl = 18;
 constexpr int kOledReset = 21;
+constexpr int kServoTxPin = 43; // UART2 output; verify the V4 header before use
 constexpr int kServoPin = 4;  // exposed GPIO on the Heltec V4 header
 constexpr int kVext = 36;     // active-low OLED/FEM supply enable
 constexpr int kFemPower = 7;
@@ -75,7 +76,8 @@ constexpr int kLoraBusy = 4;
 constexpr int kOledSda = 17;
 constexpr int kOledScl = 18;
 constexpr int kOledReset = -1;
-constexpr int kServoPin = 21;
+constexpr int kServoTxPin = 43; // LilyGO header TX -> controller RX
+constexpr int kServoPin = 21; // legacy PWM, no longer driven
 constexpr int kTxPowerDbm = 17;
 constexpr const char *kDeviceBoard = "tbeam-supreme-station";
 inline const char *deviceBoard() { return kDeviceBoard; }

@@ -29,13 +29,13 @@ inline bool decodeSpeed(uint32_t saved,double &speed) {
 // deadband, per-mode settings or fixed output cadence.
 class Controller {
  public:
-  explicit Controller(double held=90):position_(held),requested_(held) {}
+  explicit Controller(double held=179.5):position_(held),requested_(held) {}
   bool setSpeed(double speed) {
     if(!validSpeed(speed))return false;
     speed_=speed;return true;  // a live speed change preserves the latest target
   }
   bool target(double angle) {
-    if(fault_ || !std::isfinite(angle) || angle<0 || angle>180)return false;
+    if(fault_ || !std::isfinite(angle) || angle<0 || angle>359)return false;
     requested_=std::round(angle*1000)/1000.0;
     return true;
   }
@@ -44,7 +44,7 @@ class Controller {
   }
   void faultUs(uint32_t nowUs) {holdUs(nowUs);fault_=true;}
   void initializeUs(double held,uint32_t nowUs) {
-    if(!std::isfinite(held) || held<0 || held>180) {faultUs(nowUs);return;}
+    if(!std::isfinite(held) || held<0 || held>359) {faultUs(nowUs);return;}
     position_=held;fault_=false;holdUs(nowUs);
   }
   bool tickUs(uint32_t nowUs) {

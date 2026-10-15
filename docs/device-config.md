@@ -1,8 +1,8 @@
 # 固定 RF group 與裝置 manifest
 
-目前配置兩個固定 group，不掃描、不自動換頻：A 是 id 0、923.2 MHz；B 是 id 1、923.8 MHz。兩組都固定 SF10、BW125、CR5、sync word `0x12`。頻率設定本身不構成任何 RF 認證或法規符合性聲明。
+目前配置兩個固定 group，不掃描、不自動換頻：A 是 id 0、923.2 MHz；B 是 id 1、923.8 MHz。A 組維持 SF10；B 組改為 SF9。兩組都使用 BW125、CR5、sync word `0x12`。頻率設定本身不構成任何 RF 認證或法規符合性聲明。
 
-`config/rf-groups.json` 是這些 RF 值的唯一設定來源。PlatformIO 環境以 `custom_rf_group=A` 或 `B` 設定預設組別，並透過 `tools/load_rf_profile.py` 將選定 group 的 `SHORE_RF_GROUP` 與 `SHORE_RF_FREQUENCY_MHZ` 加到該次 build。不要在環境的 `build_flags` 再硬編這兩個 macro，loader 會拒絕重複定義。
+`config/rf-groups.json` 是這些 RF 值的唯一設定來源。PlatformIO 環境以 `custom_rf_group=A` 或 `B` 設定預設組別，並透過 `tools/load_rf_profile.py` 將選定 group 的 `SHORE_RF_GROUP`、`SHORE_RF_FREQUENCY_MHZ` 與 `SHORE_RF_SPREADING_FACTOR` 加到該次 build。不要在環境的 `build_flags` 再硬編這三個 macro，loader 會拒絕重複定義。
 
 實際裝置清單放在被忽略的 `config/devices.local.json`；可由 `config/devices.example.json` 開始。欄位為：
 
@@ -45,7 +45,7 @@ Client 可增加 `radio_id` 整數欄位（取自實際 USB 開機訊息，不�
 
 目前檔案只配置 A/B；往後可在同一 JSON 加入有獨立 name/id/frequency 的固定組別，
 不必複製韌體。工具拒絕重複頻率與 ID；硬體頻率範圍檢查不代表法規許可。
-現有 SF10/BW125/CR4/5 profile 維持共用，這次不新增掃頻或跳頻。
+每組可選已驗證的整數 SF9 或 SF10；BW125／CR4/5 共用。兩端 SF 必須一致，設定不會遠端更新其他 Station，也不新增掃頻或跳頻。
 
 ## Station 固定名稱
 

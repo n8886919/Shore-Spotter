@@ -23,21 +23,15 @@ class Controller {
   uint16_t station() const { return station_; }
   uint16_t command() const { return command_; }
   bool hasStation() const { return station_ != 0; }
-  bool storageDue(uint32_t now, bool charging) const {
-    return !charging && state_ == client_control::State::Ready &&
-           elapsed(now, readySince_, client_control::kStorageAfterMs);
-  }
-  void requestStorage() { state_ = client_control::State::Storage; }
-  void cancelStorage(uint32_t now) {
-    if (state_ == client_control::State::Storage) {
-      state_ = client_control::State::Ready;
-      readySince_ = now;
-    }
+  void requestReady() { state_ = client_control::State::Ready; }
+  uint32_t pollWaitMs(uint32_t now) const {
+    const uint32_t interval = state_ == client_control::State::Ready
+                                 ? client_control::kReadyPollMs : client_control::kActivePollMs;
+    const uint32_t age = uint32_t(now - lastStateMs_);
+    return age >= interval ? 0 : interval - age;
   }
   bool pollDue(uint32_t now) const {
-    return elapsed(now, lastStateMs_, state_ == client_control::State::Ready
-                                          ? client_control::kReadyPollMs
-                                          : client_control::kActivePollMs);
+    return pollWaitMs(now) == 0;
   }
   bool probeDue(uint32_t now) const {
     return state_ == client_control::State::Test && elapsed(now, lastProbeMs_, 500);
@@ -46,7 +40,7 @@ class Controller {
   void notedProbe(uint32_t now) { lastProbeMs_ = now; }
 
   CommandResult apply(const PacketHeader &header, const client_control::Command &in,
-                      uint32_t now) {
+                      uint32_t /*now*/) {
     if (header.clientId != clientId_ || in.boot != boot_ || !client_control::valid(in.action))
       return CommandResult::Ignored;
     // First valid requester owns this boot session.  A Station change is only
@@ -63,14 +57,14 @@ class Controller {
     haveCommand_ = true;
     switch (in.action) {
       case client_control::Action::Start: state_ = client_control::State::Tracking; break;
-      case client_control::Action::Stop: state_ = client_control::State::Ready; readySince_ = now; break;
+      case client_control::Action::Stop: state_ = client_control::State::Ready; break;
       case client_control::Action::Test: state_ = client_control::State::Test; break;
-      case client_control::Action::Store: state_ = client_control::State::Storage; break;
+      // Retain wire-v5 decoding for older Stations, but never enter SystemOFF.
+      case client_control::Action::Store: state_ = client_control::State::Ready; break;
     }
     return CommandResult::Applied;
   }
 
-  void resetReadyTimer(uint32_t now) { readySince_ = now; }
   void setClientId(uint16_t id) { clientId_ = id; }
 
  private:
@@ -78,7 +72,7 @@ class Controller {
   uint16_t clientId_ = 0;
   client_control::State state_ = client_control::State::Ready;
   uint16_t station_ = 0, command_ = 0;
-  uint32_t readySince_ = 0, lastStateMs_ = 0, lastProbeMs_ = 0;
+  uint32_t lastStateMs_ = 0, lastProbeMs_ = 0;
   bool haveCommand_ = false;
 };
 
