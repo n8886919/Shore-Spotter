@@ -1,0 +1,8 @@
+# FreeCAD backup files
+*.[Ff][Cc][Bb][Aa][Kk]
+*.[Ff][Cc][Ss][Tt][Dd][0-9]*
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

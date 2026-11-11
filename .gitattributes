@@ -1,0 +1,2 @@
+*.[Ff][Cc][Ss][Tt][Dd] binary -filter
+*.yaml text eol=lf
