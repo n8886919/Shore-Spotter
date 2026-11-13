@@ -1,8 +1,8 @@
 # 功能入口盤點（更新至 2026-10-28）
 
 適用 **1.0** 現行原始碼；按鍵、網頁與 API 入口見下表。
-部署與未完成驗收見 [交接入口](assistant-handoff.md)、[BLE 紀錄](ble-control-2026-10-27.md)
-及 [T096 維護紀錄](t096-maintenance-2026-10-28.md)。本表不是所有實體操作均已驗收的聲明。
+部署與未完成驗收見 [交接入口](assistant-handoff.md)、[BLE 紀錄](records-index.md#ble-control-2026-10-27)
+及 [T096 維護紀錄](records-index.md#t096-maintenance-2026-10-28)。本表不是所有實體操作均已驗收的聲明。
 
 ## 日常操作
 

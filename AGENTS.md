@@ -1,67 +1,26 @@
 ## DOCS
-- `docs/indoor-acceptance-handoff-2026-10-28.md` — 本輪室內驗收、BLE 重連延遲、三項未實作介面需求與下一 session 接續入口
-- `docs/t096-maintenance-2026-10-28.md` — T096 USER 短按 60 秒／兩頁診斷、5 秒放開 ACT／SLP（UI=8 FB27 已部署）、RST 重啟與換 Station；本輪驗證／部署紀錄
-- `docs/ble-control-2026-10-27.md` / `docs/openapi-client-control.json` — 1.0 BLE 待機、每次開機固定 owner、手動 CAD 選頻／LoRa 驗證後保存與 Wi-Fi App API；2026-10-28 已部署 584C／FB27，完整驗收界線見文件
-- `docs/health-check-2026-10-16.md` — 10/16 歷史 WIP 健檢、建置重現性修正與 E91C／F035 更新驗證
-- `include/sdk_log.h` / `src/sdk_log.cpp` / `tools/test_sdk_log.py` — ESP-IDF task log 固定佇列，主迴圈 LogTee 與 SD／DIAG USB 匯出隔離
-- `docs/servo-controller-youmi-2026-10-10.md` — 已指定 Youmi 35 kg＋9600 baud 雙路串口控制板；現行 M0 固定、9600 baud TX43 單向輸出、359°／中位179.5；舊外部 UART 輸入移除
-- `demo/info-page/` — 2026-10-10 資訊頁獨立 mock demo，無實機請求、不燒錄；手機權限延後、不加複製摘要
-- `docs/assistant-handoff.md` — 其他助手交接入口、最新 WIP 位置、現行 1.0／UI=6 行為與驗證界線（2026-10-28）
-- `docs/t096-field-validation-2026-10-10.md` — 帶殼內建 GNSS 外測、手機對照、DATA／速度／RF 證據與外接天線未決項目
-- `docs/t096-rtc-standby-2026-10-09.md` — 歷史 Ready RTC／30 秒 LoRa 時序與 TX 喚醒驗證；現行 Ready 已改 BLE
-- `docs/t096-controls-2026-10-05.md` / `docs/t096-power-validation-2026-10-08.md` — 顯示／電源歷史驗證；舊 SystemOFF 流程已由 RTC 待機取代
-- `docs/sf9-field-pair-2026-10-07.md` / `docs/lilygo-station-2026-10-06.md` — B 組 SF9 與 LilyGO Station／SD 部署
-- `include/firmware_version.h` — Client／Station 共用版本號唯一來源；發版時同步 `CHANGELOG.md`
-- `CHANGELOG.md` — 從 0.1 開始的版本紀錄（不等同 LoRa 協定版本）
-- `docs/interface.md` — LoRa 封包格式 + 攝影站 HTTP API + 欄位對應表
-- `docs/features.md` — 韌體功能/流程/狀態/OLED 顯示
-- `docs/hardware.md` — 腳位與接線
-- `include/protocol.h` — client/station 共用的 LoRa 封包定義
-- `include/gnss_snapshot.h` — 最新 epoch RMC／GGA、實測到達期限、診斷年齡與 UART 積壓失效
-- `include/lora_schedule.h` — airtime／guard 空檔預算
-- `include/client_cadence.h` — 最新有效定位即送、單次失效通知與短暫配對等待
-- `include/gnss_rate.h` — 115200／2 Hz 驗證版設定與 5 秒實測 epoch／RMC／GGA 頻率
-- `include/station_position.h` — 岸端 30 秒座標平均與 RMS 散布警告，不丟離群點
-- `docs/tracking-update-2026-09-19.md` — 已確認行為、主機驗證、實機驗收與未決問題
-- `include/packet_diagnostics.h` — 固定容量封包事件與 raw bytes
-- `include/packet_rate.h` — 接受 DATA 到達時間的 10 秒滑動 FPS，固定容量、不依賴網頁輪詢
-- `docs/sd-log.md` — 兩端 SD 循環記錄、Client GPS gate／關卡電、USB 讀取與驗證界線
-- `include/client_sd_policy.h` / `include/client_sd_record.h` — Client 記錄條件及有界事件快照，不改 RF 發送條件
-- `include/sd_retention.h` / `src/sd_log.cpp` — 自家 log 辨識、背景空間回收與 SD worker
-- `tools/test_client_sd_backend.py` — 實際 Client 記錄產生器／worker／省電與循環回收測試
-- `include/http_timing.h` — WebServer 請求前處理／組裝／寫入分段計時，保留最慢請求
-- `docs/debug-export.md` — 網頁除錯、錄製匯出與現場判讀
-- `docs/link-test-2026-09-13.md` — v4 實機收包證據、GPS／ACK 限制與 HTTP 停頓觀察
-- `include/geo_math.h` — 純數學（角度/方位/圓擬合/電量/GPS 分級），不依賴 Arduino
-- `include/alerts.h` — 現場提醒的門檻與分級，不依賴 Arduino
-- `include/tracking_policy.h` — GPS 定位／外推品質分開與 GPS/UART 模式隔離規則，不依賴 Arduino
-- `include/servo_motion.h` — 所有模式共用限速，預設 30°/s，1–90 可調；servospd NVS 單值
-- `include/control_cadence.h` — GPS 目標 50 ms 排程，與 Servo 限速器服務獨立
-- `include/uart_target.h` — UART 最新目標與 250 ms lease，不執行 PWM
-- `include/command_freshness.h` — HTTP／SET2 世代、序號、期限與 LoRa seq 重同步
-- `docs/motion-control.md` — 共用控制設定、來源有效性與新 HTTP／UART 契約
-- `docs/uart-servo.md` — 手動／GPS 共用串口控制板與鏡頭指南針校正操作
-- `include/uart_servo_mode.h` / `src/uart_servo_mode.cpp` — UART 控制端點與輸入生命週期
-- `include/uart_set_parser.h` — SET／SET2／SYNC 分行、逾時與非法指令檢查
-- `include/loop_metrics.h` — wrap-safe deadline、服務間隔與同步操作耗時
-- `include/async_lora_tx.h` — 非阻塞 Client TX 生命週期，可用 fake radio 驗證
-- `include/client_binding.h` — 單一 client ID 驗證與舊設定遷移
-- `include/magnetic_declination.h` — GPS 位置／日期轉台灣磁偏角
-- `include/taiwan_wmm_grid.h` — 產生檔，來源 `tools/make_declination.py`
-- `test/` — `pio test -e native` 在筆電上跑的純邏輯測試（數學／提醒／GPS/UART 模式隔離／Servo 控制）
-- `include/wifi_config.h` — 手機熱點 SSID/密碼設定（STATION 開機連線用）
-- `include/web_ui.h` — 內嵌監控頁
-- `docs/web-ui-design.md` — 使用者已確認的網頁設計基準；修改 UI 前必讀，包含版面、燈號、模式顯示與不得擅自恢復的項目
-- `include/web_icon.h` — 分頁圖示 PNG（**產生檔，勿手改**）
-- `tools/make_icon.py` — 圖示的唯一來源；改設計後重跑會更新 web_icon.h
-- `tools/test_servo_slider.js` — `node tools/test_servo_slider.js` 驗證滑桿排程與模式切換
-- `tools/test_motion_backend.py` — 擷取實際 HTTP／UART 輸出／GPS gate／NVS 讀寫做主機整合測試
-- `tools/test_motion_ui.js` — 資訊頁速度自動保存、GPS 選取門檻與完整頁面模擬
-- `tools/test_packet_backend.py` — 實際封包建立／解析與 GNSS 主機整合
-- `tools/test_debug_backend.py` / `tools/test_debug_ui.js` — 實際診斷 JSON／log cursor 與網頁錄製匯出
-- `docs/health-check-2026-09-08.md` — 9/8 歷史驗證狀態與當時未處理問題
+- `docs/assistant-handoff.md` — 新 session 入口、目前已驗證／未驗證界線。
+- `docs/next-session-plan.md` — GPS-only 優先驗證與程式精簡待辦；使用者最新觀察是第一次除 NETWORK GPS 外其他正常。
+- `docs/records-index.md` / `docs/records.json` / `tools/read_record.py` — 已結束的實驗／部署／階段交接從 Git 取回。
+  不因舊文件已移出工作目錄就判定證據遺失；例如 `python3 tools/read_record.py field-experiment-2026-11-14`。
+- `README.md` / `docs/features.md` / `docs/function-entrypoints.md` — 現行流程與功能入口。
+- `android/README.md` / `.agents/skills/shore-spotter-android/SKILL.md` — 原生相機／控制／GPS-only App；主機建置不等於已安裝。
+- `cad/README.md` / `cad/reference.json` — 正式外殼在 `~/freecad/Shore-Spotter-Case/` 的獨立 Git commit／主檔 hash，不重複拷貝模型。
+- `docs/interface.md` / `docs/client-binding-api.md` / `docs/openapi-client-control.json` / `docs/openapi-client-binding.json` — 現行 LoRa／BLE／HTTP 契約。
+- `docs/hardware.md` / `docs/device-config.md` — 硬體、設定、身分與部署邊界；私人 Wi-Fi／裝置設定不提交。
+- `docs/web-ui-design.md` / `include/web_ui.h` — 網頁修改前必讀；圖示只改 `tools/make_icon.py`，`include/web_icon.h` 為產生檔。
+- `docs/motion-control.md` / `docs/uart-servo.md` / `include/servo_motion.h` / `include/servo_controller.h` — 手動／GPS 共用限速與 Youmi M0／TX43／9600，無回授。
+- `include/gnss_snapshot.h` / `include/gnss_rate.h` / `include/station_position.h` / `include/geo_math.h` / `include/tracking_policy.h` — GNSS、平均位置、方位與追蹤有效性。
+- `include/protocol.h` / `include/client_cadence.h` / `include/lora_schedule.h` / `include/packet_diagnostics.h` / `include/packet_rate.h` — RF 封包與時序。
+- `include/station_extensions.h` / `include/station_ble.h` / `include/station_client_link.h` / `include/t096_control.h` / `include/t096_power.h` — Client 控制／BLE／狀態與電源。
+- `docs/sd-log.md` / `docs/debug-export.md` / `src/sd_log.cpp` / `src/sdk_log.cpp` / `include/http_timing.h` / `include/loop_metrics.h` — 有界記錄、USB 匯出與時序；不要把快照略過當成 RF 漏包。
+- `include/firmware_version.h` / `CHANGELOG.md` — 版本唯一來源與變更紀錄。
+- `tools/verify_project.py` / `test/` — 主機回歸，不會燒錄或操作硬體；相關 `tools/test_*` 見功能入口。
 
 ## RULES:
++ 使用者希望精簡程式，方便記憶與 debug。先看真正執行／占資源的路徑，優先刪除確認不用的階段性功能，不先增加框架、快取或重試狀態機。
++ 階段性實驗／部署紀錄先 commit 保存，再將 commit／原路徑／SHA-256／附件加入紀錄索引；驗證可取回後刪除工作目錄副本並 commit 清理。現行規格與 `next-session-plan.md` 持續保留，舊連結改指索引。
++ 刪除前執行 `python3 tools/read_record.py --verify`；收尾實際匯出一份含圖片的紀錄。不要重寫歷史、只保留易移動的 HEAD 指標，或為了減少文件把尚未驗收改成通過。
 + 網頁修改先讀 `docs/web-ui-design.md`；使用者最新明確指示優先，只改已授權範圍，並同步規格與驗證紀錄。不得因美化／重構自行重排控制、恢復已移除功能或改變追蹤／Servo 行為。
 + 功能、修正、介面或設定行為異動須同步記錄 `CHANGELOG.md`；未定版先放「未發行」，標版時歸入對應版本並記錄驗證／部署狀態。
 + build 與驗證由 agent 執行，輸出以結果摘要為主；使用者明確要求不 build 時不得編譯。

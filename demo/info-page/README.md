@@ -25,6 +25,6 @@ python3 -m http.server 8770 --bind 127.0.0.1 --directory demo/info-page
   取消手勢／切模式不提交；GPS只保留不可拖曳角度標記，需模擬有效定位才能選。
 
 重新載入會重置所有本頁設定，不宣稱 NVS 保存。正式欄位／待補 API、硬體協定與驗證界線見
-[UI 規格](../../docs/web-ui-design.md)、[控制板整合](../../docs/servo-controller-youmi-2026-10-10.md)。
+[UI 規格](../../docs/web-ui-design.md)、[控制板整合](../../docs/records-index.md#servo-controller-youmi-2026-10-10)。
 
 本次驗證結果記於 UI 規格及 CHANGELOG；不代表控制板實機、GPS 精度或 SD 實際寫入測試。

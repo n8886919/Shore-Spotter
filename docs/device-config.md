@@ -28,7 +28,7 @@ Station 開機優先讀取 NVS `rfchannel`；沒有有效保存值時，以建�
 
 上述驗證只證明啟動狀態與選定頻道的上行 STATE，不代表 GPS fix、LoRa 下行、戶外距離或 Servo 驗收。
 頻率設定也不構成 RF 認證或法規符合性聲明。
-操作與已記錄的部署／驗證界線見 [BLE 控制與手動選頻](ble-control-2026-10-27.md)。
+操作與已記錄的部署／驗證界線見 [BLE 控制與手動選頻](records-index.md#ble-control-2026-10-27)。
 
 ## 建置 profile 與本機 manifest
 
@@ -58,7 +58,7 @@ Station 會自動搜尋 NVS 已保存的目標 ID。回 Ready、BLE 斷線或 St
 換 Station 時依序：先關閉舊 Station 或改掉其目標 ID，讓它停止搜尋此 Client；
 在新 Station 設定此 Client ID；T096 USER 長按滿 5 秒後放開重啟；確認 Client 新 boot 與新 owner。
 舊 Station 若仍搜尋，可能再次搶先認領。只改 manifest 或 Station 接收綁定不會轉移現有 owner。
-按鍵流程見 [T096 維護與換 Station](t096-maintenance-2026-10-28.md)。
+按鍵流程見 [T096 維護與換 Station](records-index.md#t096-maintenance-2026-10-28)。
 
 範例以 Heltec V4 Station 與 T096 Client 同在 B 示範，USB serial 是待替換的 placeholder。
 真實序號只保存在被忽略的本機 manifest；新增裝置前須先核對硬體與USB身份。

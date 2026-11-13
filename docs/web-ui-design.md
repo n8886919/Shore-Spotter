@@ -23,7 +23,7 @@
 - 手機定位於前景持續更新，移除停止／開始更新按鈕；定位視窗只顯示狀態，離開前景仍停止取樣。
 - App 主畫面與對話框吞掉手機內建音量鍵，不調音量或觸發錄影；外接裝置另外辨識，尚未加入遙控錄影。
 - IP 欄不顯示或要求協定，使用數字鍵盤並允許 IPv4 的多個點，鍵盤完成即連線；換家中 Wi-Fi／手機熱點時依 Station 螢幕更改並保存。
-- App／硬體命令期限與測試界線見 [Android 紀錄](android-app-2026-11-13.md)。
+- App／硬體命令期限與測試界線見 [Android 紀錄](records-index.md#android-app-2026-11-13)。
 
 ## 2026-11-13 HTTP 逾時與前景恢復（已部署 584C）
 
@@ -41,7 +41,7 @@
 - 保留最近 16 筆頁面 RAM 錯誤 `httpFailures`（時間、方法、無 query 的路徑、截短原因），
   可用瀏覽器 console 檢查；不保存 body／位置，不自動上傳，重新載入即清除。
 
-重現、回歸與實機界線見 [修復紀錄](web-recovery-2026-11-13.md)。
+重現、回歸與實機界線見 [修復紀錄](records-index.md#web-recovery-2026-11-13)。
 
 ## 2026-10-28 RSSI／SNR 分開分級（2026-11-13 已部署 584C）
 
@@ -63,7 +63,7 @@
   再次開啟依 Station 已確認的 selected 頻道顯示。點窗內或從窗內拖曳到窗外不誤關閉。
   HTTP 操作送出中維持原有禁止關閉規則，避免隱藏尚未確認的結果；Escape 沿用相同 busy gate。
 - 「開啟 GPS／關閉 GPS」按鈕改成「開啟位置回報／關閉位置回報」；Start／Stop 請求與操作條件不變。
-- Client TFT 首行改動另見 [維護 UI=7](t096-maintenance-2026-10-28.md)。
+- Client TFT 首行改動另見 [維護 UI=7](records-index.md#t096-maintenance-2026-10-28)。
 
 
 ## 2026-10-27 BLE 待機與換頻（0.7.0-dev，2026-10-28 已部署至 584C／FB27）
@@ -83,7 +83,7 @@
   未驗證顯示「待驗證」，不以 BLE 回覆或 HTTP 202 冒充成功。命令 pending 時禁止重複送出。
 - 保留其餘版面、GPS／Servo 操作、診斷折疊與既有無線連線測試；不恢復已移除資訊。
 
-主機驗證與部署狀態見 [BLE 版本紀錄](ble-control-2026-10-27.md)。
+主機驗證與部署狀態見 [BLE 版本紀錄](records-index.md#ble-control-2026-10-27)。
 
 ## 2026-10-27 資訊頁精簡與配對顯示（已部署 584C）
 
@@ -104,7 +104,7 @@ STATE 過期為「Client 尚未回報」，不把 HTTP 2 秒期限當作 Client 
 成功後以 179.5° 為基準同步限速器，撤銷舊控制世代，下一輪控制輸出中位脈寬。
 實體按鈕沒有回授，不宣稱自動偵測到位；舊 API 未帶此參數仍要求軟體精確中位。
 
-主機回歸、320／360 px 隔離瀏覽器預覽與 LilyGO Station build 通過；[驗證紀錄](info-page-2026-10-27.md)。584C 已 USB 更新並確認新開機／HTML／持續 STATE；實體校正仍待驗收。
+主機回歸、320／360 px 隔離瀏覽器預覽與 LilyGO Station build 通過；[驗證紀錄](records-index.md#info-page-2026-10-27)。584C 已 USB 更新並確認新開機／HTML／持續 STATE；實體校正仍待驗收。
 
 RF 測試改名「無線連線測試」，留在診斷內，明示測試關閉 GPS／需手動結束，新增「結束測試」。
 沿用既有 test／stop 命令，沒有改 LoRa 封包、待機週期、Station Servo 模式或 Client 所有權。
@@ -146,7 +146,7 @@ GPS 狀態只依近期 STATE；未知或過期不假裝為關閉。
 UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw 角度；地理方位另依校正計算。
 手機定位權限流程延後、不加複製診斷摘要。
 
-部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；已 application OTA 更新，HTML 比對、M0 輸出與持續 STATE 通過；見 [部署驗證](servo-ui-deployment-2026-10-11.md)。
+部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；已 application OTA 更新，HTML 比對、M0 輸出與持續 STATE 通過；見 [部署驗證](records-index.md#servo-ui-deployment-2026-10-11)。
 主機通過 140 項 native、實際 HTTP／UART／GPS gate／NVS、圓形操作及地圖回歸。
 實體 M0 接線、UART 接受、轉向、端點、帶載及戶外 GPS 精度仍待驗收。
 
@@ -173,7 +173,7 @@ UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw �
 - Ready明示GPS關閉，過期GNSS快照不假裝為即時診斷；沒有DATA樣本時漏包顯示`--`。
 - Client position更新顯示**Station收到DATA後的時間**，不宣稱已量到來源內部延遲；來源年齡仍不在DATA。
 - 電量只放Surfer；溫濕度為Station自己的感測值，不能把Client量測改標Station。
-- 控制板是 [Youmi新指定組合](servo-controller-youmi-2026-10-10.md)；demo角度是指令值，
+- 控制板是 [Youmi新指定組合](records-index.md#servo-controller-youmi-2026-10-10)；demo角度是指令值，
   脈寬示意不代表ACK／實際位置。M0是demo假定，不代表已查出接在哪一路。
 - 指南針輸入text＋numeric，整數0～359、預設90；灰字「北 0°、東 90°、南 180°、西 270°」。
 - 回到90°改為「鏡頭置中」；demo以待驗行程中點179.5°示意，與指南針預設90°分開。

@@ -22,8 +22,9 @@
   5 個 JUnit、build／16 KB／zipalign 已過，lint 0 errors／26 warnings；**尚未安裝**，不要當成真機／戶外已驗收。
 - Station 上次部署仍是 main build `Nov 13 2026 01:13:33` 的 Web 恢復版本；GPS-only 只改 App。
   目前連線位址／板子／boot 必須重新辨識，不能硬用先前 IP 或 `/dev/ttyACM0`。
-- 指定 `~/freecad/shore-spotter-jetson-case` 目前只有 Pocket 診斷模型與 JSON，非整套機殼主設計。
-  本 repo 的 `cad/` 是兩檔快照，對照 `snapshot.json`；本輪未修改原 CAD 或驗證幾何。
+- 使用者已更正 CAD 為 `~/freecad/Shore-Spotter-Case/`，獨立 Git commit `f3c69b92dbabbcf2fabaf60c2b81fcd3ed723c81` 已保存主 FCStd 與既有 STL。
+  程式 repo 僅留 `cad/reference.json`，沒有複製模型；STL 早於 FCStd 存檔，未重算／重匯出或確認幾何一致。
+  舊 Pocket 診斷目錄不是本次主設計，其誤納入副本已移除。
 
 ## 2. 優先：建立 GPS-only 基準
 

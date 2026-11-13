@@ -1,10 +1,17 @@
-# CAD 快照
+# CAD repository 索引
 
-`shore-spotter-jetson-case/` 是使用者指定的 `~/freecad/shore-spotter-jetson-case/` 檔案快照。
-來源不是獨立 Git repository，因此將檔案本體納入 Shore-Spotter，同一份 commit 即可取回，沒有使用指向外部資料夾的 symlink。
+使用者更正的主模型目錄是 `~/freecad/Shore-Spotter-Case/`，它有自己的 Git repository。
+本次在該 repository 提交 `Shore-Spotter-Case.FCStd`、既有 STL 及 README；commit **`f3c69b92dbabbcf2fabaf60c2b81fcd3ed723c81`**。
+檔案大小／SHA-256、存檔時間與驗證範圍見 [reference.json](reference.json)。程式 repository 不重複拷貝模型。
 
-本輪來源只有兩檔：Pocket Up-to-Face 最小失敗模型與既有結果 JSON；**不包含完整機殼主模型**。
-來源未修改、未開啟或重算 FreeCAD 文件；內容只做 byte／SHA-256 核對，不把歷史診斷當成此次幾何驗收。
-檔案清單、來源相對路徑與 hash 見 [snapshot.json](shore-spotter-jetson-case/snapshot.json)。
+FCStd ZIP／Document.xml 完整性與 STL 二進位長度／14,696 三角形通過，沒有開啟、重算或重新匯出模型。
+STL 的匯出早於 FCStd 最後存檔，未確認兩者幾何一致；既有 `.snapshots` YAML 也未重新產生。
 
-CAD 後續變更需從使用者指定的實際主檔取得，更新快照與 manifest，避免把這份副本誤認成所有主設計的同步資料夾。
+需要從 CAD 歷史取回主檔可用：
+
+```sh
+git -C ~/freecad/Shore-Spotter-Case show f3c69b92dbabbcf2fabaf60c2b81fcd3ed723c81:Shore-Spotter-Case.FCStd > /tmp/Shore-Spotter-Case.FCStd
+```
+
+原先誤指的 `~/freecad/shore-spotter-jetson-case/` 只有 Pocket 診斷資料，其工作目錄副本已移除；
+先前 checkpoint 的診斷副本仍留在 Git 歷史，與這個正式外殼 repository 分開看待。原始兩個目錄都未改幾何。

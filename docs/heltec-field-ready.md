@@ -1,7 +1,7 @@
 # Heltec 外測準備與夜間驗證（2026-10-02）
 
 2026-10-05 的 USER 按鍵、5秒 TFT、電量保護與 Station RF 分級更新見
-[操作與部署筆記](t096-controls-2026-10-05.md)；下列保留10月2日的驗證脈絡。
+[操作與部署筆記](records-index.md#t096-controls-2026-10-05)；下列保留10月2日的驗證脈絡。
 
 本次對象是目前接著的 **Heltec V4 Station + T096 Client，group B 923.8 MHz**。
 版本 `0.6-dev`／wire v5；A 組923.2 MHz保留。兩塊 LilyGO 未連接，因此只做相容 build，未改燒實體角色。
@@ -57,7 +57,7 @@ Station身分以`node_id`區分（V4 `ED2C`／60716，LilyGO `584C`／22604）�
 `bound_client_id`為綁定Client（F035／61493），不代表當時收到Client資料。
 雙站皆採B923.8 MHz，同一Client每次開機只有第一個有效命令的Station能控制，另一台可接收上行。
 兩台各自連上有網際網路的Wi-Fi／手機熱點才能上傳；Flash沒有自動補傳雲端。
-驗證細節見[10/4筆記](lilygo-t096-2026-10-04.md)。
+驗證細節見[10/4筆記](records-index.md#lilygo-t096-2026-10-04)。
 
 ## 本輪修正與已知限制
 

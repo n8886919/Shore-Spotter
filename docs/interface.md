@@ -3,10 +3,10 @@
 ## 1.0 現行 BLE Client 控制與換頻
 
 現行原始碼為 1.0，BLE 契約沿用 0.7.0-dev。2026-10-28 的 1.0 雙端部署、後續 Client UI=6 與驗證界線
-見 [維護紀錄](t096-maintenance-2026-10-28.md) 最新節；0.7.0-dev 的舊部署證據保留原版本。
+見 [維護紀錄](records-index.md#t096-maintenance-2026-10-28) 最新節；0.7.0-dev 的舊部署證據保留原版本。
 
 本次新增／變更的 `/api/client/control`、`/api/client/radio`、BLE 封包、開機認領與 App 契約，
-見本文現行 Client API 小節與 [BLE 版本紀錄](ble-control-2026-10-27.md)。Ready 改走 BLE，沒有 30 秒 LoRa 輪詢；
+見本文現行 Client API 小節與 [BLE 版本紀錄](records-index.md#ble-control-2026-10-27)。Ready 改走 BLE，沒有 30 秒 LoRa 輪詢；
 `supported`、`can_control`、`state_source` 分開，BLE 回報不算 LoRa RF 活動。
 原有 LoRa wire v5、定位／Servo 契約保留。舊 Ready 輪詢紀錄另行標示，不用於現行 API 判斷。
 
@@ -294,7 +294,7 @@ timeout（65 秒）。probe 支援 uint32 wrap，重複／倒退 counter 不計�
 完整空中丟包證據。
 
 **歷史（2026-10-10，BLE Ready 改版前）：** Ready 曾以 STATE TX_DONE 後 30 秒為下一輪基準，純電池 Start
-confirmed 曾量到 30.776 秒。這不是現行 BLE Ready 的喚醒或連線期限；舊時序只供回溯，見 [RTC待機](t096-rtc-standby-2026-10-09.md)。
+confirmed 曾量到 30.776 秒。這不是現行 BLE Ready 的喚醒或連線期限；舊時序只供回溯，見 [RTC待機](records-index.md#t096-rtc-standby-2026-10-09)。
 
 ## 單一 Client 綁定
 
@@ -1354,4 +1354,4 @@ Station只對尚未送任何HTTP bytes的已accept連線套用250 ms期限，避
 接收年齡不是完整樣本年齡；發生新量測失敗後，下一個 TEL 立即傳 INT8_MIN。
 Ready 不增加 TEL；取樣只搭既有喚醒，低電保護的取樣間隔可能更長。原始四分之一攝氏度值及 Client
 開機後最高值可用 USB `DIAG STATUS` 讀取，欄位 `mcu_qc`／`max_qc` 除以 4；先判 `mcu_valid`。
-USB 異常 NMEA 契約見 [健康診斷](t096-health-diagnostics-2026-10-22.md)。
+USB 異常 NMEA 契約見 [健康診斷](records-index.md#t096-health-diagnostics-2026-10-22)。

@@ -1,0 +1,252 @@
+{
+  "version": 1,
+  "checkpoint_tag": "records/2026-11-14",
+  "records": [
+    {
+      "id": "android-app-2026-11-13",
+      "date": "2026-11-13",
+      "title": "Android 相機／控制／定位整合（2026-11-13）",
+      "path": "docs/android-app-2026-11-13.md",
+      "sha256": "362406923ca402f5429911dcf8395cabc205ea89dfa00cd41a1f0734c5379317",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "ble-control-2026-10-27",
+      "date": "2026-10-27",
+      "title": "BLE 待機、開機認領與手動選頻（2026-10-27）",
+      "path": "docs/ble-control-2026-10-27.md",
+      "sha256": "058059980216e47f1a6518b845395bb11de4dec37a8ba87b166219d7253d42ee",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "ble-reconnect-2026-10-28",
+      "date": "2026-10-28",
+      "title": "2026-10-28 BLE 重連查證與修補（Station 已部署，Client 未部署）",
+      "path": "docs/ble-reconnect-2026-10-28.md",
+      "sha256": "7b513d2b80e5f9df08a5f3761909ae2aec81350de642b6e241556bab304fa0d6",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "field-experiment-2026-11-14",
+      "date": "2026-11-14",
+      "title": "11/13 外測與 GPS-only 修正實驗紀錄",
+      "path": "docs/field-experiment-2026-11-14.md",
+      "sha256": "79c4b44b121d5689ce31b80e5cb2bce33ecea0fd8295a0cec5116de862c2a04f",
+      "assets": [
+        {
+          "path": "docs/records-assets/2026-11-14/first-tracking-gps.png",
+          "sha256": "b15425b076c91879290748bbe9d01b53a83931c612c54e8081fecc491d28c5a8"
+        },
+        {
+          "path": "docs/records-assets/2026-11-14/full-surfer-track.png",
+          "sha256": "3e798faa8dd92a1304248775eca8d9e445549d15b5ebb67f95780148de1dd3e5"
+        },
+        {
+          "path": "docs/records-assets/2026-11-14/connection-timeline.png",
+          "sha256": "57d19415bd7239a21bc6c9a7d5605d526ea7a9013a3b5457624db2e58e34c289"
+        }
+      ],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "health-check-2026-09-08",
+      "date": "2026-09-08",
+      "title": "專案健檢：2026-09-08（更新至 2026-09-09）",
+      "path": "docs/health-check-2026-09-08.md",
+      "sha256": "f2c2e22640f102ce869907a944b28988acd910f316b2c0438dac84f83031a0fb",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "health-check-2026-10-16",
+      "date": "2026-10-16",
+      "title": "專案深度健檢（2026-10-16）",
+      "path": "docs/health-check-2026-10-16.md",
+      "sha256": "6c706c10a261c0c6a7b8bdb0baff5245ca5611b137fc79fc5afc148298a1192b",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "indoor-acceptance-handoff-2026-10-28",
+      "date": "2026-10-28",
+      "title": "2026-10-28 室內驗收與接續任務",
+      "path": "docs/indoor-acceptance-handoff-2026-10-28.md",
+      "sha256": "cda52e5137b05d1502e9f9e3ad509d44c036f99e2c838d99d91e036c64ef7df3",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "info-page-2026-10-27",
+      "date": "2026-10-27",
+      "title": "2026-10-27 資訊頁精簡與狀態顯示驗證",
+      "path": "docs/info-page-2026-10-27.md",
+      "sha256": "085ca647f8eaf43e0cd9d23e2ddc939a8411055b7b408134054930f533733986",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "lilygo-station-2026-10-06",
+      "date": "2026-10-06",
+      "title": "LilyGO E91C 改為 Station，配對 T096 F035",
+      "path": "docs/lilygo-station-2026-10-06.md",
+      "sha256": "91bfa3522fb46da78659141e57f151c2d6fe03851b874c9efae839e085f3a085",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "lilygo-t096-2026-10-04",
+      "date": "2026-10-04",
+      "title": "LilyGO Station 接收 T096（2026-10-04）",
+      "path": "docs/lilygo-t096-2026-10-04.md",
+      "sha256": "fcde4101cf7e5692fbba6d46504e07594404ce89f9a2c770b5ed20f4f223c4c7",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "link-test-2026-09-13",
+      "date": "2026-09-13",
+      "title": "LoRa v4 實機通訊測試 — 2026-09-13",
+      "path": "docs/link-test-2026-09-13.md",
+      "sha256": "a8dc16ebe343505b5c189aba5731ded7e077cca3c16f1b2de7f5fe04a7d7961e",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "link-test-2026-10-02",
+      "date": "2026-10-02",
+      "title": "2026-10-02 Heltec 桌上驗證",
+      "path": "docs/link-test-2026-10-02.md",
+      "sha256": "2548aff7690dde07d853e3328fb7325a985713fafeca7cf2852e80d268721906",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "packet-proposal-review-2026-09-13",
+      "date": "2026-09-13",
+      "title": "封包精簡與 2 Hz 提案審核",
+      "path": "docs/packet-proposal-review-2026-09-13.md",
+      "sha256": "a36450e50c9d8c494ef93909f27dbfe907af87d0148151437c2bcb690e814740",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "servo-controller-youmi-2026-10-10",
+      "date": "2026-10-10",
+      "title": "Youmi 35 kg＋雙路串口 Servo 控制板（2026-10-10）",
+      "path": "docs/servo-controller-youmi-2026-10-10.md",
+      "sha256": "83944d3e3b157a8fb242e538b1f008d6bc0e5db4fbeb26b6d5682d3e3fe5a0a9",
+      "assets": [
+        {
+          "path": "docs/assets/youmi-controller/board.png",
+          "sha256": "e627bc4aedd7c9fb394577ca80a810c47f8a0f12ff68172adea52091d646e6ff"
+        },
+        {
+          "path": "docs/assets/youmi-controller/specifications.png",
+          "sha256": "fbefff2f07279c1179e8d0c26195355fe94650ea93204485544481794bc77dc3"
+        },
+        {
+          "path": "docs/assets/youmi-controller/protocol.png",
+          "sha256": "33ad23b330265125af41fa6a4a208e582251eb43847fdc3376a4d14022db7d8f"
+        },
+        {
+          "path": "docs/assets/youmi-controller/wiring.png",
+          "sha256": "a3ee405edbaf0be8e9cc0d705008de64dca4b331aaa4057b673bfed7f2f371bb"
+        }
+      ],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "servo-ui-deployment-2026-10-11",
+      "date": "2026-10-11",
+      "title": "2026-10-11 M0 串口／正式資訊頁部署驗證",
+      "path": "docs/servo-ui-deployment-2026-10-11.md",
+      "sha256": "2d01a34a7e6442b1f59b53ffef590c56f4cef81a32ab9029f5354318787e704c",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "sf9-field-pair-2026-10-07",
+      "date": "2026-10-07",
+      "title": "2026-10-07 T096／LilyGO Station SF9 更新",
+      "path": "docs/sf9-field-pair-2026-10-07.md",
+      "sha256": "5d5b47db75f40d2fbbdabd2cc32ca12abf2da32086b0fe429f8be2e3eea645db",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "t096-controls-2026-10-05",
+      "date": "2026-10-05",
+      "title": "T096 按鍵、螢幕、電量與 Station RF 顯示（2026-10-05）",
+      "path": "docs/t096-controls-2026-10-05.md",
+      "sha256": "ef339ef2ef1ccf614fd5154e7b1eff20d052a218d3518bc6d539cd141420f169",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "t096-field-validation-2026-10-10",
+      "date": "2026-10-10",
+      "title": "T096 帶殼／內建 GNSS 天線外測（2026-10-10）",
+      "path": "docs/t096-field-validation-2026-10-10.md",
+      "sha256": "a63fcddcb3859ed5748e7334ea32668d04903d4c7570c62f3523b87f4924a092",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "t096-health-diagnostics-2026-10-22",
+      "date": "2026-10-22",
+      "title": "T096 MCU 溫度與異常 NMEA 證據（2026-10-22）",
+      "path": "docs/t096-health-diagnostics-2026-10-22.md",
+      "sha256": "cd89323f949f61a3a7c029dead7fe7e33d872fa8ea74473288daccbbb367707e",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "t096-maintenance-2026-10-28",
+      "date": "2026-10-28",
+      "title": "T096 開蓋維護按鍵與顯示（2026-10-28）",
+      "path": "docs/t096-maintenance-2026-10-28.md",
+      "sha256": "f6ac9d23d928f1b70637dc4962f2da233f8c853269fe2b6aaaca4814d61995e7",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "t096-power-validation-2026-10-08",
+      "date": "2026-10-08",
+      "title": "T096 無線充電與收納喚醒驗證（2026-10-08）",
+      "path": "docs/t096-power-validation-2026-10-08.md",
+      "sha256": "fd4d79d824a2c917979c35738cceaf3611808af0958f95b43f362deb198fa182",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "t096-rtc-standby-2026-10-09",
+      "date": "2026-10-09",
+      "title": "T096 保留狀態的 RTC 待機",
+      "path": "docs/t096-rtc-standby-2026-10-09.md",
+      "sha256": "d34bcb97761eca59cc98381f90bd903d901fc622737ee01e561843a7db81ab80",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "tracking-update-2026-09-19",
+      "date": "2026-09-19",
+      "title": "GPS／LoRa／追蹤更新：2026-09-19",
+      "path": "docs/tracking-update-2026-09-19.md",
+      "sha256": "dbc72112d582d33477216a1f4d34f00e954317ce70e5d3b066717d9f380ff894",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    },
+    {
+      "id": "web-recovery-2026-11-13",
+      "date": "2026-11-13",
+      "title": "Station Web 逾時與前景恢復修復（2026-11-13，已部署 584C）",
+      "path": "docs/web-recovery-2026-11-13.md",
+      "sha256": "219651796fe75bc1c109eb2c4d1b4b8f4be8ea192d6d3dad4df3d3fa13a8b1f3",
+      "assets": [],
+      "commit": "bcce441291c4c9ee6f2b9fe2b7817b1976702bf6"
+    }
+  ]
+}

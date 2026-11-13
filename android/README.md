@@ -11,10 +11,11 @@ Pixel 10 的橫向滿版相機、原生追蹤控制與手機定位 App。App 版
 5. 右下半透明畫質按鈕調解析度／FPS；錄影中鎖定畫質設定。加粗的倍率滑桿／點按對焦仍可操作，移除 1×／2×／5× 快捷鍵。
 
 右下畫質右側的資源區以兩行顯示：上行接電時為**綠色閃電 icon＋N%**，拔電時為「電量 N%」，接電且滿電也保留閃電與百分比；下行為錄影磁碟的**剩餘 XX.X GB**。提醒直接疊在影像，點按可看處理方法。
-最新閃電 icon／百分比改動尚未部署到手機；本輪手機收起後不再操作 ADB／Mobile MCP 或安裝，待下次接續部署。
+目前 source 包含閃電 icon／百分比與 GPS-only；本次 GPS-only APK 尚未安裝，現有手機 APK 未與目前 source 位元組比對，歷史真機驗收不可直接套用。
 沒有地圖、雷達、重複的面板標頭、常駐重整、SD 資訊或診斷數值；原 Station 網頁保留作 debug。
 Surfer 使用 Heltec T096，App 不呈現不存在的 SD 卡。
 狀態採不透明背景：就緒綠 `#7acd9c`、等待沙色、未確認／斷線／錯誤粉紅 `#e99a94`、停用灰色，保留文字與模式勾選。定位尚未取得第一筆時顯示沙色等待，有位置但尚未確認時為粉紅。
+完整底板／文字色值以 `FieldStyle.java` 為準；既有實心底板對比為 NEUTRAL 11.24:1、GOOD 6.71:1、WARNING 8.40:1、DANGER 5.24:1、DISABLED 5.42:1。半透明工具不能套用此固定值，日照辨識仍需外測。
 上方只有固定寬 112dp 的定位與 128dp 的 Station 入口，底色視覺高度一致為 32dp、觸控區 48dp，沒有整條大背景或儲存 chip；文字變動不推動其他元件。橫向間距 8dp，面板內按鈕垂直間距 12dp。
 一般按鈕底板維持 6dp 小圓角長方形。錄影鍵為半透明圓形底板，中心為紅圓／停止方塊，沒有白色外框。
 錄影／暫停／倍率／右下畫質／資源區均高 48dp、距底部 26dp 對齊，使用半透明底板；倍率與畫質有白色細框。畫質寬 128dp、距右 172dp；右側兩行資源區寬 144dp、距右 20dp，13sp 文字共用同一個半透明背景，沒有白框。
@@ -47,7 +48,22 @@ python3 tools/check_16kb.py app/build/outputs/apk/debug/app-debug.apk
 產物 `app/build/outputs/apk/debug/app-debug.apk`；獨立套件 `tw.shorespotter.app`，不覆蓋舊 My Application。
 CameraX 1.6.2。FPS 是鏡頭目標範圍，實際影片仍需驗證；不把手機官方相機功能當作第三方 App 保證。
 動作沿用 Station API 的開機識別／世代／序號／2 秒有效期；失聯或切回前景後不重送舊操作。
-詳細實作與驗收邊界見 [2026-11-13 紀錄](../docs/android-app-2026-11-13.md)。
+目前部署／未驗收界線見 [交接入口](../docs/assistant-handoff.md) 與 [後續規劃](../docs/next-session-plan.md)。
+過往 UI／影片／API 驗收見 [歷史 App 紀錄索引](../docs/records-index.md#android-app-2026-11-13)。
+
+## 定位、控制與驗證契約
+
+GPS-only 在收樣與送出前拒絕 network／fused／passive 或缺少來源；GPS provider 停用時仍保留 listener，重新啟用可恢復，停用時清除 App 最新位置。
+Android 回報的精度半徑不是實測誤差；GPS 信號不足時等待衛星定位，不自動改來源。
+依 monotonic 時鐘拒絕重複／倒退／未滿條件的新樣本，超過 10 秒不送；位置 POST 必須回覆相同 source／valid／座標／timestamp 才確認。
+App 背景化會停止定位、撤銷舊世代並結束保存錄影；Station 仍保留最後手機 snapshot 至重開機。
+
+HTTP 由單一 executor 序列化，連線／讀取各有 2 秒期限，回應上限 64 KiB。控制只由手勢產生，捕捉 2 秒意圖期限、boot／epoch；執行時 GET 新上下文，核對同世代後送 seq+1／stamp。
+失聯、重啟或換世代撤銷舊意圖，POST 不重送；Surfer HTTP 202 僅受理，繼續核對 Station boot＋operation ID 的 confirmed／error／timeout。
+UART 或命令角度沒有實體回授；只看 API 成功不算舵機驗收。
+
+11/14 GPS-only：JUnit 三組共 5 案例、assembleDebug、4 個 64 位元 JNI 的 16 KB ELF／APK 對齊及 zipalign 通過；lint 0 errors／26 warnings。
+APK SHA-256 `7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`；尚未安裝或外測，不需重燒 Station／Client。
 
 ## Agent 操作
 

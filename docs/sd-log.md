@@ -1,4 +1,4 @@
-2026-10-27（0.7.0-dev，2026-10-28 已部署至 584C／FB27）：Station session header 使用 runtime 頻率／SF 快照，`frequency_scope=session_open_snapshot`；同檔切頻依 `[RF]` 事件判讀，不能把 header 視為全檔固定頻率。見 [BLE 版本紀錄](ble-control-2026-10-27.md)。
+2026-10-27（0.7.0-dev，2026-10-28 已部署至 584C／FB27）：Station session header 使用 runtime 頻率／SF 快照，`frequency_scope=session_open_snapshot`；同檔切頻依 `[RF]` 事件判讀，不能把 header 視為全檔固定頻率。見 [BLE 版本紀錄](records-index.md#ble-control-2026-10-27)。
 
 # Station／Client SD 循環記錄
 

@@ -39,4 +39,4 @@ LilyGO GPIO43 TX → 控制板 RX；GND 共地；Servo 固定接 M0，控制板�
 開機先送 `#00P1500!`；由 `/api/track` 的 `servo` 欄位核對 M0／9600／1500 μs 與寫入錯誤，
 資訊頁已移除控制板卡；API 欄位名稱見 [介面契約](interface.md)。
 再目視 Servo 是否到中位。先以中位附近小幅度檢查方向，再驗證端點；不能由 UART 計數判定已動作。
-硬體圖片、脈寬模型與限制見 [控制板契約](servo-controller-youmi-2026-10-10.md)。
+硬體圖片、脈寬模型與限制見 [控制板契約](records-index.md#servo-controller-youmi-2026-10-10)。

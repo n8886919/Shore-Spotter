@@ -3,9 +3,10 @@
 目前原始碼為 **1.0（診斷專用建置 1.0-debug），LoRa wire v5、BLE wire v1**；版本唯一來源為
 [firmware_version.h](include/firmware_version.h)，變更見 [CHANGELOG](CHANGELOG.md)。
 其他工程師先讀 [交接入口](docs/assistant-handoff.md) 與 [功能入口](docs/function-entrypoints.md)。
-截至 2026-10-28，最新改動仍含未提交與未追蹤檔；只取 HEAD 會漏掉 BLE、維護介面與相關文件。
+2026-11-14 checkpoint 已保存 BLE／維護介面／Web 恢復、Android GPS-only。外殼另於獨立 CAD repository 提交，見 [CAD 索引](cad/README.md)。
+目前待辦見 [下一 session 規劃](docs/next-session-plan.md)，階段紀錄依 [索引](docs/records-index.md) 從 Git 查回。
 
-## 現行流程（2026-10-28）
+## 現行流程（2026-11-14）
 
 - 使用中的 Client 為 Heltec T096；LilyGO T-Beam Supreme 作 Station。舊 T-Beam Client 與診斷 profile
   仍保留於原始碼，不能把它們的 PMU／SD／按鍵說明套在 T096。
@@ -13,16 +14,16 @@
   Station 自動搜尋已指定 Client，第一個有效 BLE Claim 取得本次開機 owner。
   Stop、斷線、Station 重開不解除 owner；換 Station 前先停用舊 Station 搜尋，再重啟 Client。
 - Start 開 GPS／LoRa；Test 只開 LoRa；Stop 回 Ready。Ready **沒有定期 LoRa STATE 或接收窗口**。
-  HTTP 202 只是受理；Start 要收到匹配 LoRa STATE 才確認。Web／未來 App 都經 Wi-Fi HTTP 控制 Station。
+  HTTP 202 只是受理；Start 要收到匹配 LoRa STATE 才確認。Web／Android App 都經 Wi-Fi HTTP 控制 Station。
 - 候選 A 923.2 MHz、B 923.8 MHz **皆 SF9／BW125／CR4/5**；Ready 且 BLE 已認領時可手動 CAD 掃描及選擇。
   選擇先存 RAM，Start 的匹配 LoRa STATE 驗證後才保存 Station 頻道偏好。
   舊 manifest 的 A/SF10 與現行 runtime 候選是不同層，見 [裝置設定](docs/device-config.md)。
 - USER 短按亮屏 60 秒／切換連線與診斷兩頁；按住 1 秒出現 ACT／SLP 倒數，未滿 5 秒放開取消，
   滿 5 秒放開切換模式，未認領也可 ACT；保留 owner／BLE／boot，重啟改按 RST。
-  原始碼 UI=8 FB27 已部署，首頁 CLIENT ID、sleep／active、owner、BLE／GPS／RF 與電壓＋UP；診斷六行保留 SAT／AGE／HDOP。
-  操作與限制見 [維護介面](docs/t096-maintenance-2026-10-28.md)。
+  原始碼 UI=8；歷次部署見紀錄索引，當前實機需重新辨識。首頁 CLIENT ID、sleep／active、owner、BLE／GPS／RF 與電壓＋UP；診斷六行保留 SAT／AGE／HDOP。
+  操作與限制見 [維護介面](docs/records-index.md#t096-maintenance-2026-10-28)。
 
-完整控制、混版限制及 API 見 [BLE 流程](docs/ble-control-2026-10-27.md)、
+完整控制、混版限制及 API 見 [BLE 流程](docs/records-index.md#ble-control-2026-10-27)、
 [綁定契約](docs/client-binding-api.md)、[OpenAPI](docs/openapi-client-control.json)。
 
 ## 網頁與 Servo
@@ -46,24 +47,25 @@ Youmi 35 kg＋串口控制板固定 M0，LilyGO TX GPIO43、9600 8N1、RX 不配
 雙端新 boot、Ready／BLE 認領與 SD recording 已確認；FB27 隨後已更新 UI=6，診斷版本行為 `VERSION 1.0`。
 詳見該文件的雙端部署與版本標籤節。
 此前 0.7.0-dev 的 B 頻道 5 個 test probes 無缺號及 Stop 回 Ready 是前版證據，1.0 部署未重做 RF Test／GPS。
-產物 hash、boot、主機回歸／build 與實機結果分列於 [BLE 部署紀錄](docs/ble-control-2026-10-27.md)
-及 [維護紀錄](docs/t096-maintenance-2026-10-28.md)。這些是既有部署證據，文件同步不等於重新驗收。
+產物 hash、boot、主機回歸／build 與實機結果分列於 [BLE 部署紀錄](docs/records-index.md#ble-control-2026-10-27)
+及 [維護紀錄](docs/records-index.md#t096-maintenance-2026-10-28)。這些是既有部署證據，文件同步不等於重新驗收。
 多 Station 競爭、跨頻保存、長時間重連、待機電流、維護按鍵／TFT 目視及新版戶外追蹤仍有待驗項目。
 
 DATA 18 bytes、無 ACK；最新有效 epoch 才送，失效通知一次，E7 解析度不是實際精度。
 T096 UC6580 的 2 Hz 配置／epoch 證據不代表每秒兩筆有效位置或 RF 到達；歷史外測見
-[10/10 GNSS 紀錄](docs/t096-field-validation-2026-10-10.md)。
+[10/10 GNSS 紀錄](docs/records-index.md#t096-field-validation-2026-10-10)。
 T096 TEL 的 `humidityPct=254` 表示 MCU 溫度／無濕度，不能套用環境告警；
-唯讀 USB NMEA 證據與取樣界線見 [健康診斷](docs/t096-health-diagnostics-2026-10-22.md)。
+唯讀 USB NMEA 證據與取樣界線見 [健康診斷](docs/records-index.md#t096-health-diagnostics-2026-10-22)。
 
 LilyGO Station 自動 SD 記錄；header 是開檔時的 runtime RF 快照，同檔切頻看 `[RF]` 事件。
 T096 正常版無 SD；V4 使用有界 Flash。USB 匯出與 CRC 驗證見 [SD 記錄](docs/sd-log.md)。
-Axiom API 保留、預設關閉，需要自行設定 ingest Token；目前部署採 SD，忙碌或離線可能遺失上傳資料。
+Axiom API 保留、設定預設關閉；但 11/13 晚調查曾讀回 NVS enabled／low_memory，不能假定實機停用。
+Station 採 SD 留原始證據，Axiom 是否移除／回收資源列入後續精簡，尚未更改；忙碌或離線可能遺失上傳資料。
 網頁 GPX／Strava／除錯錄製已移除，診斷 HTTP API 仍可使用，見 [現場除錯](docs/debug-export.md)。
 
 全套主機驗證入口為 `python3 tools/verify_project.py --prepare`，不會燒錄或操作硬體。
-[10/16 健檢](docs/health-check-2026-10-16.md)、[10/11 Servo 部署](docs/servo-ui-deployment-2026-10-11.md)
-與 [10/9 RTC 待機](docs/t096-rtc-standby-2026-10-09.md) 保留當時證據；舊 Ready 每 30 秒 LoRa 流程已由 BLE 取代。
+[10/16 健檢](docs/records-index.md#health-check-2026-10-16)、[10/11 Servo 部署](docs/records-index.md#servo-ui-deployment-2026-10-11)
+與 [10/9 RTC 待機](docs/records-index.md#t096-rtc-standby-2026-10-09) 保留當時證據；舊 Ready 每 30 秒 LoRa 流程已由 BLE 取代。
 
 ![alt text](image.png)
  > **衝浪攝影不求人**
@@ -120,7 +122,7 @@ native 測試涵蓋 GPS／UART 模式隔離、SET 解析、watchdog、非阻塞 
 既有數學／提醒，以及 v5 codec、同 epoch GNSS 與無線排程；Node 測試執行實際頁面，
 模擬時鐘與 HTTP 回覆；Python 工具擷取實際 C++ 後端驗證控制、封包與除錯 JSON。
 現況與待處理項目見 [交接入口](docs/assistant-handoff.md) 和 [版本紀錄](CHANGELOG.md)。
-[9/8 健檢](docs/health-check-2026-09-08.md) 是歷史驗證，不代表現行部署。
+[9/8 健檢](docs/records-index.md#health-check-2026-09-08) 是歷史驗證，不代表現行部署。
 
 ## Station 透過 Wi-Fi 更新（PlatformIO espota）
 

@@ -3,8 +3,8 @@
 本文件描述 **1.0／`api_version=2` 現行原始碼契約（2026-10-28）**；BLE 行為沿用 0.7.0-dev。
 iOS／Android App 透過 Wi-Fi HTTP 存取 Station，由 Station 以 BLE／LoRa 與 Client 溝通。
 Ready 的 GPS 關閉、LoRa 休眠，沒有每 30 秒 LoRa STATE 輪詢；舊 0.6.1 的等待方式不適用。
-兩端須使用支援 BLE Ready 的韌體；0.7.0-dev 的既有部署證據見 [BLE 控制與換頻](ble-control-2026-10-27.md)，
-1.0 雙端部署、後續 Client UI=6 與驗收界線見 [維護紀錄](t096-maintenance-2026-10-28.md) 最新節。
+兩端須使用支援 BLE Ready 的韌體；0.7.0-dev 的既有部署證據見 [BLE 控制與換頻](records-index.md#ble-control-2026-10-27)，
+1.0 雙端部署、後續 Client UI=6 與驗收界線見 [維護紀錄](records-index.md#t096-maintenance-2026-10-28) 最新節。
 
 本文件涵蓋單一 Client 綁定及狀態判斷。完整欄位見 [interface.md](interface.md)，
 可匯入的規格見 [綁定 OpenAPI](openapi-client-binding.json)；控制／選頻另見 [控制 OpenAPI](openapi-client-control.json)。
@@ -97,4 +97,4 @@ OpenAPI 是上述端點的子集，非完整 Station API，也不是韌體上新
 測試 `python3 tools/test_client_binding_api.py` 會編譯實際讀寫 handler／NVS 流程，
 驗證回應、格式錯誤、替換／解除、保存失敗與重新載入；不會呼叫實機或更動綁定。
 2026-10-27 改綁與 Ready STATE 為當時版本的歷史實機紀錄；0.7.0-dev 的 2026-10-28 部署與驗收界線
-見 [BLE 版本紀錄](ble-control-2026-10-27.md)。本次文件核對不新增實機證據；尚未實作或驗收 iOS／Android App。
+見 [BLE 版本紀錄](records-index.md#ble-control-2026-10-27)。本次文件核對不新增實機證據；尚未實作或驗收 iOS／Android App。

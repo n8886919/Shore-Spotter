@@ -41,11 +41,11 @@ UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；地理方位另依校正�
 不自動跳頻。各設定來源與界線見 [device-config.md](device-config.md)。
 
 T096 本次開機第一個有效 BLE Claim 固定 owner；換 Station 必須先停舊 Station 搜尋，再重啟 Client。
-USER 短按亮屏 60 秒／切換兩頁診斷，長按滿 5 秒後放開切換 ACT／SLP（未認領也可 ACT），RST 硬體重啟；UI=8 FB27 已部署，見 [維護操作](t096-maintenance-2026-10-28.md)。
+USER 短按亮屏 60 秒／切換兩頁診斷，長按滿 5 秒後放開切換 ACT／SLP（未認領也可 ACT），RST 硬體重啟；UI=8 FB27 已部署，見 [維護操作](records-index.md#t096-maintenance-2026-10-28)。
 目前 Ready 為保留 RAM 的 BLE 待機，GPS 關閉、LoRa 休眠；下方 2026-10-09 RTC／30 秒交換為歷史流程。
 
-既有主機、部署與實機證據分別見 [資訊頁驗證](info-page-2026-10-27.md)、
-[584C／FB27 BLE 與 LoRa 部署紀錄](ble-control-2026-10-27.md)及 [T096 維護部署紀錄](t096-maintenance-2026-10-28.md)。
+既有主機、部署與實機證據分別見 [資訊頁驗證](records-index.md#info-page-2026-10-27)、
+[584C／FB27 BLE 與 LoRa 部署紀錄](records-index.md#ble-control-2026-10-27)及 [T096 維護部署紀錄](records-index.md#t096-maintenance-2026-10-28)。
 本次文件同步沒有新增 build 或硬體驗收；實體置中校正、M0 接線／UART 接受、轉向、端點、帶載與戶外 GPS 精度不能由原始碼或主機測試推定通過。
 
 ## 以下為板型規格與歷史紀錄（控制與 UI 差異以上節為準）
@@ -55,7 +55,7 @@ USER 短按亮屏 60 秒／切換兩頁診斷，長按滿 5 秒後放開切換 A
 > **2026-10-10 當時紀錄，後續決策以上節為準**：使用者指定 Youmi 35 kg、5–8.4 V、359°＋雙路串口控制板，
 > LilyGO 透過 TX/RX 控制，控制板輸出 PWM。控制板供電 8.4 V、共地、手動燈亮，
 > 旋鈕兩端接近一整圈為使用者確認；M0/M1 與 GPIO 未核定。9600 baud／指令／接線及首輪測試見
-> [Youmi 控制板契約](servo-controller-youmi-2026-10-10.md)。本輪未改韌體／燒錄，
+> [Youmi 控制板契約](records-index.md#servo-controller-youmi-2026-10-10)。本輪未改韌體／燒錄，
 > 下方 GXServo、IO21 PWM、180°／333 Hz、回到90°為**舊軟體與歷史硬體**，不能當新組合接法。
 
 1. **腳位圖（Pins Map）** — T-Beam Supreme GPIO 分配
@@ -77,7 +77,7 @@ ALDO4 仍供 GPS；ALDO1 供 OLED／BME280，不因 OLED 睡眠而斷電。
 
 T-Beam Supreme Station 使用8 MB QSPI PSRAM，`tbeam-station`明確設定`qio_qspi`及`BOARD_HAS_PSRAM`；
 2026-10-04 的584C實機`GET /api/axiom`記錄中，`psram_total`為8,388,608 bytes，upload batch配置於PSRAM。
-當時未改 Client 環境；記憶體配置與驗證見[歷史筆記](lilygo-t096-2026-10-04.md)。
+當時未改 Client 環境；記憶體配置與驗證見[歷史筆記](records-index.md#lilygo-t096-2026-10-04)。
 
 ---
 
@@ -367,8 +367,8 @@ WOUT接太陽能接口、PCB BAT留空、電池接T096；WOUT充電與離座接�
 穩定3.5V回Ready。硬體保護切斷後的充電恢復、整機電流與續航尚待量測。
 USB VBUS只是USB供電訊號，不可用`charging:false`判solar沒有充電。
 
-歷史SystemOFF／USER修正與實機結果見[t096-power-validation-2026-10-08.md](t096-power-validation-2026-10-08.md)，
-歷史RTC待機驗證見[t096-rtc-standby-2026-10-09.md](t096-rtc-standby-2026-10-09.md)，現行流程見[BLE 控制](ble-control-2026-10-27.md)。
+歷史SystemOFF／USER修正與實機結果見[t096-power-validation-2026-10-08.md](records-index.md#t096-power-validation-2026-10-08)，
+歷史RTC待機驗證見[t096-rtc-standby-2026-10-09.md](records-index.md#t096-rtc-standby-2026-10-09)，現行流程見[BLE 控制](records-index.md#ble-control-2026-10-27)。
 
 ### T096 外接 GNSS 天線（2026-10-10 規劃）
 
@@ -378,7 +378,7 @@ USB VBUS只是USB供電訊號，不可用`charging:false`判solar沒有充電。
 GNSS和LoRa的IPEX 1.0接口不同，不可互換；UC6580使用L1＋L5，天線頻段、主動／被動與偏壓供電
 要依實際天線型號和電路核對，尚未選定。外接天線是否仍放殼內，取決於天線／殼材與擺位，不能保證效果。
 原廠建議TFT側朝天空、避免金屬遮蔽；需和電池／無線充電線圈的殼內位置一併驗證。
-本輪尚未移焊或換天線；[10/10外測](t096-field-validation-2026-10-10.md)支持測試這個方向，但不能單獨判內建天線故障。
+本輪尚未移焊或換天線；[10/10外測](records-index.md#t096-field-validation-2026-10-10)支持測試這個方向，但不能單獨判內建天線故障。
 
 
 ### T096 GNSS 上游供電（2026-10-02 桌上確認）

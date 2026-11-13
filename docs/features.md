@@ -6,7 +6,7 @@
 LoRa wire v5／BLE wire v1 與韌體版本分開。
 
 本文件整理現行功能；歷史主機／部署結果見 [CHANGELOG](../CHANGELOG.md)、
-[BLE 紀錄](ble-control-2026-10-27.md)、[維護紀錄](t096-maintenance-2026-10-28.md)。
+[BLE 紀錄](records-index.md#ble-control-2026-10-27)、[維護紀錄](records-index.md#t096-maintenance-2026-10-28)。
 0.7.0-dev／UI=2～4 的既有部署證據保留當時版本；1.0／UI=5 雙端部署與後續 Client UI=6 分列於維護紀錄，
 舊版 RF Test／外測不能自動升格為新版驗收。
 操作入口見 [function-entrypoints](function-entrypoints.md)，接手須讀 [assistant-handoff](assistant-handoff.md)。
@@ -39,14 +39,14 @@ Station 自動搜尋 NVS 已指定的 Client ID，第一個有效 BLE Claim 固�
 
 FreeRTOS tickless RTC 在服務空檔睡眠；BLE、USB、按鍵與各期限影響實際喚醒。
 Ready 不定期重試 RF 初始化，等 Start／Test 再啟動；活躍狀態故障可重試，保留原始錯誤，不自動換頻。
-舊 Ready 每 30 秒 LoRa／USER 長按 2 秒回 Ready 僅為 [RTC 歷史紀錄](t096-rtc-standby-2026-10-09.md)。
+舊 Ready 每 30 秒 LoRa／USER 長按 2 秒回 Ready 僅為 [RTC 歷史紀錄](records-index.md#t096-rtc-standby-2026-10-09)。
 
 Web／未來 App 經 Station Wi-Fi HTTP 控制，沒有手機直接控制 Client BLE 的產品流程。
 `/api/client/control` 為 `api_version=2`，`supported`、`state_source`、`can_control` 各自判讀；
 BLE 新鮮度依 Client uptime 推進，重讀相同 bytes 不延長存活。`ready_poll_ms=0`。
 HTTP 202 是 pending；以 Station boot／operation ID 追蹤最近操作，confirmed／error／timeout 分開，期限 65 秒。
 Start 要匹配 Client boot、owner、command 的實際 LoRa STATE；Test／Stop 可由有效 BLE 狀態確認。
-完整契約見 [BLE 控制](ble-control-2026-10-27.md) 與 [OpenAPI](openapi-client-control.json)。
+完整契約見 [BLE 控制](records-index.md#ble-control-2026-10-27) 與 [OpenAPI](openapi-client-control.json)。
 
 ## RF、封包與定位新鮮度
 
@@ -88,7 +88,7 @@ DATA 單向非阻塞發射，TX_DONE 只代表送完；SEQ 缺口不能單獨區
   ACT 沿用 runtime 頻道（開機 A），低電保護禁止 ACT；RF 忙碌等交易完成。開機已按住先放開；自動畫面約 5 秒。
 - 開機立即顯示 `CLIENT BOOTING`；USER 切換完成顯示 `ACT STARTED`／`ENTERED SLP` 約 2 秒，失敗顯示低電／RF 原因。
 - 共用 160×16 row buffer；首頁每列 16 px、診斷 13 px，6×8 字體、最多 26 字；診斷底部 2 px 清黑。
-  500 ms 更新，RF 忙碌讓位；背光期限獨立，SLPOUT 120 ms 非阻塞。操作細節見 [維護文件](t096-maintenance-2026-10-28.md)。
+  500 ms 更新，RF 忙碌讓位；背光期限獨立，SLPOUT 120 ms 非阻塞。操作細節見 [維護文件](records-index.md#t096-maintenance-2026-10-28)。
 - ADC 3.0 V reference、12 bit、390k/100k 分壓；RF idle 才取樣，開 divider 等 10 ms、丟首次並平均 4 次。
   0 或超出 2.5～4.5 V 為 unknown；Ready 健康時 30 秒、活躍／低電警告 1 秒、保護期間 60 秒取樣。
 - 三次有效 <3.2 V 且無 USB 進低電保護，停止 GPS／新 RF；三次 ≥3.5 V 才回 Ready，不自動開 GPS。
@@ -98,7 +98,7 @@ DATA 單向非阻塞發射，TX_DONE 只代表送完；SEQ 缺口不能單獨區
 - MCU 約每 30 秒機會式取樣，TEL `humidityPct=254` 表示晶片溫度／無濕度，環境欄位 null。
   接收 60 秒過期時目前值 unknown，接收最高值另保留；接收年齡不是樣本完整年齡，Ready 不送溫度 TEL。
 - GNSS 拒收原因與 4 筆有界 RAM 原始 NMEA bytes 可用唯讀 USB `DIAG STATUS`／`DIAG NMEA` 匯出，
-  含截斷／覆寫計數，不寫 Flash；重啟清除。見 [健康診斷](t096-health-diagnostics-2026-10-22.md)。
+  含截斷／覆寫計數，不寫 Flash；重啟清除。見 [健康診斷](records-index.md#t096-health-diagnostics-2026-10-22)。
 
 ## Station 接收、位置與 Servo
 
