@@ -21,6 +21,20 @@ BOARD_ROLES = {
     "heltec-t096": {"client"},
     "lilygo-tbeam": {"station", "client"},
 }
+# Explicit firmware targets; native tests are not a deployable device profile.
+# Keep this list small and review it when a PlatformIO environment is added.
+ENVIRONMENT_TARGETS = {
+    "heltec-v4-station": ("heltec-v4", "station"),
+    "heltec-v4-2-station": ("heltec-v4", "station"),
+    "heltec-v4-3-station": ("heltec-v4", "station"),
+    "tbeam-station": ("lilygo-tbeam", "station"),
+    "tbeam-station-ota": ("lilygo-tbeam", "station"),
+    "tbeam-station-diagnostic": ("lilygo-tbeam", "station"),
+    "tbeam-client": ("lilygo-tbeam", "client"),
+    "tbeam-client-diagnostic": ("lilygo-tbeam", "client"),
+    "tbeam-client-trip": ("lilygo-tbeam", "client"),
+    "t096-client": ("heltec-t096", "client"),
+}
 
 
 class ConfigError(ValueError):
@@ -67,6 +81,9 @@ def load_devices(path: Path, groups: dict[str, dict]) -> dict[str, dict]:
             raise ConfigError(f"{name}: board {board!r} 不支援 role {role!r}")
         if not isinstance(device["environment"], str) or not device["environment"]:
             raise ConfigError(f"{name}: environment 不可空白")
+        target = ENVIRONMENT_TARGETS.get(device["environment"])
+        if target != (board, role):
+            raise ConfigError(f"{name}: environment {device['environment']!r} 不支援 {board}/{role}；請核對板型與角色")
         if device["rf_group"] not in groups:
             raise ConfigError(f"{name}: rf_group 必須存在於 rf-groups.json")
         if not isinstance(device["usb_serial"], str) or not serial_key(device["usb_serial"]):

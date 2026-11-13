@@ -11,6 +11,11 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 部署設定防呆與換機說明**：manifest 的 check／plan／build loader 共用板型、角色與 environment 對照，
+  拒絕未知／native／錯誤板型或角色；保留現有十種 firmware profiles。換 Station 流程更正為 RST 重啟，
+  USER 長按 ACT／SLP 不清 owner。新增負例在修正前 15 個 subcases 失敗，修正後 11 組設定回歸通過，
+  本機四台 manifest 檢查通過；沒有 build、燒錄或硬體操作。
+
 - **2026-11-14 Session checkpoint 與紀錄整理**：保存目前 firmware／Android GPS-only，正式外殼改於使用者更正的 `~/freecad/Shore-Spotter-Case/` 獨立 Git 提交，
   以 `cad/reference.json` 對照 commit／檔案 hash，移除誤納入的 Pocket 診斷副本。
   新增實驗紀錄及下一 session 精簡規劃；已結束階段文件先提交，再移出工作目錄。

@@ -56,7 +56,8 @@ Station 會自動搜尋 NVS 已保存的目標 ID。回 Ready、BLE 斷線或 St
 同一 Station 可重連，其他 Station 即使收到 LoRa 上行也不能取得控制權。
 
 換 Station 時依序：先關閉舊 Station 或改掉其目標 ID，讓它停止搜尋此 Client；
-在新 Station 設定此 Client ID；T096 USER 長按滿 5 秒後放開重啟；確認 Client 新 boot 與新 owner。
+在新 Station 設定此 Client ID；按 T096 **RST** 重啟；確認 Client 新 boot 與新 owner。
+USER 長按滿 5 秒放開只切換 ACT／SLP，會保留 owner，不能用來轉移控制權。
 舊 Station 若仍搜尋，可能再次搶先認領。只改 manifest 或 Station 接收綁定不會轉移現有 owner。
 按鍵流程見 [T096 維護與換 Station](records-index.md#t096-maintenance-2026-10-28)。
 
@@ -72,7 +73,9 @@ python3 tools/test_device_config.py
 ```
 
 `list`、`check`、`plan` 都是純本機設定檢查：不 build、不 flash、不 reset USB。`plan` 列出 board、RF group、manifest 預期裝置 ID、配對 Client 與 `custom_rf_group`，供下一步由已確認的 build 流程使用。
-目前工具檢查 board／role 組合，但 `environment` 只檢查非空；仍須核對實際 PlatformIO environment 的板型與角色，不能把 `check` 成功當成完整相容性驗證。
+工具會交叉檢查 board／role／environment；未知 environment、native 測試環境及不相容組合均拒絕。
+`check`／`plan` 與 build loader 共用此檢查；新增 firmware environment 時須同步 `tools/device_config.py` 的對照與回歸。
+這只驗證建置設定，仍須核對實際 USB 身分、私人 Wi-Fi 設定與部署目標，不能把 `check` 成功當成實機驗收。
 
 ## 依設備選擇 build
 

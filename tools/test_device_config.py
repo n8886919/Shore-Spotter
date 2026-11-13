@@ -71,6 +71,54 @@ class DeviceConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(device_config.ConfigError, text):
             device_config.load_devices_from_test(devices["devices"], GROUPS)
 
+    def test_wrong_board_role_environment_is_rejected_before_plan_or_build(self):
+        for environment in ("tbeam-client", "tbeam-station", "t096-client", "native", "typo"):
+            with self.subTest(environment=environment), tempfile.TemporaryDirectory() as tmp:
+                fixture = copy.deepcopy(DEVICES)
+                fixture["devices"][0]["environment"] = environment
+                root = Path(tmp)
+                (root / "config").mkdir()
+                path = root / "config/devices.local.json"
+                path.write_text(json.dumps(fixture))
+                command = [sys.executable, str(ROOT / "tools/device_config.py"), "--devices", str(path)]
+                for action in (["check"], ["plan", "station-v4"]):
+                    result = subprocess.run(command + action, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn("environment", result.stderr)
+                    self.assertNotIn("pio run", result.stdout)
+                env = FakeEnv("B")
+                env.subst = lambda key: environment
+                with patch.object(load_rf_profile, "ROOT", root), patch.dict(os.environ, {"SHORE_DEVICE": "station-v4"}):
+                    with self.assertRaisesRegex(ValueError, "environment"):
+                        load_rf_profile.apply_profile(env)
+                self.assertEqual(env["CPPDEFINES"], [])
+
+    def test_supported_firmware_environments_keep_their_board_and_role(self):
+        import re
+        profiles = {
+            "heltec-v4-station": ("heltec-v4", "station"),
+            "heltec-v4-2-station": ("heltec-v4", "station"),
+            "heltec-v4-3-station": ("heltec-v4", "station"),
+            "tbeam-station": ("lilygo-tbeam", "station"),
+            "tbeam-station-ota": ("lilygo-tbeam", "station"),
+            "tbeam-station-diagnostic": ("lilygo-tbeam", "station"),
+            "tbeam-client": ("lilygo-tbeam", "client"),
+            "tbeam-client-diagnostic": ("lilygo-tbeam", "client"),
+            "tbeam-client-trip": ("lilygo-tbeam", "client"),
+            "t096-client": ("heltec-t096", "client"),
+        }
+        declared = set(re.findall(r"\[env:([^\]]+)\]", (ROOT / "platformio.ini").read_text() + (ROOT / "platformio-t096.ini").read_text()))
+        self.assertEqual(set(profiles), declared - {"native"})
+        for environment, (board, role) in profiles.items():
+            with self.subTest(environment=environment):
+                devices = copy.deepcopy(DEVICES["devices"])
+                device = next(d for d in devices if d["role"] == role)
+                device.update(board=board, environment=environment)
+                self._load_data(devices, GROUPS)
+                device["board"] = "lilygo-tbeam" if board != "lilygo-tbeam" else ("heltec-v4" if role == "station" else "heltec-t096")
+                with self.assertRaisesRegex(device_config.ConfigError, "environment"):
+                    self._load_data(devices, GROUPS)
+
     def test_invalid_pairing_and_identity_are_rejected(self):
         def load(data, groups=GROUPS):
             return device_config.load_devices_from_test(data, groups)
