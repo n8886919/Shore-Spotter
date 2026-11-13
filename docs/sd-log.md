@@ -94,7 +94,7 @@ FAT 空間檢查失敗／刪檔失敗／無可刪檔案都明確停止，不反�
 |---|---|
 | `session` | build、韌體／協定／RF 參數、boot ID、記錄政策 |
 | `lora_packet` | 每次接收的事件 ID、接收 IRQ 時間、解析／拒收結果、RF 錯誤碼、RSSI／SNR、原始 bytes（最多 255） |
-| `station_snapshot` | 每秒 GPS／Client／追蹤命令／電量／記憶體／各服務耗時等詳細快照；本地 schema 3 使用 station_gps／station_gnss／station_average |
+| `station_snapshot` | 每秒 GPS／Client／追蹤命令／電量／記憶體／各服務耗時等詳細快照；本地 schema 3 使用 station_gps／station_gnss／station_average，另含實際選用岸端 station_position |
 | `client_event` | Client GPS epoch、恢復／停錄原因、GNSS 診斷與 TX 開始／結果／raw bytes；僅合格 GPS 錄製期間及最後停錄事件 |
 | `state_change` | 相鄰快照間偵測到的連線、模式、GPS、PWM 等狀態變化；不是任意瞬間狀態的完整歷史 |
 | `text_log` | 既有 LogTee 文字（長行可拆成多筆），含有限的開機 log 重播 |
@@ -104,6 +104,12 @@ Station 改名不重寫卡上的歷史檔案。USB 工具逐 byte 匯出，因�
 仍可完整讀回；離線分析須接受兩種 kind，並將舊 `server_gps`／`server_gnss`／`station`
 分別對應新 `station_gps`／`station_gnss`／`station_average`。Axiom 上傳另保留 schema 2
 相容路徑以保護既有 dataset 欄位上限，詳見 [Axiom 記錄](axiom-log.md)。
+
+2026-11-14 的 `station_position` 是 schema 3 追加欄位：`source`（phone／gnss）、`valid`、
+`lat`／`lon`、`age_ms`、`updated_utc_ms`、`accuracy_m`。無效岸端座標為 null；GNSS 使用實際追蹤的平均座標，
+年齡仍是最新 epoch 到達年齡，UTC 與公尺精度無可靠值時為 null。手機 timestamp／accuracy 保留原始 metadata，
+年齡從 Station 接收計算，既有保留至重啟行為不變。`station_gps.fresh` 僅指板載 sample 自身的新鮮度。
+舊紀錄沒有這些選用來源欄位，不能從板載座標推定當時手機位置；本次不回填歷史。
 
 原始 CRC 壞包保留，但不送進位置／Servo 解析；壞包的 ID／seq 不可當成可信來源。
 未收到的 RF 封包沒有 bytes 可存。其他 radio 讀取失敗不假造 raw 或 RSSI／SNR。

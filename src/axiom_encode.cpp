@@ -174,6 +174,14 @@ size_t encodeSample(char *out, size_t capacity, const Sample &s, int64_t unixMs,
   j.number("duplicate_epochs", s.gnssCounters.duplicateEpochs);
   j.number("backward_epochs", s.gnssCounters.backwardEpochs);
   j.number("time_resyncs", s.gnssCounters.timeResyncs); j.end();
+  // Additive evidence for the actual shore input; preserve existing schema keys.
+  j.object("station_position"); j.string("source", s.positionPhone ? "phone" : "gnss");
+  j.boolean("valid", s.positionValid);
+  j.real("lat", s.positionValid ? s.positionLat : NAN, 7);
+  j.real("lon", s.positionValid ? s.positionLon : NAN, 7);
+  j.age("age_ms", s.positionAgeMs);
+  j.real("updated_utc_ms", s.positionUtcMs, 0);
+  j.real("accuracy_m", s.positionAccuracyM, 1); j.end();
   j.object(cloudLegacyKeys ? "station" : "station_average"); j.number("window_ms", 30000); j.number("samples", s.stationSamples);
   j.real("mean_lat", s.stationSamples ? s.stationLat : NAN, 7);
   j.real("mean_lon", s.stationSamples ? s.stationLon : NAN, 7);

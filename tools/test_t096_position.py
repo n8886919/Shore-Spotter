@@ -20,11 +20,13 @@ cpp=r'''
 #include "t096_control.h"
 #include "tracking_policy.h"
 #include "t096_gnss_config.h"
+#include "t096_maintenance.h"
 struct Collector {gnss_snapshot::Snapshot value{};bool have=true;bool sample(uint32_t,gnss_snapshot::Snapshot &s){s=value;return have;}}gnss;
 client_cadence::Scheduler cadence;
 t096_control::Controller control(77);
 enum class AirState {Idle,Sending,Receiving};AirState air=AirState::Idle;
 uint8_t out[MAX_PACKET_LEN];size_t outLength=0;bool outOpensReceiveWindow=false,outIsState=false,dataWaiting=false;
+t096_maintenance::Fault maintenanceFault;uint32_t txErrors=0;
 uint16_t thisClientId=5,dataSequence=0;uint32_t dataDeferred=0,nextTxStartMs=0,usbLogDropped=0;
 struct Console {bool connected=true;int available=128;std::string output;operator bool(){return connected;}int availableForWrite(){return available;}
 size_t write(const uint8_t*p,size_t n){assert(n<=size_t(available));output.append((char*)p,n);return n;}}Serial;
@@ -44,7 +46,18 @@ int main(){
  outLength=0;assert(!queueRealPosition(2900));
  s.epochMsOfDay=2000;s.arrivalAgeMs=0;s.haveGga=false;
  assert(!queueRealPosition(3000));assert(!queueRealPosition(3149));assert(queueRealPosition(3150));
- outLength=0;control.requestReady();s.epochMsOfDay=2500;assert(!queueRealPosition(4000));
+ // Out-of-wire-range velocity must preserve the fresh position and consume one epoch.
+ outLength=0;s.haveGga=true;s.epochMsOfDay=2500;s.speedMps=25.41;
+ const auto before=dataSequence;assert(queueRealPosition(4000));
+ assert(protocol::decodeData(out,outLength,h,p)&&p.fix&&!p.velocityValid&&p.speedDmS==protocol::kUnknown);
+ assert(h.seq==before&&dataSequence==uint16_t(before+1));
+ outLength=0;for(unsigned i=0;i<5;++i)assert(!queueRealPosition(4001+i));
+ assert(dataSequence==uint16_t(before+1));
+ // A local encoding fault is visible and cannot consume seq or retry this epoch.
+ const auto goodSeq=dataSequence;thisClientId=0;s.epochMsOfDay=3000;
+ assert(!queueRealPosition(4500)&&txErrors==1&&maintenanceFault.source);
+ assert(!queueRealPosition(4501)&&txErrors==1&&dataSequence==goodSeq);
+ thisClientId=5;control.requestReady();s.epochMsOfDay=3500;assert(!queueRealPosition(5000));
  Serial.available=2;usbLog("%s","abcd");assert(usbLogDropped==1&&Serial.output.empty());
  Serial.available=128;usbLog("%s","works");assert(Serial.output=="works");
  Serial.connected=false;usbLog("ignored");assert(Serial.output=="works");

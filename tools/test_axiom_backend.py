@@ -253,7 +253,7 @@ int main(){
  for(auto &e:s.events){e.rawLength=17;e.id=UINT32_MAX;memset(e.raw,0xff,17);}
  char payload[kBatchBytes];const size_t n=encodeSample(payload,sizeof(payload),s,1760000000123,7,91);
  assert(n>0&&n*5<kBatchBytes);std::cout<<payload;
- // Cloud retains exactly the schema 2 field paths; SD exports use schema 3.
+ // Cloud retains existing schema 2 field paths plus the shared additive position fields; SD uses schema 3.
  assert(encodeSample(payload,sizeof(payload),s,1760000000123,7,91,nullptr,nullptr,true));std::cout<<payload;
  char small[32];assert(encodeSample(small,sizeof(small),s,1760000000000,0,0)==0);
  s.events[0].rawLength=37;assert(encodeSample(payload,sizeof(payload),s,1760000000000,0,0)==0);
@@ -395,3 +395,70 @@ with tempfile.TemporaryDirectory(prefix='shore-axiom-test-') as tmp:
     for schema, fields in fields_by_schema.items():
         assert len(fields) < 256, (schema, len(fields))
     print(f'PASS strict JSON, millisecond UTC, nulls, escapes, cloud legacy keys and per-schema field budgets: {[(s, len(f)) for s, f in fields_by_schema.items()]}')
+
+
+# Exercise main.cpp's real source selection and snapshot assignments, not a
+# synthetic Sample that could conceal a phone/board freshness mix-up.
+from test_t096_gnss_uart import extract_function
+position_functions = '\n'.join(extract_function(source, sig) for sig in [
+    'static bool gpsFixFresh()', 'static double stationLatitude()', 'static double stationLongitude()'])
+position_capture = source[source.index('  gnssCollector.sample(now, s.gps);'):source.index('  s.gnssCounters =')]
+position_cpp = r"""
+#define ROLE_STATION
+#include <cassert>
+#include <cstdio>
+#include <string>
+#include "axiom_log.h"
+#include "phone_position.h"
+#include "station_position.h"
+uint32_t clockMs=10000;
+uint32_t millis(){return clockMs;}
+constexpr uint32_t GPS_FIX_MAX_AGE_MS=2000;
+gnss_snapshot::Collector gnssCollector;
+station_position::Average stationAverage;
+namespace station_extensions {phone_position::Fix phone;}
+""" + position_functions + r"""
+void capture(uint32_t now,axiom_log::Sample &s){
+""" + position_capture + r"""
+}
+int main(){
+ std::string payload="GPGGA,120000.000,2406.0000,N,12130.0000,E,1,08,1.0,0,M,0,M,,";
+ unsigned checksum=0;for(char c:payload)checksum^=(unsigned char)c;
+ char frame[180];snprintf(frame,sizeof(frame),"$%s*%02X\r\n",payload.c_str(),checksum);
+ for(char c:std::string(frame))gnssCollector.feed(c,1000);
+ assert(station_extensions::phone.set(25.1,122.5,5,1760000000000.0,9999));
+ assert(stationLatitude()==25.1 && stationLongitude()==122.5);
+ axiom_log::Sample s;char out[axiom_log::kBatchBytes];
+ for(unsigned scenario=0;scenario<3;++scenario){
+  if(scenario==1){station_extensions::phone.enabled=false;clockMs=1100;
+   stationAverage.observe(1000,true,43200000,24.2,121.6);}
+  if(scenario==2)clockMs=10000;
+  capture(millis(),s);
+  assert(gpsFixFresh()==(scenario!=2));
+  assert(s.gpsFresh==(scenario==1));
+  for(bool cloud:{false,true}){
+   assert(axiom_log::encodeSample(out,sizeof(out),s,1760000000000,0,0,nullptr,nullptr,cloud));puts(out);
+  }
+ }
+ fprintf(stderr,"position sample RAM=%zu\n",sizeof(s));
+}
+"""
+with tempfile.TemporaryDirectory(prefix='shore-position-log-test-') as td:
+    td=Path(td);(td/'test.cpp').write_text(position_cpp)
+    subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-I'+str(ROOT/'include'),
+                    str(td/'test.cpp'),str(ROOT/'src/axiom_encode.cpp'),'-o',str(td/'test')],check=True)
+    result=subprocess.run([str(td/'test')],text=True,capture_output=True)
+    print(result.stderr,end='');result.check_returncode()
+    positions=[json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    for i,doc in enumerate(positions):
+        p=doc['station_position'];scenario=i//2
+        assert p['source']==('phone' if scenario==0 else 'gnss')
+        assert p['valid']==(scenario!=2)
+        assert p['lat']==(25.1 if scenario==0 else 24.2 if scenario==1 else None)
+        assert p['lon']==(122.5 if scenario==0 else 121.6 if scenario==1 else None)
+        assert p['age_ms']==(1 if scenario==0 else 100 if scenario==1 else 9000)
+        assert p['accuracy_m']==(5 if scenario==0 else None)
+        assert p['updated_utc_ms']==(1760000000000 if scenario==0 else None)
+        board=doc['server_gps' if i%2 else 'station_gps']
+        assert board['fresh']==(scenario==1) and board['lat']==24.1
+    print('PASS actual Station phone/GNSS/invalid selection, independent board freshness and both log schemas')

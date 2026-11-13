@@ -69,6 +69,11 @@ struct Sample {
   uint32_t gpsBacklogDrops = 0, clientGnssAge = UINT32_MAX, clientDiagAge = UINT32_MAX;
   DiagnosticPayload clientDiag{};
   bool gpsFresh = false, clientPresent = false;
+  // Selected shore input; board GNSS diagnostics above remain independent.
+  double positionLat = NAN, positionLon = NAN, positionUtcMs = NAN;
+  float positionAccuracyM = NAN;
+  uint32_t positionAgeMs = UINT32_MAX;
+  bool positionPhone = false, positionValid = false;
   double clientLat = 0, clientLon = 0;
   uint32_t clientRxAge = UINT32_MAX, clientSourceAge = UINT32_MAX;
   uint16_t clientSeq = 0, clientSpeedCmS = UINT16_MAX, clientCourseDeg10 = 0;

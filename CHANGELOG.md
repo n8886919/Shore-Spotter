@@ -11,6 +11,12 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 Station 記錄來源與 T096 DATA 修正**：SD／Axiom 的板載 GNSS freshness 改由自身 fix／arrival age 決定，
+  schema 2／3 追加 `station_position` 保存實際選用岸端 source、valid、座標、接收年齡與手機 timestamp／accuracy；
+  保留既有欄位及手機位置保留規則，不改追蹤／Servo。固定 Sample 主機大小 1200→1240 bytes，無新 worker／動態配置。
+  T096 速度超出 wire 範圍時保留有效位置並標示速度未知；編碼故障記既有錯誤、不空增 DATA 序號或重試同 epoch。
+  wire v5／BLE v1／正常 2 Hz 不變。兩項新增回歸先在舊碼失敗，修正後六組相關主機回歸通過；尚未部署或外測。
+
 - **2026-11-14 部署設定防呆與換機說明**：manifest 的 check／plan／build loader 共用板型、角色與 environment 對照，
   拒絕未知／native／錯誤板型或角色；保留現有十種 firmware profiles。換 Station 流程更正為 RST 重啟，
   USER 長按 ACT／SLP 不清 owner。新增負例在修正前 15 個 subcases 失敗，修正後 11 組設定回歸通過，

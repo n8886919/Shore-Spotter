@@ -212,14 +212,18 @@ bool queueRealPosition(uint32_t now) {
   const bool velocity=valid && s.velocityValid && s.speedMps>=0.3 && s.courseDeg>=0.0;
   PositionPayload p{};
   p.speedDmS=protocol::kUnknown; p.courseDeg10=protocol::kUnknownCourse; p.hdop10=protocol::kUnknown;
-  p.fix=valid; p.velocityValid=velocity;
+  p.fix=valid;
   if(valid) {
     p.latE7=int32_t(lround(s.lat*1e7)); p.lonE7=int32_t(lround(s.lon*1e7));
     p.satelliteClass=protocol::satClass(s.satellites); p.hdop10=protocol::quantizeHdop(s.hdop);
     if(velocity) { p.speedDmS=protocol::quantizeSpeed(s.speedMps); p.courseDeg10=uint16_t(lround(s.courseDeg*10.0))%3600; }
+    p.velocityValid=velocity && p.speedDmS!=protocol::kUnknown;
   }
-  PacketHeader h{thisClientId,dataSequence++,MSG_DATA}; outLength=protocol::encodeData(out,sizeof(out),h,p);
-  if (outLength) { dataWaiting=false; outOpensReceiveWindow=false; outIsState=false; cadence.attempted(now,valid,s.epochMsOfDay); }
+  // Consume this epoch even on an encoding fault; never spin/retry one fix.
+  cadence.attempted(now,valid,s.epochMsOfDay); dataWaiting=false;
+  PacketHeader h{thisClientId,dataSequence,MSG_DATA}; outLength=protocol::encodeData(out,sizeof(out),h,p);
+  if (outLength) { ++dataSequence; outOpensReceiveWindow=false; outIsState=false; }
+  else { ++txErrors; maintenanceFault.record("RF DATA"); }
   return outLength != 0;
 }
 bool queueDiagnostic(uint32_t now) {

@@ -2770,7 +2770,16 @@ static void serviceAxiomLog() {
   s.heapLargest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   s.resetReason = esp_reset_reason(); s.wifiRssi = WiFi.RSSI();
   s.batteryMv = cachedBatteryMv; s.clientBatteryMv = boundClientBatteryMv();
-  gnssCollector.sample(now, s.gps); s.gpsFresh = gpsFixFresh();
+  gnssCollector.sample(now, s.gps);
+  s.gpsFresh = s.gps.fix && s.gps.arrivalAgeMs < GPS_FIX_MAX_AGE_MS;
+  const auto &phone = station_extensions::phone;
+  s.positionPhone = phone.enabled;
+  s.positionValid = phone.enabled || s.gpsFresh;
+  s.positionLat = s.positionValid ? stationLatitude() : NAN;
+  s.positionLon = s.positionValid ? stationLongitude() : NAN;
+  s.positionAgeMs = phone.enabled ? phone.age(now) : s.gps.arrivalAgeMs;
+  s.positionUtcMs = phone.enabled ? phone.utcMs : NAN;
+  s.positionAccuracyM = phone.enabled ? phone.accuracy : NAN;
   s.gnssCounters = gnssCollector.stats(); s.gpsBacklogDrops = gpsBacklogDrops;
   s.stationGnss = gnss_diagnostics::capture(gnssCollector, now);
   if (clientGnssDiagnostic.received()) {
