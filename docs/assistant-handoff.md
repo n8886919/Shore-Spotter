@@ -1,51 +1,51 @@
 # Session 交接入口（2026-11-14）
 
-先讀 `AGENTS.md` → [下一 session 規劃](next-session-plan.md)。需要過往證據才到 [紀錄索引](records-index.md) 查回。
-使用者希望精簡程式與機制，方便理解及 debug；**最新觀察：第一次除了 NETWORK GPS 問題，其餘正常**。
-先驗證單一修正，再決定刪除哪些階段性功能；本輪未開始功能刪減。
+先讀 `AGENTS.md` → [下次更新與外測](next-session-plan.md)。過往證據由 [紀錄索引](records-index.md) 查回。
+使用者已授權完成健檢六項修正與交接；**下次起床後會再要求更新 App，再出門測試**。
+本輪只修程式、測試、build 與保存產物；沒有操作手機、網路、燒錄、重啟或舵機。
 
-## 已完成與尚未驗證
+## 這次已完成
 
-| 項目 | 已有證據 | 仍未證明 |
+| 項目 | 已有證據 | 部署／驗收界線 |
 | --- | --- | --- |
-| Android GPS-only | 只訂閱 GPS，收樣／送出前拒絕非 GPS；5 個 JUnit、build／16 KB 對齊通過，lint 0 errors／26 warnings | **未安裝手機、未外測** |
-| Station Web 恢復 | 11/13 曾 USB 部署逾時釋放／前景重讀版本，main build `Nov 13 2026 01:13:33` | 11/13 晚仍有連線異常，不能視為戶外已解決 |
-| 11/13 21:56–22:19 外測 | 多次約 80° 跳動時 Surfer／板載 GPS 沒相應跳點；22:18:26 開機原因為 panic | 未記實際手機座標／provider，不能將每個尖峰定案為 NETWORK；無 crash backtrace |
-| 手動 Servo | 後段 Station 收到 119°／266°／109° 等目標並改變軟體命令 | UART／控制板接收與實體動作無回授，不能全部歸因 Wi-Fi |
-| Axiom | 調查時另一 boot 回報 enabled／low_memory／requests=0；queue＋stack 常駐至少約 22 KB | 回家後計數不能套用外測，未證實上傳堵塞主迴圈 |
-| CAD | 使用者更正為 `~/freecad/Shore-Spotter-Case/`，獨立 commit `f3c69b9` 保存 FCStd／STL；對照 `cad/reference.json` | 未重算幾何，STL 早於 FCStd 存檔，兩者是否一致未確認 |
+| Android 0.2／versionCode 2 | 保留 GPS-only；失聯撤銷排隊控制；背景保存後回前景恢復錄影鍵；新整合回歸先紅後綠、5 JUnit、assembleDebug、16 KB／zipalign 通過，lint 0 errors／26 warnings | **未安裝手機、未真機／外測** |
+| Station 快照 | 板載 GNSS freshness 不再混用手機狀態；SD／Axiom 追加實際選用岸端 `station_position` | **Station 未燒錄；只更新 App 不會得到新 SD 欄位** |
+| T096 DATA | 超出速度編碼範圍仍送有效位置；編碼錯誤可見、不空增序號、不重試同 epoch | **Client 未燒錄**；wire v5、BLE v1、正常 2 Hz 不變 |
+| 部署工具／文件 | board／role／environment 交叉檢查；換 Station 改用 RST，USER 長按保留 owner | 11 組設定回歸與現有四台 manifest 通過；不等同 USB 目標驗證 |
+| 整體主機驗證 | **51／51 suites，native 140／140**；LilyGO Station／T096 build 通過；T096 ZIP CRC／application-only 通過 | 不是 RF、CameraX、機械或戶外驗收 |
 
-GPS-only APK SHA-256：`7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`。
-本機產物：`~/.local/state/shore-spotter/android-gps-only-20261114T002648+0800/shore-spotter-gps-only.apk`。
-手機現有 APK 尚未與目前 source 位元組比對，不把歷史真機驗收套用新版。
+程式 commits：`4e1c00c`（manifest／文件）、`60d5d7b`（韌體／記錄）、`b395973`（Android）。
+韌體 release 仍為 1.0，修正記在 CHANGELOG「未發行」；不能只看 1.0 判定是否已有本次修正。
 
-## Git 與紀錄
+## 下次使用的產物
 
-- `records/2026-11-14`／`bcce441291c4c9ee6f2b9fe2b7817b1976702bf6` 保存實驗、既有程式 WIP 與 Android；當時誤納入 Pocket 診斷，後續已移除副本。
-- 正式外殼在獨立 `~/freecad/Shore-Spotter-Case/` repository 提交，完整 commit／hash 見 `cad/reference.json`。
-- 階段性文件由後續清理 commit 移出工作目錄，`python3 tools/read_record.py` 可列出／讀取／匯出；索引固定保存 commit／原路徑／hash。
-- 原始 USB／HTTP／GPS 證據留在本機 `~/.local/state/shore-spotter/field-investigation-20261113T235548+0800/`，不納入公開內容。
-- checkpoint 前完整主機回歸 50／50 組通過；文件歸檔不等於重新燒錄、手機或戶外驗收。
+本機目錄：`~/.local/state/shore-spotter/health-fixes-20261114T011939+0800/`。
+`artifacts.json` 保存各產物 SHA-256、來源 commit、build environment、私人設定 fingerprint 與驗證摘要。
+產物與 ELF／設定 fingerprint 僅在本機，不加入公開 repo；部署前仍須核對目前目標與 Wi-Fi 設定。
 
-## 現行系統入口
+- **優先更新 APK：`shore-spotter-0.2.apk`**，套件 `tw.shorespotter.app`、versionCode 2／versionName 0.2。
+  SHA-256：`9f5cb1f551452739ce3e21d02869f9cdfff64885a47f1ddae6e822919b2d8681`。
+- Station：`tbeam-station/firmware.bin` 與對應 `firmware.elf`。
+- T096：`t096-client/firmware.zip`（application-only），另留 bin／elf。
+- 同目錄有 Android red／green、Gradle、lint 摘要、16 KB／zipalign、完整主機與雙端 build logs。
 
-- 原始碼 1.0、LoRa wire v5／BLE wire v1；版本唯一來源 `include/firmware_version.h`。
-  使用 T096 Client、LilyGO T-Beam Supreme Station；舊 LilyGO Client／Heltec V4／診斷 profiles 仍在，刪除前查清用途。
-- T096 Ready 關 GPS／LoRa，BLE claim 固定本次 owner；Start 開 GPS／LoRa，Stop 回 Ready。
-  HTTP 202 是 pending，匹配 Client boot／owner／command 的 STATE 才確認；Ready 沒有舊 30 秒 LoRa 輪詢。
-- A／B runtime 候選 923.2／923.8 MHz，皆 SF9。API 見 [interface](interface.md)、[binding](client-binding-api.md)、[OpenAPI](openapi-client-control.json)。
-- Youmi 固定 M0，UART2 TX43、9600 8N1，RX 不配置；0～359°／中位 179.5°，無 ACK／實體回授。
-  接線／校正見 [hardware](hardware.md)、[motion-control](motion-control.md)、[uart-servo](uart-servo.md)。
-- Station SD 自動記錄；低 heap／忙碌會略過快照，`sample_dropped` 不是 RF 漏包。
-  Axiom 預設關閉不代表 NVS 實際停用；見 [SD](sd-log.md)、[Axiom](axiom-log.md)。
-- App 規格與建置見 [android/README](../android/README.md)。僅操作 `tw.shorespotter.app`，不改手機網路或全域設定；無背景／鎖屏服務。
-  Station 保留最後手機位置至重開機。
+先前 0.1 GPS-only 基準 APK 仍保留於 `~/.local/state/shore-spotter/android-gps-only-20261114T002648+0800/`，
+hash `7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`；它不是下次預設安裝產物。
 
-## 下一步與操作界線
+## 仍不能宣稱已解決
 
-依 [下一 session 規劃](next-session-plan.md) 先做 GPS-only 真機／戶外基準，再評估 Axiom、舊實驗入口與重複流程。
-不先重寫整條追蹤，不為掩蓋失敗降低記憶體／freshness 門檻。
-定位來源、網路到達、UART 寫入與實體動作分別驗證。
+- 使用者最新觀察：第一次除 NETWORK GPS 外其他正常。GPS-only 尚未真機外測，不能將每次跳角都定案為 NETWORK。
+- 11/13 21:56–22:19 多次約 80° 跳動，Surfer／板載 GPS 無相應跳點；舊紀錄缺實際手機座標／provider。
+  新快照只能改善部署後證據，無法回填過去。
+- 11/13 22:18:26 有 panic，但沒有 crash backtrace；本輪沒有找到或修正已證明的 panic 根因。
+- 當時手動命令 119°／266°／109° 已抵達軟體；UART、控制板與 Servo 無回授，不能全部歸因 Wi-Fi。
+- Station 上次部署仍為 main build `Nov 13 2026 01:13:33` 的 Web 恢復版；當日後續仍有連線異常。
+- Axiom 某次回家後 boot 有 enabled／low_memory／requests=0，不能套用外測或當成崩潰根因；本輪未移除或改設定。
+- CAD 仍由 `cad/reference.json` 指向獨立 repo。FCStd／STL committed hash 已核對，但 STL 與目前幾何一致性未驗證。
 
-本輪沒有操作手機、改網路、燒錄、重啟或發送舵機／Client 命令。
-下一 session 操作前重新核對裝置、IP、boot、模式與授權；歷史位址不能直接沿用。
+## 系統邊界
+
+T096 Ready 關 GPS／LoRa，BLE Claim 固定本次 owner；Start 的 HTTP 202 只是受理，匹配 STATE 才確認。
+現役為 T096 Client＋LilyGO Station；runtime A／B 均 SF9。Youmi M0、TX43、9600、0～359°，無 ACK／物理角度回授。
+手機位置保留到 Station 重開，錄影／定位生命週期不自動切換 Servo 模式。舊 profiles／Axiom 本輪均未刪除。
+操作規格見 [App](../android/README.md)、[API](interface.md)、[SD](sd-log.md)、[硬體](hardware.md)。

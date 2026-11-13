@@ -1,71 +1,53 @@
-# 下一 session：先驗證 GPS-only，再精簡程式
+# 下次起床後：更新 App 0.2，分段驗證再外測
 
-更新：2026-11-14。這是目前待辦入口，持續維護本檔；完整過往實驗留在 Git 歷史。
+更新：2026-11-14。使用者已授權健檢六項修正與產物準備，會在下次起床後再要求更新 App。
+最新產物／hash／主機結果以 [交接入口](assistant-handoff.md) 為準。本輪未操作手機或燒錄。
 
-## 接續目標
+## 1. 更新 App
 
-使用者希望程式簡單、穩定、容易記住與 debug，可以刪除已不需要的階段性功能。
-最新觀察是：**第一次除了 NETWORK GPS 問題，其餘正常。**
-因此先驗證已完成的單一定位修正，再決定後續刪除範圍；本輪不開始大規模重構。
+1. 重新列出 ADB 裝置，核對 Pixel 型號／系統／當次 device ID。所有命令明確指定 `-s`；不沿用歷史 IP／port。
+2. 核對本輪 `shore-spotter-0.2.apk` hash／package／versionCode 2，以更新安裝保留 App 資料；不清除資料、不動其他 App 或全域網路設定。
+3. 讀回安裝版本；只開 `tw.shorespotter.app`，初次檢查保持 Station 手動，不因更新 App 自動啟動 Client 或 GPS／Servo。
+4. 使用者若只要求更新 App，就先完成 App 範圍，不自動加做兩端韌體燒錄。
 
-基本路徑保持清楚：
+## 2. 出門前的短驗收
 
-`手機衛星 GPS → Station 岸端位置` ＋ `Surfer GNSS → LoRa DATA → Station`
-`→ 計算方位 → 共用角度／限速 → UART → 串口控制板 → 舵機`
+- 開始一段測試錄影 → 離開 App 等保存完成 → 回前景 → 能開始第二段並保存。再測保存尚未完成就回前景，確認不會重複啟動。
+- 確認無聲、影片可保存、暫停／繼續及控制面板展收不破壞錄影；只查本次 App 新建影片。
+- 室外有衛星 fix 時，確認新 GPS 樣本持續更新、Station 回覆相同快照；無 fix 時等待，不採 network／fused。
+- GPS 停用／啟用恢復需要使用者操作或明確授權，不為了測試自行改手機全域設定。
+- 失聯／重連不應重放舊意圖；涉及真實控制或斷網的驗收另按當次授權和安全狀態進行。主機已涵蓋排隊撤銷，不為測它而臨時移動舵機。
 
-## 1. 接續時先核對（不必重做已通過檢查）
+驗收記錄安裝版本、時間與結果。CameraX、GPS／Wi-Fi、API、實際機械動作分開記，不能把 build 當成通過。
 
-- 讀 `AGENTS.md`、`docs/assistant-handoff.md`、本檔；需要過往證據才用紀錄索引取回。
-- Git checkpoint 已包含原有 Android／BLE／T096／Web WIP；不從早於 checkpoint 的 HEAD 推定現行行為。
-- Android GPS-only APK：SHA-256 `7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`。
-  原檔在 `~/.local/state/shore-spotter/android-gps-only-20261114T002648+0800/shore-spotter-gps-only.apk`。
-  5 個 JUnit、build／16 KB／zipalign 已過，lint 0 errors／26 warnings；**尚未安裝**，不要當成真機／戶外已驗收。
-- Station 上次部署仍是 main build `Nov 13 2026 01:13:33` 的 Web 恢復版本；GPS-only 只改 App。
-  目前連線位址／板子／boot 必須重新辨識，不能硬用先前 IP 或 `/dev/ttyACM0`。
-- 使用者已更正 CAD 為 `~/freecad/Shore-Spotter-Case/`，獨立 Git commit `f3c69b92dbabbcf2fabaf60c2b81fcd3ed723c81` 已保存主 FCStd 與既有 STL。
-  程式 repo 僅留 `cad/reference.json`，沒有複製模型；STL 早於 FCStd 存檔，未重算／重匯出或確認幾何一致。
-  舊 Pocket 診斷目錄不是本次主設計，其誤納入副本已移除。
+## 3. Station／Client 更新是另外兩件事
 
-## 2. 優先：建立 GPS-only 基準
-
-- 在使用者授權操作手機時，重新辨識 Pixel／ADB ID，只更新 `tw.shorespotter.app`，保留 App 資料。
-- 確認有衛星定位時持續更新、GPS 停用／重新啟用後可恢復、沒有衛星定位時等待；不採網路估算位置。
-- 初次檢查保持 Station 手動，不因安裝／開 App 自動切 GPS 或移動舵機。
-- 在約定的外測中先重跑第一次正常流程，再測錄影停止／切 App／重連，分段觀察。
-- 若不再亂轉，保留結果，避免同時改多個定位／追蹤門檻，讓原因仍可追溯。
-
-驗收應分開記：App 實際安裝版本／GPS 樣本、API 確認、收到的 RF、軟體目標／命令與實體動作。
-沒有回授時不能把 UART 寫入成功當作舵機已動。
-
-## 3. 精簡候選，先確認用不用，再刪
-
-每項只寫簡單結論：目前誰在用、占多少常駐資源／執行路徑、移除後少了什麼、用哪個測試確認。
-不要先加入通用框架、新背景 worker、額外重試／快取／降級狀態機。
-
-| 候選 | 優先調查 | 決定條件 |
+| 更新範圍 | 會生效的修正 | 尚未更新時的限制 |
 | --- | --- | --- |
-| Axiom 雲端上傳 | worker／queue 常駐至少約 22 KB，低記憶體也不回收；目前 SD 已能留證據 | 使用者確定不需雲端 log 時才整條移除；需要時再選最小資源生命週期修正 |
-| 舊外部 UART、舊 Client／診斷 profile 與實驗入口 | 搜尋實際呼叫、編譯 profile、測試與文件；判斷是否真有進入韌體／占 RAM | 不再使用且沒有目前硬體依賴才刪，不能只因檔案舊就判為肇因 |
-| App／Web 重複的狀態與控制流程 | 先看哪條是日常入口、哪條仍供現場 debug | 先列使用者真正需要的操作；先刪重複入口，不先動 RF／追蹤核心 |
-| 大型診斷快照／格式化 | 確認 heap／最大區塊、快照略過與可讀性 | 保留原始 DATA 和少量失敗原因，避免為記錄而重建多份狀態 |
+| App 0.2 | GPS-only、失聯撤銷舊操作、錄影回前景恢復 | 不會修正韌體 DATA 或增加 SD 記錄 |
+| LilyGO Station | 正確板載 freshness、實際選用岸端 `station_position` | 舊 SD 無法證明當時真正使用的手機座標 |
+| T096 Client | 超出速度範圍保留有效位置、編碼故障有界可見 | 舊韌體仍有該邊界缺陷 |
 
-保留原則：有效定位／新樣本與 RF seq 規則、控制 boot／epoch／期限、共用限速及可見錯誤，直到有等效且更簡單的方案。
-先確認行為再移除，不為掩蓋症狀降低 SD／TLS 記憶體門檻。
+若使用者要求兩端更新：重新核對板型／USB serial／boot／現有設定與回復產物，再使用本輪 manifest 對應檔案。
+Station 產物使用本機私人 Wi-Fi 設定，不能因有 build 成功就假定與現場網路一致。
+Station 重啟會輸出中位命令，先處理舵機電源／機構安全；T096 僅更新 application，保留 bootloader／SoftDevice。
+部署後讀回新 boot／build、配對／owner／頻道與速限；不自動發送動作。新 SD 快照需實際讀回 `station_position` 才算生效。
 
-## 4. 只有再現時才深入的分支
+## 4. 外測分段與再現時留證據
 
-- **Wi-Fi／App 仍失聯：** 分清正在連線、拿到 IP、HTTP 收到／逾時；現有每 5 秒 reconnect 與連線中錯誤需核對。
-  先補少量必要事件，不堆疊新的重連機制。已確認外測有一次 panic；需可重現的 backtrace 才能定位，不直接認定是 Axiom／OOM。
-- **手動仍不動：** 記錄新命令是否抵達及 UART sent／deferred／errors，再檢查控制板接收與通道／模式。
-  外測已記到 119°／266°／109° 目標，全部歸因 Wi-Fi 不合理。
-- **GPS-only 仍大幅亂轉：** 優先補實際岸端參考座標／來源／精度與該點 Surfer DATA，再評估方位與 0／359° 邊界。
-  受限角度舵機不能直接套連續旋轉的最短路徑；行為取捨另行確認。
+基本路徑：`手機衛星 GPS → Station 岸端位置` ＋ `Surfer GNSS → LoRa DATA → 方位 → 共用限速 → UART → 控制板 → 舵機`。
+先重跑第一次正常流程，再分段測停止錄影、切 App、重連；本輪不混入 Axiom 刪除、頻道／追蹤門檻或大型重構。
 
-## 5. 每完成一小步的交接方式
+- 若跳角：記時間與當時操作，保留同段原始 RF、實際岸端來源／座標／年齡、Surfer DATA、目標與命令。未部署新 Station 時要明說缺少岸端快照。
+- 若失聯：區分 App／HTTP、Station 是否重開，以及 Client RF；回家後另一個 boot 的計數不能代替當時證據。
+- 若手動不動：先分清 API 抵達、UART sent／deferred／errors 與實體接收；沒有回授不宣稱 Servo 已到位。
+- 若重開／panic：記錄發生時間、操作與新 boot，先保留／匯出 SD／DIAG，不先重刷清資料。需配對當時 ELF 與 crash backtrace 才能定位；本輪未加入持久化 coredump，無筆電現場可能仍取不到 backtrace，必要時回主機控制條件重現並捕捉 USB 輸出。
 
-1. 改動一個原因，跑必要主機／實機驗證；清楚標記尚未部署、未外測或未取得實體證據。
-2. 更新當前規格、CHANGELOG 與本待辦，短實驗紀錄先提交到 Git。
-3. 在紀錄索引保存 commit／原路徑／hash／附件，再移除已結束的階段性紀錄並提交清理。
-4. 實際執行取回與附件 hash 驗證後收尾，工作目錄只留當前規格、待辦、索引與必要資源。
+使用者不需在海邊操作診斷工具；先記時間／操作並保留裝置資料，回來由 agent 匯出分析。
 
-目前沒有授權新的燒錄、手機網路更動或舵機操作；本輪任務是文件、快照與 Git 提交。
+## 5. 後續與交接
+
+先完成本輪安裝／部署與外測，不把「沒有再現」寫成已找到 panic 根因。
+每完成一段更新交接的版本／hash／boot／實測結果；有紀錄就依固定 commit＋hash 索引保存並驗證可取回。
+尚待決定：Axiom 是否需要、舊 profile／入口用途。SD 與 Axiom 共用快照／encoder，移除上傳時保留本地記錄。
+CAD 幾何／STL 一致性、RF 長時間與機構驗收仍是獨立待辦；本輪沒有擴張這些範圍。

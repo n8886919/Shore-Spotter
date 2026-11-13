@@ -11,6 +11,11 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 健檢修正整合與次日交接**：六項修正分別提交，完整主機回歸 **51／51**（native 140／140）與
+  LilyGO Station／T096 build 通過；T096 DFU ZIP CRC／application-only 核對通過。
+  APK／兩端 bin／elf／ZIP、hash 與來源 commit 已存本機獨立產物目錄；更新交接與出門前分段驗收。
+  **未安裝 App、未燒錄、未操作舵機；panic 根因與戶外可靠性尚未驗證**。詳見交接入口與階段紀錄索引。
+
 - **2026-11-14 Android 0.2 健檢修正（待安裝）**：保留 GPS-only，poll 失敗先在 worker 封鎖同世代操作，
   UI 再撤銷世代與 busy；5 秒 freshness 過期及送出前／GET 後均檢查，舊世代失敗不影響新連線。
   保留 boot／epoch／seq／2 秒期限與 POST 不重送。錄影在背景完成保存後，回前景恢復錄影鍵；

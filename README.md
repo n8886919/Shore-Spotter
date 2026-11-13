@@ -5,6 +5,8 @@
 其他工程師先讀 [交接入口](docs/assistant-handoff.md) 與 [功能入口](docs/function-entrypoints.md)。
 2026-11-14 checkpoint 已保存 BLE／維護介面／Web 恢復、Android GPS-only。外殼另於獨立 CAD repository 提交，見 [CAD 索引](cad/README.md)。
 目前待辦見 [下一 session 規劃](docs/next-session-plan.md)，階段紀錄依 [索引](docs/records-index.md) 從 Git 查回。
+健檢六項修正已完成主機驗證，App 0.2 與 Station／T096 產物已備妥，**尚未安裝／燒錄／外測**。
+最新 hash、實際更新範圍與出門前驗收見交接入口；只更新 App 不會更新兩端韌體。
 
 ## 現行流程（2026-11-14）
 
@@ -64,6 +66,9 @@ Station 採 SD 留原始證據，Axiom 是否移除／回收資源列入後續�
 網頁 GPX／Strava／除錯錄製已移除，診斷 HTTP API 仍可使用，見 [現場除錯](docs/debug-export.md)。
 
 全套主機驗證入口為 `python3 tools/verify_project.py --prepare`，不會燒錄或操作硬體。
+包含 Android 真實方法的 lifecycle／排隊控制回歸，另需 JDK 17+（可設 `JAVA_HOME`）；
+此入口不包含 Gradle 或 firmware build。現役雙端 build 使用 `pio run -e tbeam-station -e t096-client`，
+Android build／JUnit／lint 見 [android/README](android/README.md)，真機與戶外另驗收。
 [10/16 健檢](docs/records-index.md#health-check-2026-10-16)、[10/11 Servo 部署](docs/records-index.md#servo-ui-deployment-2026-10-11)
 與 [10/9 RTC 待機](docs/records-index.md#t096-rtc-standby-2026-10-09) 保留當時證據；舊 Ready 每 30 秒 LoRa 流程已由 BLE 取代。
 

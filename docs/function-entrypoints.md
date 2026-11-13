@@ -1,4 +1,4 @@
-# 功能入口盤點（更新至 2026-10-28）
+# 功能入口盤點（更新至 2026-11-14）
 
 適用 **1.0** 現行原始碼；按鍵、網頁與 API 入口見下表。
 部署與未完成驗收見 [交接入口](assistant-handoff.md)、[BLE 紀錄](records-index.md#ble-control-2026-10-27)
@@ -57,6 +57,8 @@
 - 健康診斷／NMEA：`include/mcu_temperature.h`、`include/nmea_evidence.h`、`include/gnss_snapshot.h`。
 - Servo：`include/servo_controller.h`、`include/servo_motion.h`、`src/main.cpp`；RF metadata：`include/runtime_radio_profile.h`、`src/sd_log.cpp`。
 - 主機回歸清單：`python3 tools/verify_project.py --list`。測試保留的 UART parser／模式隔離不表示現行 Station 還提供外部 UART 控制。
+- Android lifecycle／排隊控制：`tools/test_android_lifecycle.py`（JDK 17+，主機入口自動納入）；Gradle build／JUnit／lint 與真機驗收另跑。
+- Station 實際選用位置證據：SD／Axiom `station_position`，規格見 [SD 記錄](sd-log.md)；舊紀錄不回填手機座標。
 
 ## 已取代的流程
 
