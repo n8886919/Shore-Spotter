@@ -1,6 +1,6 @@
 ## DOCS
 - `docs/assistant-handoff.md` — 新 session 入口、目前已驗證／未驗證界線。
-- `docs/next-session-plan.md` — 起床後更新 App 0.2、分段外測與兩端韌體待部署界線；使用者最新觀察是第一次除 NETWORK GPS 外其他正常。
+- `docs/next-session-plan.md` — App 0.3／兩端韌體已部署後的分段外測與未驗收界線；使用者最新觀察是第一次除 NETWORK GPS 外其他正常。
 - `docs/records-index.md` / `docs/records.json` / `tools/read_record.py` — 已結束的實驗／部署／階段交接從 Git 取回。
   不因舊文件已移出工作目錄就判定證據遺失；例如 `python3 tools/read_record.py field-experiment-2026-11-14`。
 - `README.md` / `docs/features.md` / `docs/function-entrypoints.md` — 現行流程與功能入口。

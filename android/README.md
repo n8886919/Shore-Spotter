@@ -12,7 +12,7 @@ Pixel 10 的橫向滿版相機、原生追蹤控制與手機定位 App。App 版
 5. 右下半透明畫質按鈕調解析度／FPS；錄影中鎖定畫質設定。加粗的倍率滑桿／點按對焦仍可操作，移除 1×／2×／5× 快捷鍵。
 
 右下畫質右側的資源區以兩行顯示：上行接電時為**綠色閃電 icon＋N%**，拔電時為「電量 N%」，接電且滿電也保留閃電與百分比；下行為錄影磁碟的**剩餘 XX.X GB**。提醒直接疊在影像，點按可看處理方法。
-目前 source 包含閃電 icon／百分比與 GPS-only；本次 GPS-only APK 尚未安裝，現有手機 APK 未與目前 source 位元組比對，歷史真機驗收不可直接套用。
+目前 Pixel 10 已安裝 0.3，包含閃電 icon／百分比、GPS-only、最近 IP；已拉回 APK 核對 hash，真機／戶外驗收界線見交接入口。
 沒有地圖、雷達、重複的面板標頭、常駐重整、SD 資訊或診斷數值；原 Station 網頁保留作 debug。
 Surfer 使用 Heltec T096，App 不呈現不存在的 SD 卡。
 狀態採不透明背景：就緒綠 `#7acd9c`、等待沙色、未確認／斷線／錯誤粉紅 `#e99a94`、停用灰色，保留文字與模式勾選。定位尚未取得第一筆時顯示沙色等待，有位置但尚未確認時為粉紅。
@@ -71,11 +71,11 @@ APK SHA-256 `7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`�
 使用專案內的 [$shore-spotter-android](../.agents/skills/shore-spotter-android/SKILL.md)；沿用 Mobile MCP／ADB，不另開專用遠控服務。
 包含只讀裝置／Station 檢查工具、App 前景截圖檢查與真機驗收流程。Skill 不會縮小 ADB 本身的整機權限，agent 必須遵守日常手機與硬體操作範圍。
 
-### 0.2 待安裝驗證
+### 0.2 主機與後續真機驗證
 
 0.2 保留 GPS-only，修正背景錄影保存後回前景無法重新錄影，以及失聯後已排隊的舵機／Surfer 操作未撤銷。
 `python3 tools/test_android_lifecycle.py`（專案根目錄）抽取實際 Java 方法，模擬 executor／UI 回呼順序；由 `tools/verify_project.py` 自動納入。需要 JDK 17+（優先 `JAVA_HOME`／PATH，亦可使用既有 Android Studio JBR），不連手機或 Station。
-覆蓋背景／前景 Finalize、仍在保存、相機不可用，以及 poll 失敗後 UI 回呼前後撤銷、freshness 期限、舊世代失敗、重連新手勢、boot／epoch／2 秒期限。這是主機回歸，不能替代 CameraX、實際 Wi-Fi、GPS／戶外與機械驗收；新 APK 尚未安裝。
+覆蓋背景／前景 Finalize、仍在保存、相機不可用，以及 poll 失敗後 UI 回呼前後撤銷、freshness 期限、舊世代失敗、重連新手勢、boot／epoch／2 秒期限。這是主機回歸，不能替代 CameraX、實際 Wi-Fi、GPS／戶外與機械驗收；0.2 已安裝並完成錄影恢復驗收，後續更新為 0.3；戶外未驗收。
 
 0.2 主機檢查：上述 integration 回歸、5 個 JUnit、assembleDebug 通過，lint 0 errors／26 warnings；4 個 64 位元 JNI 的 16 KB ELF／APK 對齊及 zipalign 通過。APK SHA-256 `9f5cb1f551452739ce3e21d02869f9cdfff64885a47f1ddae6e822919b2d8681`；產物與明日驗收步驟見 [交接入口](../docs/assistant-handoff.md)。
 
@@ -83,4 +83,4 @@ APK SHA-256 `7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`�
 
 `tools/test_android_lifecycle.py` 另驗證實際 poll／歷史寫入方法：最近兩筆排序與去重、相同地址不重寫、歷史儲存，以及任一 GET 失敗、過期世代、背景回覆不記錄。保留數字鍵盤、完成即連線與取消／外部點按不提交的既有流程。
 assembleDebug、5 個 JUnit、上述 integration 回歸、16 KB ELF／APK 對齊與 zipalign 通過；lint 0 errors／26 warnings。
-APK SHA-256 `51df3ec533560626ba406a15b9ed2d66cc58780a72996cbc4a98334381d5b8ba`；本項僅為主機驗證，安裝與手機 UI 驗收另記於交接入口。
+APK SHA-256 `51df3ec533560626ba406a15b9ed2d66cc58780a72996cbc4a98334381d5b8ba`；已安裝 Pixel 10／Android 17並拉回hash比對。第一筆近期IP出現、點選連回、結束App後仍保存已驗證；第二筆尚無不同IP真機連線，排序／去重已有主機回歸。背景保存後回前景再次錄影，兩段1080p約30 FPS／無音軌通過。GPS衛星fix與戶外仍未驗收。

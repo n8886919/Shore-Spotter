@@ -11,6 +11,8 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 實機部署**：使用者確認舵機斷電；584C application-only 燒錄及 hash 成功，build `Nov 14 2026 01:21:02`；F035 application-only DFU 成功，build `Nov 14 2026 01:21:52`，新 boot／Ready／BLE 認領確認。保留設定與 SD；新記錄 CRC 匯出含 `station_position`。Pixel 10 先安裝 0.2 驗證錄影恢復，再更新 **0.3**，拉回 APK hash 相符，最近 IP 按鈕真機點選連線成功。戶外 GPS-only、跳角／panic 與實際機械驗收仍待完成；歷史「未部署」敘述為當時階段狀態，現況見交接入口。
+
 - **2026-11-14 Android 0.3 最近 Station IP**：IP 輸入框下列出最近成功連線的最多兩個不同地址，最新在左，點按直接沿用原連線流程；只在 Station 識別及完整狀態 poll 成功、目前世代仍有效時寫入本機歷史，失敗／過期／背景回覆不記錄。versionCode=3；主機回歸（排序／去重／失敗／過期回覆）、5 個 JUnit、assembleDebug、lint（0 errors／26 warnings）、16 KB／zipalign 通過；本項主機驗證不代表已安裝／真機驗收。
 
 - **2026-11-14 健檢修正整合與次日交接**：六項修正分別提交，完整主機回歸 **51／51**（native 140／140）與

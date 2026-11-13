@@ -16,7 +16,7 @@ description: Develop, install, inspect, and verify the Shore Spotter Android cam
 - 一般按鈕底板維持 6dp 小圓角長方形；錄影鍵例外為半透明圓形底板，中心保留紅圓／停止方塊，沒有白色外框。
 - 錄影／暫停／倍率／右下畫質／資源區均高 48dp、距底部 26dp 對齊；相機工具底板保留半透明，只有倍率／畫質有白色細框。畫質寬 128dp／距右 172dp，右側資源區寬 144dp／距右 20dp。錄影中心紅色 alpha `0xb3`、底板 `0x99`。倍率只有數字與 8dp 軌道／28dp 拖曳點，沒有 1×／2×／5×；滑桿列縮至前次寬度 80%，左側預留錄影／暫停區，再以 `max(200dp, 螢幕寬 - 464dp)` 夾限；展開面板時隱藏倍率／畫質／資源區，收合後恢復。
 - 右下資源區以 13sp 上下兩行共用同一個半透明背景，沒有白框：上行接電顯示綠色閃電 icon＋N%，拔電顯示「電量 N%」，接電且滿電也保留閃電與百分比；下行剩餘 GB，不再用「充電中／已充滿」取代百分比。未連線的「Station 斷線」只開 IP 設定，不能進控制／資訊；失聯停用並收起浮層。Surfer 是 Heltec T096；兩端 SD、地圖／雷達、封包／log／原始診斷留在既有網頁，不搬進 App。
-- 目前 source 包含閃電 icon／百分比與 GPS-only；GPS-only 尚未安裝，當前狀態先看 `docs/assistant-handoff.md`／`android/README.md`。使用者收起手機時停止 ADB／Mobile MCP 與安裝；歷史真機驗收不可套用新 APK。
+- 目前 source 包含閃電 icon／百分比、GPS-only 與最近 IP；0.3 已安裝的驗證界線以交接為準，當前狀態先看 `docs/assistant-handoff.md`／`android/README.md`。使用者收起手機時停止 ADB／Mobile MCP 與安裝；歷史真機驗收不可套用新 APK。
 - 手機固定在 Station 旁提供位置。影片暫停不切追蹤模式；GPS 追蹤與錄影生命週期分開。
 - 使用 App 時吞掉手機內建音量鍵，含對話框，不改音量、不當錄影鍵；外接裝置另辨識，目前未加遙控錄影。按鍵驗收只在本 App 前景，不隨意改全域音訊或配對設定。
 
