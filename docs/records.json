@@ -3,6 +3,15 @@
   "checkpoint_tag": "records/2026-11-14",
   "records": [
     {
+      "id": "deployment-app-0-3-2026-11-14",
+      "date": "2026-11-14",
+      "title": "兩端韌體部署與 App 0.3 最近 IP／真機驗證",
+      "path": "docs/deployment-app-0-3-2026-11-14.md",
+      "sha256": "54cebbb797aae11e5e16481f26db4c8d10fb0a98a03bd9f9925a0aa913efaac4",
+      "assets": [],
+      "commit": "ac4ae2e3cce4c1df20090f69993d624bbff71a0b"
+    },
+    {
       "id": "health-fixes-2026-11-14",
       "date": "2026-11-14",
       "title": "健檢六項修正與待部署產物（2026-11-14）",

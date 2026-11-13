@@ -7,6 +7,8 @@ App 0.3 增加最近兩個成功 Station IP 快選；目前一個真實地址已
 
 ## 最新部署（2026-11-14）
 
+完整步驟、真機負例與驗證見 [部署紀錄](records-index.md#deployment-app-0-3-2026-11-14)。
+
 - Station：build `Nov 14 2026 01:21:02`，boot `3950833316`；active app1 application-only 燒錄，hash 驗證通過。
   保留 NVS／分區／SD，實際匯出新 SD 並核對 CRC，20 個快照含 `station_position`。SD 已恢復 recording；快照仍有略過，不能等同 RF 漏包或宣稱所有快照持續保存。
 - T096 F035：build `Nov 14 2026 01:21:52`，boot `82F0D506`；application-only DFU 成功，保留 bootloader／SoftDevice。
