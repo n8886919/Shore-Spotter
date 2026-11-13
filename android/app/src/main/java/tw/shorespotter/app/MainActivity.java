@@ -75,7 +75,7 @@ public class MainActivity extends ComponentActivity {
     private Location latestLocation;
     private String station = "", appliedFormat = "", locationError = "";
     private volatile boolean resumed, destroyed;
-    private boolean connecting, sending, verified, finalizing, paused;
+    private boolean connecting, sending, verified, finalizing, paused, cameraReady;
     private volatile int generation;
     private long lastAckElapsed, lastAttemptElapsed, lastOfferedSampleNanos, lastConnectAttemptElapsed;
     private String lastAckStatus = "尚未傳送", recordingStatus = "準備相機…";
@@ -299,6 +299,7 @@ public class MainActivity extends ComponentActivity {
         int qi = qualitySpinner.getSelectedItemPosition(), fi = fpsSpinner.getSelectedItemPosition();
         if (qi < 0 || fi < 0) return;
         Quality quality = qualities.get(qi); int fps = frameRates.get(fi);
+        cameraReady = false;
         try {
             if (camera != null) {
                 camera.getCameraInfo().getZoomState().removeObservers(this);
@@ -310,6 +311,7 @@ public class MainActivity extends ComponentActivity {
             video = new VideoCapture.Builder<>(recorder).setTargetFrameRate(new Range<>(fps, fps)).build();
             video.setTargetRotation(getWindowManager().getDefaultDisplay().getRotation());
             camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, pv, video);
+            cameraReady = true;
             camera.getCameraInfo().getZoomState().observe(this, zs -> {
                 if (zs == null) return;
                 zoomLabel.setText(String.format(Locale.US, "%.1f×", zs.getZoomRatio()));
@@ -317,14 +319,14 @@ public class MainActivity extends ComponentActivity {
                 if (max > zs.getMinZoomRatio()) zoom.setProgress((int) Math.round(1000 * Math.log(zs.getZoomRatio() / zs.getMinZoomRatio()) / Math.log(max / zs.getMinZoomRatio())));
             });
             camera.getCameraInfo().getCameraState().observe(this, s -> {
-                if (s.getError() != null) { recordingStatus = "相機錯誤 " + s.getError().getCode() + "；請選其他畫質並套用"; recordButton.setEnabled(false); updateCameraStatus(); }
+                if (s.getError() != null) { cameraReady = false; recordingStatus = "相機錯誤 " + s.getError().getCode() + "；請選其他畫質並套用"; recordButton.setEnabled(false); updateCameraStatus(); }
             });
             appliedFormat = qualityName(quality) + " / " + fps + " fps 目標";
-            recordingStatus = "待錄影 · 無聲"; recordButton.setEnabled(true);
+            recordingStatus = "待錄影 · 無聲"; recordButton.setEnabled(resumed && cameraReady);
             prefs.edit().putString("quality", qualityName(quality)).putInt("fps", fps).apply();
             updateCameraStatus();
         } catch (Exception e) {
-            video = null; recordingStatus = "此畫質組合無法開啟，請更換後套用";
+            cameraReady = false; video = null; recordingStatus = "此畫質組合無法開啟，請更換後套用";
             recordButton.setEnabled(false); updateCameraStatus();
         }
     }
@@ -361,7 +363,7 @@ public class MainActivity extends ComponentActivity {
                 } else if (event instanceof VideoRecordEvent.Finalize) {
                     VideoRecordEvent.Finalize done = (VideoRecordEvent.Finalize) event;
                     recording = null; finalizing = false; paused = false;
-                    recordButton.setImageDrawable(new CaptureButtonDrawable(false)); recordButton.setContentDescription("開始錄影"); recordButton.setEnabled(resumed && video != null);
+                    recordButton.setImageDrawable(new CaptureButtonDrawable(false)); recordButton.setContentDescription("開始錄影"); recordButton.setEnabled(resumed && cameraReady && video != null);
                     pauseButton.setVisibility(View.GONE); pauseButton.setEnabled(true);
                     setFormatEnabled(true);
                     if (done.hasError()) {
@@ -602,6 +604,7 @@ public class MainActivity extends ComponentActivity {
     };
     @Override protected void onResume() {
         super.onResume(); resumed = true;
+        recordButton.setEnabled(cameraReady && video != null && !finalizing);
         startLocations(); main.removeCallbacks(tick); main.post(tick);
         if (!station.isEmpty() && !verified) connectStation();
     }

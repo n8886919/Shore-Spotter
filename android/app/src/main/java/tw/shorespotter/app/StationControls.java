@@ -25,9 +25,10 @@ public final class StationControls {
     private final Button clientButton, manualButton, gpsButton, calibrateButton, speedButton;
     private final SeekBar aim;
     private volatile boolean active;
-    private volatile int generation;
+    private volatile int generation, failedGeneration = -1;
     private String endpoint = "", transientError = "", alertDetail = "";
-    private long lastPollAttempt, lastSuccess, errorUntil;
+    private long lastPollAttempt, errorUntil;
+    private volatile long lastSuccess;
     private boolean reading, motionBusy, clientBusy, dragging;
     private JSONObject track = new JSONObject(), control = new JSONObject(), status = new JSONObject();
     private long pendingStationBoot = -1, pendingOperation = -1, clientDeadline;
@@ -76,7 +77,9 @@ public final class StationControls {
         this.endpoint=endpoint;active=true;tick();
     }
     public void stop(){active=false;generation++;reading=false;motionBusy=false;clientBusy=false;lastSuccess=0;render();}
+    private void invalidateConnection(){generation++;lastSuccess=0;reading=false;motionBusy=false;clientBusy=false;pendingOperation=-1;}
     public void tick(){
+        if(active&&lastSuccess>0&&!fresh())invalidateConnection();
         render();
         if(!active||reading||SystemClock.elapsedRealtime()-lastPollAttempt<1200)return;
         reading=true;lastPollAttempt=SystemClock.elapsedRealtime();
@@ -99,11 +102,15 @@ public final class StationControls {
                     }
                     render();
                 });
-            }catch(Exception e){ui.post(()->{if(gen==generation){reading=false;lastSuccess=0;render();}});}
+            }catch(Exception e){
+                // Revoke queued work before the executor advances, even if the UI is busy.
+                failedGeneration=gen;
+                ui.post(()->{if(gen==generation){invalidateConnection();render();}});
+            }
         });
     }
     private JSONObject servo(){JSONObject s=track.optJSONObject("servo");return s==null?new JSONObject():s;}
-    private boolean fresh(){return active&&lastSuccess>0&&SystemClock.elapsedRealtime()-lastSuccess<5000;}
+    private boolean fresh(){return active&&generation!=failedGeneration&&lastSuccess>0&&SystemClock.elapsedRealtime()-lastSuccess<5000;}
     private boolean readyForMotion(){return fresh()&&!motionBusy&&servo().optBoolean("output_ready")&&!servo().optBoolean("motion_fault");}
     private void render(){
         boolean fresh=fresh();JSONObject servo=servo();boolean gps="gps".equals(servo.optString("mode"));
@@ -163,9 +170,9 @@ public final class StationControls {
         executor.execute(()->{
             String failure=null;
             try{
-                if(!active||!lease.valid(SystemClock.elapsedRealtime(),generation,snapshot.optLong("control_boot_id",-1),snapshot.optLong("control_epoch",-1)))throw new IOException("操作已過期，請重試");
+                if(!fresh()||!lease.valid(SystemClock.elapsedRealtime(),generation,snapshot.optLong("control_boot_id",-1),snapshot.optLong("control_epoch",-1)))throw new IOException("操作已過期，請重試");
                 JSONObject t=exchange.request(base+"/api/track",null);JSONObject s=t.getJSONObject("servo");
-                if(!active||!lease.valid(SystemClock.elapsedRealtime(),generation,s.getLong("control_boot_id"),s.getLong("control_epoch")))throw new IOException("狀態已改變，請重新操作");
+                if(!fresh()||!lease.valid(SystemClock.elapsedRealtime(),generation,s.getLong("control_boot_id"),s.getLong("control_epoch")))throw new IOException("狀態已改變，請重新操作");
                 String query=path+(path.contains("?")?"&":"?")+"epoch="+s.getLong("control_epoch")+"&seq="+ControlLease.nextSequence(s.getLong("command_seq"))+"&stamp="+s.getLong("clock_ms");
                 exchange.request(base+query,"");
             }catch(Exception e){failure=e.getMessage();}
@@ -180,9 +187,9 @@ public final class StationControls {
         clientBusy=true;pendingOperation=-1;clientDeadline=SystemClock.elapsedRealtime()+65000;render();
         executor.execute(()->{
             try{
-                if(!active||gen!=generation||SystemClock.elapsedRealtime()>=deadline)throw new IOException("操作已過期");
+                if(!fresh()||gen!=generation||SystemClock.elapsedRealtime()>=deadline)throw new IOException("操作已過期");
                 JSONObject c=exchange.request(base+"/api/client/control",null);
-                if(!active||gen!=generation||SystemClock.elapsedRealtime()>=deadline||!c.optBoolean("can_control")
+                if(!fresh()||gen!=generation||SystemClock.elapsedRealtime()>=deadline||!c.optBoolean("can_control")
                         ||c.optLong("station_boot_id",-1)!=boot||c.optLong("boot_id",-1)!=clientBoot||c.optLong("client_id",-1)!=id)throw new IOException("追蹤器狀態已變更");
                 JSONObject accepted=exchange.request(base+"/api/client/control?action="+action,"");
                 ui.post(()->{if(gen!=generation)return;control=accepted;pendingStationBoot=accepted.optLong("station_boot_id",-1);pendingOperation=accepted.optLong("operation_id",-1);lastPollAttempt=0;render();});

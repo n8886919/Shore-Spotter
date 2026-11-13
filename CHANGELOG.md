@@ -11,6 +11,14 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 Android 0.2 健檢修正（待安裝）**：保留 GPS-only，poll 失敗先在 worker 封鎖同世代操作，
+  UI 再撤銷世代與 busy；5 秒 freshness 過期及送出前／GET 後均檢查，舊世代失敗不影響新連線。
+  保留 boot／epoch／seq／2 秒期限與 POST 不重送。錄影在背景完成保存後，回前景恢復錄影鍵；
+  仍在保存、相機未就緒或已出錯時保持停用。App versionCode=2／versionName=0.2。
+  新增 `tools/test_android_lifecycle.py`，實際方法的兩個舊碼失敗案例修正後通過，並測 callback 順序／重連／過期；
+  自動納入主機回歸，需 JDK 17+。5 個 JUnit、assembleDebug、lint（0 errors／26 warnings）、16 KB／zipalign 通過。
+  APK SHA-256 `9f5cb1f551452739ce3e21d02869f9cdfff64885a47f1ddae6e822919b2d8681`，尚未安裝／真機／外測；產物位置見交接入口。
+
 - **2026-11-14 Station 記錄來源與 T096 DATA 修正**：SD／Axiom 的板載 GNSS freshness 改由自身 fix／arrival age 決定，
   schema 2／3 追加 `station_position` 保存實際選用岸端 source、valid、座標、接收年齡與手機 timestamp／accuracy；
   保留既有欄位及手機位置保留規則，不改追蹤／Servo。固定 Sample 主機大小 1200→1240 bytes，無新 worker／動態配置。

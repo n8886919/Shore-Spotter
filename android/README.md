@@ -1,6 +1,6 @@
 # Shore Spotter Android
 
-Pixel 10 的橫向滿版相機、原生追蹤控制與手機定位 App。App 版本與韌體版本分開管理。
+Pixel 10 的橫向滿版相機、原生追蹤控制與手機定位 App。App 版本與韌體版本分開管理。目前待安裝版本為 **0.2（versionCode 2）**。
 
 ## 海邊使用
 
@@ -23,7 +23,7 @@ Surfer 使用 Heltec T096，App 不呈現不存在的 SD 卡。
 右上角 Android 綠點表示相機正在使用，預覽也會亮，不代表已開始錄影。
 
 影片不收音，存至相簿的 `Movies/ShoreSpotter`。不申請麥克風、背景定位或全部檔案權限。
-App 前景保持亮屏；離開 App 或鎖屏會停止定位並結束保存錄影，第一版不提供鎖屏錄影。
+App 前景保持亮屏；離開 App 或鎖屏會停止定位並結束保存錄影，第一版不提供鎖屏錄影。保存已在背景完成時，回前景可重新開始錄影；仍在保存或相機不可用時保持停用。
 滿版預覽中央填滿，邊緣會隨螢幕比例裁切；輸出影片使用所選標準解析度。
 **錄影暫停與 GPS 追蹤相互獨立**，暫停影片不會停止追蹤器或偷偷切換舵機模式。
 使用 App 時忽略手機內建音量加減／靜音鍵（含 App 對話框），不調音量、不當錄影鍵；離開 App 後恢復系統行為。
@@ -59,13 +59,21 @@ Android 回報的精度半徑不是實測誤差；GPS 信號不足時等待衛�
 App 背景化會停止定位、撤銷舊世代並結束保存錄影；Station 仍保留最後手機 snapshot 至重開機。
 
 HTTP 由單一 executor 序列化，連線／讀取各有 2 秒期限，回應上限 64 KiB。控制只由手勢產生，捕捉 2 秒意圖期限、boot／epoch；執行時 GET 新上下文，核對同世代後送 seq+1／stamp。
-失聯、重啟或換世代撤銷舊意圖，POST 不重送；Surfer HTTP 202 僅受理，繼續核對 Station boot＋operation ID 的 confirmed／error／timeout。
+poll 失敗或狀態逾 5 秒會撤銷尚未送出的舊意圖；worker 偵測失敗後即封鎖同世代操作，不等 UI 回呼，舊世代失敗不影響新連線。重啟或換世代同樣撤銷舊意圖，POST 不重送；Surfer HTTP 202 僅受理，繼續核對 Station boot＋operation ID 的 confirmed／error／timeout。
 UART 或命令角度沒有實體回授；只看 API 成功不算舵機驗收。
 
-11/14 GPS-only：JUnit 三組共 5 案例、assembleDebug、4 個 64 位元 JNI 的 16 KB ELF／APK 對齊及 zipalign 通過；lint 0 errors／26 warnings。
+11/14 先前 0.1 GPS-only 基準：JUnit 三組共 5 案例、assembleDebug、4 個 64 位元 JNI 的 16 KB ELF／APK 對齊及 zipalign 通過；lint 0 errors／26 warnings。
 APK SHA-256 `7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`；尚未安裝或外測，不需重燒 Station／Client。
 
 ## Agent 操作
 
 使用專案內的 [$shore-spotter-android](../.agents/skills/shore-spotter-android/SKILL.md)；沿用 Mobile MCP／ADB，不另開專用遠控服務。
 包含只讀裝置／Station 檢查工具、App 前景截圖檢查與真機驗收流程。Skill 不會縮小 ADB 本身的整機權限，agent 必須遵守日常手機與硬體操作範圍。
+
+### 0.2 待安裝驗證
+
+0.2 保留 GPS-only，修正背景錄影保存後回前景無法重新錄影，以及失聯後已排隊的舵機／Surfer 操作未撤銷。
+`python3 tools/test_android_lifecycle.py`（專案根目錄）抽取實際 Java 方法，模擬 executor／UI 回呼順序；由 `tools/verify_project.py` 自動納入。需要 JDK 17+（優先 `JAVA_HOME`／PATH，亦可使用既有 Android Studio JBR），不連手機或 Station。
+覆蓋背景／前景 Finalize、仍在保存、相機不可用，以及 poll 失敗後 UI 回呼前後撤銷、freshness 期限、舊世代失敗、重連新手勢、boot／epoch／2 秒期限。這是主機回歸，不能替代 CameraX、實際 Wi-Fi、GPS／戶外與機械驗收；新 APK 尚未安裝。
+
+0.2 主機檢查：上述 integration 回歸、5 個 JUnit、assembleDebug 通過，lint 0 errors／26 warnings；4 個 64 位元 JNI 的 16 KB ELF／APK 對齊及 zipalign 通過。APK SHA-256 `9f5cb1f551452739ce3e21d02869f9cdfff64885a47f1ddae6e822919b2d8681`；產物與明日驗收步驟見 [交接入口](../docs/assistant-handoff.md)。
