@@ -1,11 +1,14 @@
 ## DOCS
-- `docs/health-check-2026-10-16.md` — 目前 WIP 深度健檢、建置重現性修正與 E91C／F035 更新驗證
+- `docs/indoor-acceptance-handoff-2026-10-28.md` — 本輪室內驗收、BLE 重連延遲、三項未實作介面需求與下一 session 接續入口
+- `docs/t096-maintenance-2026-10-28.md` — T096 USER 短按 60 秒／兩頁診斷、5 秒放開 ACT／SLP（UI=8 FB27 已部署）、RST 重啟與換 Station；本輪驗證／部署紀錄
+- `docs/ble-control-2026-10-27.md` / `docs/openapi-client-control.json` — 1.0 BLE 待機、每次開機固定 owner、手動 CAD 選頻／LoRa 驗證後保存與 Wi-Fi App API；2026-10-28 已部署 584C／FB27，完整驗收界線見文件
+- `docs/health-check-2026-10-16.md` — 10/16 歷史 WIP 健檢、建置重現性修正與 E91C／F035 更新驗證
 - `include/sdk_log.h` / `src/sdk_log.cpp` / `tools/test_sdk_log.py` — ESP-IDF task log 固定佇列，主迴圈 LogTee 與 SD／DIAG USB 匯出隔離
 - `docs/servo-controller-youmi-2026-10-10.md` — 已指定 Youmi 35 kg＋9600 baud 雙路串口控制板；現行 M0 固定、9600 baud TX43 單向輸出、359°／中位179.5；舊外部 UART 輸入移除
 - `demo/info-page/` — 2026-10-10 資訊頁獨立 mock demo，無實機請求、不燒錄；手機權限延後、不加複製摘要
-- `docs/assistant-handoff.md` — 其他助手交接入口、最新 WIP 位置、現行行為與驗證界線（2026-10-10）
+- `docs/assistant-handoff.md` — 其他助手交接入口、最新 WIP 位置、現行 1.0／UI=6 行為與驗證界線（2026-10-28）
 - `docs/t096-field-validation-2026-10-10.md` — 帶殼內建 GNSS 外測、手機對照、DATA／速度／RF 證據與外接天線未決項目
-- `docs/t096-rtc-standby-2026-10-09.md` — T096 Ready 保留 RAM 的 RTC 待機、30 秒時序、TX 喚醒修正與實機驗證
+- `docs/t096-rtc-standby-2026-10-09.md` — 歷史 Ready RTC／30 秒 LoRa 時序與 TX 喚醒驗證；現行 Ready 已改 BLE
 - `docs/t096-controls-2026-10-05.md` / `docs/t096-power-validation-2026-10-08.md` — 顯示／電源歷史驗證；舊 SystemOFF 流程已由 RTC 待機取代
 - `docs/sf9-field-pair-2026-10-07.md` / `docs/lilygo-station-2026-10-06.md` — B 組 SF9 與 LilyGO Station／SD 部署
 - `include/firmware_version.h` — Client／Station 共用版本號唯一來源；發版時同步 `CHANGELOG.md`
@@ -56,7 +59,7 @@
 - `tools/test_motion_ui.js` — 資訊頁速度自動保存、GPS 選取門檻與完整頁面模擬
 - `tools/test_packet_backend.py` — 實際封包建立／解析與 GNSS 主機整合
 - `tools/test_debug_backend.py` / `tools/test_debug_ui.js` — 實際診斷 JSON／log cursor 與網頁錄製匯出
-- `docs/health-check-2026-09-08.md` — 最新驗證狀態、歷史測試與尚未處理的問題
+- `docs/health-check-2026-09-08.md` — 9/8 歷史驗證狀態與當時未處理問題
 
 ## RULES:
 + 網頁修改先讀 `docs/web-ui-design.md`；使用者最新明確指示優先，只改已授權範圍，並同步規格與驗證紀錄。不得因美化／重構自行重排控制、恢復已移除功能或改變追蹤／Servo 行為。
@@ -70,6 +73,12 @@
 - 清楚區分已知事實、推測、主機測試、實機與外測結果。資料不足就指出缺口，不把設定寫入、成功 build 或接收封包當成精度與穩定性的證明。
 - 現階段優先簡單、穩定、方便 debug，讓問題可見並學習原因。保留原始資料與失敗原因，避免靜默降級、掩蓋異常，或為低機率情況堆疊複雜狀態機；耗電優化後置。
 - 已確認的工作自主完成並驗證；新發現若需要改變尚未確認的產品行為，先提出取捨，不以假設安全或可靠為理由自行擴大範圍。
+
+## 協作原則：適度節省 token
+- 在正確性、可維護性與必要驗證不打折的前提下，減少不必要的上下文、重複探索與冗長輸出；不為省 token 省略關鍵證據、風險或未完成事項。
+- 由 agent 依任務複雜度、風險、所需上下文、可驗證性與預期總成本，自主選擇可用模型、推理強度及是否使用 subagent，不固定指定某個模型。範圍明確、可獨立驗證的工作可交給合適的 subagent；主 agent 負責介面與行為決策、審查、整合及必要驗證。涉及跨模組狀態、時序、硬體或燒錄風險時，優先確保推理與驗證能力；若較小模型反覆失敗，應調整分工或升級模型，避免無效重試。
+- 派工只提供必要背景、檔案與驗收條件，避免複製整段對話或整個專案；各 agent 分工與檔案範圍要清楚，避免重複探索或互相覆寫。短小、相依性高的工作由主 agent 直接完成，不為派工而派工。
+- 以完成任務的整體 token、時間與返工成本判斷是否值得分工，不只比較單次模型成本；subagent 也消耗 token，不承諾總 token、費用或帳號額度必然下降。模型能力與可用性以當前工具為準，遇到限制時如實說明，不宣稱已使用實際未啟用的模型。
 
 ## 外測診斷
 - `docs/field-diagnostic.md` — 無筆電外測流程、內建 Flash 邊界、UTC／原始資料與 USB 匯出。

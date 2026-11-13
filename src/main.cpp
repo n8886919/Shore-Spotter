@@ -35,6 +35,7 @@
 #include "station_flash.h"
 #include "rf_reception.h"
 #include "t096_power.h"
+#include "mcu_temperature.h"
 #if defined(FIELD_DIAGNOSTIC)
 #include "field_diagnostic.h"
 #endif
@@ -98,7 +99,11 @@ constexpr int LORA_BUSY = station_board::kLoraBusy;
 // Fixed A/B P2P frequencies; the frequency alone does not establish RF compliance.
 constexpr float RF_FREQUENCY = radio_profile::frequencyMhz;
 constexpr float RF_BW = radio_profile::bandwidthKhz;
+#if defined(ROLE_STATION)
+constexpr int RF_SF = 9;
+#else
 constexpr int RF_SF = radio_profile::spreadingFactor;
+#endif
 // SF10 trades airtime for sensitivity. DATA fits a 500 ms slot; low-rate
 // diagnostics use dedicated slots interleaved with DATA. Both roles must match.
 // Coding rate 4/5; v5 uplink codecs are shared by both roles.
@@ -436,6 +441,7 @@ struct ClientState {
   int humidityBaselinePct = -1;
 };
 static ClientState gpsClient;
+static mcu_temperature::Received clientMcuTemperature;
 static rf_reception::Latest rfReception;
 // Existing formatters use aliases to the one active record.
 static DecodedData &lastData = gpsClient.position;
@@ -1312,6 +1318,9 @@ static bool recoverRadio() {
 
   if (!initRadio()) {
     Log.println(F("[LoRa] ERROR: re-init failed; will retry"));
+#if defined(ROLE_STATION)
+    station_extensions::activeChannel=-1;station_extensions::verified=false;runtime_radio_profile::set(0,9);station_extensions::logRf("recover failed",0);
+#endif
     return false;
   }
 #if defined(ROLE_CLIENT)
@@ -1324,6 +1333,12 @@ static bool recoverRadio() {
 #else
   radio.setDio1Action(onLoRaDio1);
   stationRadioIrq = false;
+  if (radio.setFrequency(ble_control::frequencyMhz(station_extensions::desiredChannel)) != RADIOLIB_ERR_NONE) {
+    station_extensions::activeChannel = -1;station_extensions::verified = false;runtime_radio_profile::set(0,9);station_extensions::logRf("recover failed",0);return false;
+  }
+  station_extensions::activeChannel=station_extensions::desiredChannel;
+  runtime_radio_profile::set(ble_control::frequencyMhz(station_extensions::activeChannel),9);
+  station_extensions::logRf("recover",ble_control::frequencyMhz(station_extensions::activeChannel));
   if (radio.startReceive() != RADIOLIB_ERR_NONE) {
     Log.println(F("[LoRa] ERROR: RX restart failed after re-init"));
     return false;
@@ -1509,10 +1524,15 @@ static void recordPacketEvent(packet_diagnostics::Kind kind, uint32_t ms,
 
 static void serviceStationRadio() {
   station_extensions::serviceRadio();
-  if (station_extensions::txActive) return;
+  if (station_extensions::txActive || station_extensions::scanning) return;
   MeasureDuration timing(loraDuration);
   if (!stationRxReady &&
       loop_metrics::due(millis(), nextStationRxRetryMs)) {
+    if (station_extensions::activeChannel < 0) {
+      stationRxReady = recoverRadio();
+      nextStationRxRetryMs = millis() + 100;
+      return;
+    }
     stationRadioIrq = false;
     const int16_t status = radio.startReceive();
     stationRxReady = status == RADIOLIB_ERR_NONE;
@@ -1558,12 +1578,16 @@ static void enterManual() {
 
 static bool setGpsClientBinding(uint16_t id) {
   if (id != 0 && !client_binding::validId(id)) return false;
-  if (prefs.putUShort("gpsclient", id) != sizeof(uint16_t)) return false;
+  if (id != gpsClientId && (station_extensions::link.pending() || station_extensions::scanning || station_extensions::txActive)) return false;
   if (id == gpsClientId) return true;
+  if (!station_ble::tryBindingLock()) return false;
+  if (prefs.putUShort("gpsclient", id) != sizeof(uint16_t)) { station_ble::unlockBinding(); return false; }
   enterManual();
   gpsClientId = id;
   station_extensions::resetClient();
+  station_ble::unlockBinding();
   gpsClient = ClientState{};
+  clientMcuTemperature = mcu_temperature::Received{};
   rfReception = rf_reception::Latest{};
   gpsSequence = command_freshness::RadioSequence{};
   haveClientDiagnostic = false;
@@ -1879,7 +1903,7 @@ static void renderStationDisplay() {
   }
   drawLeft(19, buf);
   if (selectedTelemetry && lastTelemetry.tempC != INT8_MIN &&
-      lastTelemetry.humidityPct != 0xFF) {
+      lastTelemetry.humidityPct <= 100) {
     snprintf(buf, sizeof(buf), "%dC/%u%%", (int)lastTelemetry.tempC,
              lastTelemetry.humidityPct);
   } else {
@@ -2066,8 +2090,8 @@ static String buildTrackJson() {
   js.reserve(900);
   js += F("{\"board\":\""); js += station_board::deviceBoard();
   js += F("\",\"hostname\":\""); js += stationHostname;
-  js += F("\",\"rf_group\":"); js += String(radio_profile::group);
-  js += F(",\"frequency_mhz\":"); js += String(RF_FREQUENCY, 1);
+  js += F("\",\"rf_group\":"); js += station_extensions::activeChannel>=0 ? String(station_extensions::activeChannel) : F("null");
+  js += F(",\"frequency_mhz\":"); js += station_extensions::activeChannel>=0 ? String(ble_control::frequencyMhz(station_extensions::activeChannel),1) : F("null");
   js += F(",\"linked\":");
   js += linked ? F("true") : F("false");
   js += F(",\"data_fresh\":"); js += linked ? F("true") : F("false");
@@ -2137,13 +2161,23 @@ static String buildTrackJson() {
   js += F("},\"telemetry\":{\"batt_mv\":");
   js += String(boundClientBatteryMv());
   js += F(",\"temp_c\":");
-  if (haveTelemetry && lastTelemetry.tempC != INT8_MIN) {
+  if (haveTelemetry && lastTelemetry.humidityPct != protocol::kMcuTemperatureMarker && lastTelemetry.tempC != INT8_MIN) {
     js += String((int)lastTelemetry.tempC);
   } else {
     js += F("null");
   }
+  js += F(",\"temp_kind\":");
+  js += !haveTelemetry ? F("null") : lastTelemetry.humidityPct==protocol::kMcuTemperatureMarker ? F("\"mcu\"") : F("\"environment\"");
+  js += F(",\"mcu_temp_c\":");
+  js += clientMcuTemperature.fresh(millis()) ? String(int(clientMcuTemperature.current)) : F("null");
+  js += F(",\"mcu_temp_max_received_c\":");
+  js += clientMcuTemperature.haveMaximum ? String(int(clientMcuTemperature.maximum)) : F("null");
+  js += F(",\"mcu_temp_rx_age_ms\":");
+  js += clientMcuTemperature.have ? String(uint32_t(millis()-clientMcuTemperature.rxMs)) : F("null");
+  js += F(",\"mcu_temp_sample_interval_ms\":30000,\"mcu_temp_fresh\":");
+  js += clientMcuTemperature.fresh(millis()) ? F("true") : F("false");
   js += F(",\"humidity_pct\":");
-  js += (haveTelemetry && lastTelemetry.humidityPct != 0xFF)
+  js += (haveTelemetry && lastTelemetry.humidityPct <= 100)
             ? String(lastTelemetry.humidityPct)
             : F("null");
   js += F(",\"last_rx_sec\":");
@@ -2202,6 +2236,13 @@ static void appendAlertsJson(String &js) {
     n++;
   };
 
+  // SD failures belong in the shared alert drawer. Intentional USB STOP and
+  // boards without SD are not hardware failures; raw cause stays in /api/sd/status.
+  if (strcmp(sd_log::stateName(), "error") == 0) {
+    add(alerts::WARN, "station_sd", "Station SD 記錄異常",
+        "本次記錄可能不完整。請檢查 SD 卡；詳細原因可由診斷紀錄查詢。");
+  }
+
   // --- 下水端：連線 -------------------------------------------------------
   if (stationAverage.warning()) {
     add(alerts::WARN, "station_scatter", "岸端 GPS 座標散布偏大",
@@ -2233,7 +2274,7 @@ static void appendAlertsJson(String &js) {
 
   // --- 下水端：遙測（電量 / 溫濕度，每 30 秒一筆）------------------------
   if (haveTelemetry) {
-    int hum = (lastTelemetry.humidityPct != 0xFF) ? (int)lastTelemetry.humidityPct : -1;
+    int hum = (lastTelemetry.humidityPct <= 100) ? (int)lastTelemetry.humidityPct : -1;
     alerts::Level hl = alerts::humidityLevel(hum, clientHumBaselinePct);
     if (hl == alerts::ERROR) {
       add(hl, "client_water", "追蹤器可能已經進水",
@@ -2245,7 +2286,7 @@ static void appendAlertsJson(String &js) {
           (hum - clientHumBaselinePct) + " 個百分點，可能正在慢慢滲水。建議上岸檢查防水圈。");
     }
 
-    if (lastTelemetry.tempC != INT8_MIN) {
+    if (lastTelemetry.humidityPct != protocol::kMcuTemperatureMarker && lastTelemetry.tempC != INT8_MIN) {
       int t = lastTelemetry.tempC;
       alerts::Level tl = alerts::temperatureLevel(t, true);
       if (tl == alerts::ERROR) {
@@ -2528,7 +2569,7 @@ static String buildDebugJson(const packet_diagnostics::Selection &selection) {
          "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"protocol_version\":");
   js += String(PROTO_VERSION); js += F(",\"boot_id\":");
   js += String(controlBootId); js += F(",\"clock_ms\":"); js += String(now);
-  js += F(",\"config\":{\"rf_frequency_mhz\":"); js += String(RF_FREQUENCY, 3);
+  js += F(",\"config\":{\"rf_frequency_mhz\":"); js += station_extensions::activeChannel>=0 ? String(ble_control::frequencyMhz(station_extensions::activeChannel),3) : F("null");
   js += F(",\"bw_khz\":"); js += String(RF_BW, 1);
   js += F(",\"sf\":"); js += String(RF_SF); js += F(",\"cr\":"); js += String(RF_CR);
   js += F(",\"data_bytes\":"); js += String(DATA_PACKET_LEN);
@@ -2896,6 +2937,10 @@ static void initWebServer() {
       httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"unknown action\"}");
       return;
     }
+    if (nextId != gpsClientId && (station_extensions::link.pending() || station_extensions::scanning || station_extensions::txActive)) {
+      httpServer.send(409, "application/json", "{\"ok\":false,\"error\":\"operation_busy\"}");
+      return;
+    }
     if (!setGpsClientBinding(nextId)) {
       httpServer.send(503, "application/json",
                       "{\"ok\":false,\"error\":\"client binding could not be saved\"}");
@@ -2903,7 +2948,7 @@ static void initWebServer() {
     }
     httpServer.send(200, "application/json", buildWhitelistJson());
   });
-  // Record a replaceable RAM reference only at the settled 90-degree command.
+  // Record a RAM reference after software centering or operator-confirmed physical centering.
   httpServer.on("/api/track/calibrate", HTTP_POST, []() {
     if (!acceptMotionRequest()) return;
     float bearing = 0.0f;
@@ -2912,18 +2957,35 @@ static void initWebServer() {
                       "{\"ok\":false,\"error\":\"bearing must be 0 <= degrees < 360\"}");
       return;
     }
-    if (!compassCalibrationReady()) {
-      httpServer.send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"請先鏡頭置中並等鏡頭停穩，再按校正\"}");
+    const bool physicalCenter = httpServer.hasArg("physical_center") && httpServer.arg("physical_center") == "1";
+    if (httpServer.hasArg("physical_center") && !physicalCenter) {
+      httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"physical_center must be 1\"}");
       return;
     }
-    lockMountOffset(bearing, servoAngleDeg);
+    const bool settledManual = trackMode == TrackMode::Manual && servoOutputReady &&
+        !servoMotion.faulted() && !servoMotion.moving() &&
+        fabs(servoMotion.position() - servoAngleDeg) < 0.001;
+    if (physicalCenter ? !settledManual : !compassCalibrationReady()) {
+      httpServer.send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"請先切手動、置中並等鏡頭停穩，再按校正\"}");
+      return;
+    }
+    const float referenceAngle = physicalCenter ? 179.5f : servoAngleDeg;
+    if (physicalCenter) {
+      // The button has no feedback. This is the operator's confirmation, not a
+      // measurement. Invalidate old commands and synchronize the limiter; the
+      // next control service sends the same home pulse to the controller.
+      enterManual();
+      servoMotion.initializeUs(referenceAngle, micros());
+      servoTargetDeg = referenceAngle;
+    }
+    lockMountOffset(bearing, referenceAngle);
     String js = F("{\"ok\":true,\"method\":\"compass\",\"bearing\":");
     js += String(bearing, 2);
     js += F(",\"mount_offset_deg\":");
     js += String(mountOffsetDeg, 2);
     js += F(",\"servo_angle\":");
-    js += String(servoAngleDeg, 1);
+    js += String(referenceAngle, 1);
     js += '}';
     Log.println(F("[TRACK] camera compass calibration set in RAM"));
     httpServer.send(200, "application/json", js);
@@ -3478,6 +3540,7 @@ static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
       // A new T096 session cannot inherit the old session's fix or diagnostics.
       // Keep cumulative receiver counters; only reset the live source baseline.
       havePkt=haveTelemetry=haveClientDiagnostic=false;
+      clientMcuTemperature=mcu_temperature::Received{};
       gpsSequence=command_freshness::RadioSequence{};
       clientGnssDiagnostic=gnss_diagnostics::Latest{};
       loraDataRate=packet_rate::Window10s{};
@@ -3509,9 +3572,11 @@ static void acceptRadioPacket(const uint8_t *buf, size_t n, uint32_t receivedAtM
     DecodedTelemetry tel{};
     if (!parseTelemetryPacket(buf, n, tel)) { ++rejectedFormat; return reject(Kind::Format); }
     lastTelemetry = tel; haveTelemetry = true; lastTelemetryRxMs = receivedAtMs;
+    if(tel.humidityPct==protocol::kMcuTemperatureMarker) clientMcuTemperature.observe(tel.tempC,receivedAtMs);
+    else clientMcuTemperature=mcu_temperature::Received{};
     rfReception.observe(receivedAtMs, receivedPacketRssi, receivedPacketSnr);
     ++rxTelemetryCount; ++rxWinTelem;
-    if (clientHumBaselinePct < 0 && tel.humidityPct != 255) clientHumBaselinePct = tel.humidityPct;
+    if (clientHumBaselinePct < 0 && tel.humidityPct <= 100) clientHumBaselinePct = tel.humidityPct;
     recordPacketEvent(Kind::Telemetry, receivedAtMs, buf, n);
     return;
   }
@@ -3732,6 +3797,9 @@ void setup() {
   display.drawStr(0, 30, "STATION booting...");
   if (oledOnline) display.sendBuffer();
 
+  loadStationSettings();
+  station_extensions::begin();
+
   // A CPU/USB reset does not remove SD power. Start with a real card power cycle
   // so an interrupted write/format cannot leave the next boot's SPI card busy.
 #if defined(BOARD_HELTEC_V4)
@@ -3763,7 +3831,6 @@ void setup() {
   nextRxSummaryMs = millis() + RX_SUMMARY_MS;
   nextDisplayMs = millis() + DISPLAY_REFRESH_MS;
   Log.println(F("[STATION] mode active: receive position packets"));
-  loadStationSettings();
   Log.print(F("[STATION] GPS client: "));
   if (gpsClientId != 0) Log.println(gpsClientId, HEX);
   else Log.println(F("unbound"));
@@ -3823,10 +3890,12 @@ void setup() {
   initWebServer();
   initArduinoOta();
 
+  // Set the Station runtime channel and start its isolated BLE worker.
+  station_extensions::startBle();
   // Arm non-blocking, interrupt-driven reception.
   radio.setDio1Action(onLoRaDio1);
   stationRadioIrq = false;
-  stationRxReady = radio.startReceive() == RADIOLIB_ERR_NONE;
+  stationRxReady = station_extensions::activeChannel >= 0 && radio.startReceive() == RADIOLIB_ERR_NONE;
   if (!stationRxReady) nextStationRxRetryMs = millis() + 100;
   enterManual();  // boot in Manual; LoRa reception and SD recording remain active
 #endif
@@ -3980,7 +4049,7 @@ void loop() {
   serviceControl();
   // DIO1 drives Station RX completion; HTTP and I2C are measured separately.
   serviceStationRadio();
-  if (stationRxReady && stationRadioIrq) {
+  if (!station_extensions::scanning && stationRxReady && stationRadioIrq) {
     MeasureDuration timing(loraDuration);
     const uint32_t receivedAtMs = stationRadioIrqMs;
     stationRadioIrq = false;

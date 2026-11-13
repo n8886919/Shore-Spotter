@@ -1,0 +1,305 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Shore-Spotter Station Client Control API",
+    "version": "2026-10-28",
+    "description": "1.0 原始碼／api_version=2（BLE 行為沿用 0.7.0-dev；部署與驗收另見維護紀錄）。App 透過 Wi-Fi HTTP 控制 Station；此 API 不代表 App 直接以 BLE 控制 Client。POST 參數放在 URL query，request body 為空。規格版本不是韌體版本；Ready 沒有定期 LoRa STATE 或接收窗口。"
+  },
+  "servers": [
+    {
+      "url": "http://{station}",
+      "variables": {
+        "station": {
+          "default": "192.168.x.x",
+          "description": "替換為目前 Station 的 IP 或 hostname"
+        }
+      }
+    }
+  ],
+  "paths": {
+    "/api/client/control": {
+      "get": {
+        "operationId": "getClientControlState",
+        "summary": "讀取最新 Client 狀態與最近一次控制操作",
+        "description": "每次呼叫都回傳目前快照。supported 表示有新鮮狀態，不等於 can_control；BLE 優先，須仍連線且最近 boot／uptime 前進未滿 3000 ms，重讀同一 uptime 不延長期限。否則可顯示接收未滿 90000 ms 的 LoRa STATE，但已知其他 owner 時不沿用。state_source=none 時 supported=false、state=unknown、boot_id/age_ms/battery_mv/charging=null。Ready 沒有 30 秒 LoRa 輪詢；缺少狀態不代表關機。Station 只保留最近操作；App 以 station_boot_id + operation_id 比對 POST 結果，Station 重啟後重新計數。Start 必須有匹配的 LoRa STATE 並驗證實際 RF 頻道才 confirmed。",
+        "responses": {
+          "200": {
+            "description": "目前控制與 Client 狀態快照。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ClientControl"},
+                "examples": {
+                  "ready": {"value": {"api_version": 2, "state_source": "ble", "can_control": true, "station_boot_id": 123456, "operation_id": 8, "ble": {"state": "connected", "connected": true, "claimed": true, "owner_station_id": 22604, "last_error": ""}, "supported": true, "client_id": 64295, "boot_id": 234567, "state": "ready", "age_ms": 250, "battery_mv": 4010, "charging": false, "command": "idle", "command_id": 7, "tx_packets": 40, "test_received": 0, "test_missing": 0, "test_rssi": null, "test_snr": null, "test_max_gap_ms": 0, "last_error": 0, "rf_group": 1, "frequency_mhz": 923.8, "storage_after_hours": 0, "ready_poll_ms": 0, "ble_advertising_ms": 10000}},
+                  "pending": {"value": {"api_version": 2, "state_source": "ble", "can_control": false, "station_boot_id": 123456, "operation_id": 9, "ble": {"state": "connected", "connected": true, "claimed": true, "owner_station_id": 22604, "last_error": ""}, "supported": true, "client_id": 64295, "boot_id": 234567, "state": "ready", "age_ms": 300, "battery_mv": 4010, "charging": false, "command": "pending", "command_id": 8, "tx_packets": 40, "test_received": 0, "test_missing": 0, "test_rssi": null, "test_snr": null, "test_max_gap_ms": 0, "last_error": 0, "rf_group": 1, "frequency_mhz": 923.8, "storage_after_hours": 0, "ready_poll_ms": 0, "ble_advertising_ms": 10000}}
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "requestClientControl",
+        "summary": "要求 Client 開始追蹤、停止或執行測試",
+        "description": "參數以 URL query 傳送，request body 必須為空。HTTP 202 只表示 Station 接受並排入操作；App 後續 GET 最新快照，以 station_boot_id + operation_id 確認操作仍是最近一次，再等待 command 從 pending 轉成 confirmed、error 或 timeout。這不是冪等提交；重送可能建立另一個操作。Start 只有在收到相符 Client LoRa STATE 並驗證實際頻道後才會 confirmed。Legacy action=store 目前等同 stop。 Ready 使用已認領的 BLE；BLE 不可用時，只能使用新鮮且 boot/command/owner 相符的 Tracking/Test LoRa STATE。can_control 是一般控制可用條件；Start/Test 在活躍狀態仍須符合選定頻道限制，伺服器會再次檢查。命令期限為 65000 ms；停止或測試可由匹配 BLE/LoRa 狀態確認，Start 必須有 LoRa 證據。",
+        "parameters": [
+          {"name": "action", "in": "query", "required": true, "schema": {"type": "string", "enum": ["start", "stop", "test", "store"]}, "description": "控制動作；store 為相容舊 API 的 stop 別名。"}
+        ],
+        "responses": {
+          "202": {
+            "description": "操作已接受；回傳當下 control 快照，通常 command=pending。必須再 GET 確認結果。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ClientControl"}
+              }
+            }
+          },
+          "400": {
+            "description": "未知 action。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ApiError"}
+              }
+            }
+          },
+          "409": {
+            "description": "目前傳輸、owner、命令或頻道狀態不允許操作；例如沒有新鮮認領的 BLE／相符活躍 LoRa STATE、命令 pending、掃描／TX 進行中，或 Start/Test 的選定頻道與活躍頻道不符。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ApiError"}
+              }
+            }
+          },
+          "503": {
+            "description": "Station 頻率設定、接收啟動或 BLE worker 排入失敗。回應 body 是 control 快照物件，不是 {ok:false,error:string}；檢查 command 與 last_error。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ClientControl"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/client/radio": {
+      "get": {
+        "operationId": "getClientRadioState",
+        "summary": "讀取 Station 對 Client RF 頻道的選擇與掃描狀態",
+        "responses": {
+          "200": {
+            "description": "兩個候選頻道的掃描計數與目前選擇。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ClientRadio"}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "updateClientRadio",
+        "summary": "掃描候選頻道或選擇 RF 頻道",
+        "description": "參數以 URL query 傳送，request body 必須為空。scan/選頻都要求新鮮 BLE 狀態、Client 已由本 Station claim、Client 為 Ready、RF 接收可用，且沒有 pending 命令、掃描或 TX。掃描跨兩個候選頻道執行；accepted 不代表掃描已完成，後續 GET 讀取 scan_state。選擇頻道只更新待選值；Start 成功並經 Client LoRa STATE 驗證後才會保存頻道。",
+        "parameters": [
+          {"name": "action", "in": "query", "required": true, "schema": {"type": "string", "enum": ["scan", "select"]}},
+          {"name": "channel", "in": "query", "required": false, "description": "select 必填；0=A 923.2 MHz，1=B 923.8 MHz。scan 忽略。", "schema": {"type": "string", "enum": ["0", "1"]}}
+        ],
+        "responses": {
+          "200": {
+            "description": "select 已接受，回傳更新後 radio 快照。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ClientRadio"}
+              }
+            }
+          },
+          "202": {
+            "description": "scan 已啟動；回傳 scan_state=scanning 的快照。使用 GET 查詢完成或錯誤狀態。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ClientRadio"}
+              }
+            }
+          },
+          "400": {
+            "description": "未知 action 或 channel 不是精確字串 0/1。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ApiError"}
+              }
+            }
+          },
+          "409": {
+            "description": "Client 未 Ready/claim、接收不可用，或有其他操作進行中。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ApiError"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/whitelist": {
+      "get": {
+        "operationId": "getClientBinding",
+        "summary": "讀取 Station 保存的單一 Client 綁定",
+        "responses": {
+          "200": {"$ref": "#/components/responses/BindingSaved"}
+        }
+      },
+      "post": {
+        "operationId": "updateClientBinding",
+        "summary": "指定、替換或解除單一 Client 綁定",
+        "description": "參數以 URL query 傳送，request body 必須為空。set 替換唯一 ID；clear 解除。實際變更成功保存於 NVS，回手動並清空舊 Client 狀態，Station 自動搜尋新目標。同 ID 重送為 no-op，不重置狀態也不重寫 NVS。200 僅表示設定已儲存，不表示 Client 在線、已認領或收到命令。逾時先 GET 核對結果。add/remove 保留舊相容操作；remove 不同 ID 不改綁定。改綁不解除 Client 本次開機的 owner。",
+        "parameters": [
+          {"name": "action", "in": "query", "required": true, "schema": {"type": "string", "enum": ["set", "clear", "add", "remove"]}},
+          {"name": "id", "in": "query", "required": false, "description": "set/add/remove 必填；clear 忽略。十六進位，不加 0x 或空白。0000、0010、FFFF（含短碼及大小寫變形）不可用。", "schema": {"type": "string", "pattern": "^[0-9A-Fa-f]{1,4}$", "minLength": 1, "maxLength": 4}, "example": "FB27"}
+        ],
+        "responses": {
+          "200": {"$ref": "#/components/responses/BindingSaved"},
+          "400": {
+            "description": "action 或 ID 非法／保留值；不改綁定。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/BindingError"}
+              }
+            }
+          },
+          "409": {
+            "description": "add 不同的第二個 Client 被拒；替換用 set。實際改綁／解除遇到命令 pending、掃描或 TX 進行中回 operation_busy；同 ID no-op 不受此限制。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/BindingError"}
+              }
+            }
+          },
+          "503": {
+            "description": "實際改綁／解除時 BLE 寫入鎖忙碌或 NVS 保存失敗；原綁定與 Client RAM 狀態不變。",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/BindingError"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "BindingSaved": {
+        "description": "目前已保存的綁定；不表示 Client 在線。",
+        "content": {
+          "application/json": {
+            "schema": {"$ref": "#/components/schemas/ClientBinding"},
+            "examples": {
+              "bound": {"value": {"whitelist": ["FB27"], "count": 1, "capacity": 1}},
+              "unbound": {"value": {"whitelist": [], "count": 0, "capacity": 1}}
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {"type": "string"}
+        }
+      },
+      "BindingError": {
+        "type": "object",
+        "required": ["ok", "error"],
+        "properties": {
+          "ok": {"type": "boolean", "enum": [false]},
+          "error": {"type": "string"}
+        }
+      },
+      "ClientBinding": {
+        "type": "object",
+        "required": ["whitelist", "count", "capacity"],
+        "properties": {
+          "whitelist": {"type": "array", "minItems": 0, "maxItems": 1, "items": {"type": "string", "pattern": "^[0-9A-F]{4}$"}},
+          "count": {"type": "integer", "enum": [0, 1], "description": "與 whitelist 長度一致"},
+          "capacity": {"type": "integer", "enum": [1]}
+        }
+      },
+      "ClientControl": {
+        "type": "object",
+        "required": ["api_version", "state_source", "can_control", "station_boot_id", "operation_id", "ble", "supported", "client_id", "boot_id", "state", "age_ms", "battery_mv", "charging", "command", "command_id", "tx_packets", "test_received", "test_missing", "test_rssi", "test_snr", "test_max_gap_ms", "last_error", "rf_group", "frequency_mhz", "storage_after_hours", "ready_poll_ms", "ble_advertising_ms"],
+        "properties": {
+          "api_version": {"type": "integer", "enum": [2]},
+          "state_source": {"type": "string", "enum": ["ble", "lora", "none"], "description": "目前顯示來源，優先新鮮 BLE，其次新鮮 LoRa STATE，兩者皆無為 none；BLE 不刷新 LoRa RF 活動或品質。"},
+          "can_control": {"type": "boolean", "description": "沒有 pending／掃描／TX，且有本 Station/本次 Station boot 的新鮮 BLE 認領，或 boot/command/owner 相符的活躍 Tracking/Test LoRa STATE。不是特定 action 成功保證，Start/Test 另檢查頻道。"},
+          "station_boot_id": {"type": "integer", "format": "int64", "minimum": 0, "maximum": 4294967295, "description": "本次 Station 開機識別值；與 operation_id 一起比對操作。"},
+          "operation_id": {"type": "integer", "format": "int64", "minimum": 0, "maximum": 4294967295, "description": "本次 Station 開機期間最近通過控制前置檢查的操作計數；傳輸套用失敗的 503 也可能已增加。沒有操作歷史／冪等查詢。"},
+          "ble": {"$ref": "#/components/schemas/BleState"},
+          "supported": {"type": "boolean", "description": "有可顯示的新鮮 BLE 或 LoRa 狀態，不等於已認領或可控制；依 state_source 使用不同期限，不能統一以 90 秒判斷。"},
+          "client_id": {"type": "integer", "minimum": 0, "maximum": 65535, "description": "Station 保存的 Client ID，十進位；0 表示未綁定。FB27 對應 64295。"},
+          "boot_id": {"type": "integer", "format": "int64", "minimum": 0, "maximum": 4294967295, "nullable": true, "description": "目前顯示 Client 的開機識別；沒有新鮮狀態時為 null。"},
+          "state": {"type": "string", "enum": ["ready", "tracking", "test", "storage", "unknown"], "description": "目前顯示 Client 狀態；沒有新鮮狀態時為 unknown。storage 僅保留 LoRa 舊值相容，現行 store 動作回 Ready。"},
+          "age_ms": {"type": "integer", "format": "int64", "minimum": 0, "nullable": true, "description": "目前顯示來源的年齡。BLE 以 Client boot／uptime 最近前進計時（小於 3000 ms）；LoRa 以 STATE 接收計時（小於 90000 ms）。不是 GPS 定位年齡；沒有新鮮狀態為 null。"},
+          "battery_mv": {"type": "integer", "minimum": 0, "maximum": 65535, "nullable": true, "description": "目前新鮮顯示狀態的電池 mV；未知 0 或沒有新鮮狀態時為 null。"},
+          "charging": {"type": "boolean", "nullable": true, "description": "目前新鮮狀態的 USB VBUS 指示，不證明太陽能充電或淨充電電流；沒有新鮮狀態為 null。"},
+          "command": {"type": "string", "enum": ["idle", "pending", "confirmed", "error", "timeout"], "description": "最近操作狀態；65000 ms 未確認轉 timeout。須同時比對 station_boot_id + operation_id，不能把其他操作的 confirmed 當成本次成功。"},
+          "command_id": {"type": "integer", "minimum": 0, "maximum": 65535, "description": "最近命令的 16-bit 序號；BLE Claim 也會推進序號，不等同 operation_id。"},
+          "tx_packets": {"type": "integer", "format": "int64", "minimum": 0},
+          "test_received": {"type": "integer", "format": "int64", "minimum": 0},
+          "test_missing": {"type": "integer", "format": "int64", "minimum": 0},
+          "test_rssi": {"type": "number", "nullable": true},
+          "test_snr": {"type": "number", "nullable": true},
+          "test_max_gap_ms": {"type": "integer", "format": "int64", "minimum": 0},
+          "last_error": {"type": "integer", "format": "int32", "description": "最近控制操作保留的整數錯誤碼；部分失敗路徑可能仍為 0，須一併看 HTTP 狀態與 command。"},
+          "rf_group": {"type": "integer", "enum": [0, 1], "description": "目前 active 頻道；無 active 時回已保存頻道。0=A 923.2 MHz，1=B 923.8 MHz；兩者 runtime 皆 SF9。"},
+          "frequency_mhz": {"type": "number", "nullable": true, "enum": [923.2, 923.8, null], "description": "Station 目前 active 頻率；無有效 active 頻道為 null，不代表選定或已保存頻道。"},
+          "storage_after_hours": {"type": "integer", "enum": [0], "description": "固定 0；已取消自動 SystemOFF。"},
+          "ready_poll_ms": {"type": "integer", "enum": [0], "description": "固定 0；Ready 沒有定期 LoRa STATE 或接收窗口。"},
+          "ble_advertising_ms": {"type": "integer", "enum": [10000], "description": "未連線時的 BLE 可連線廣播間隔，不是連線期限或只開放十秒。"}
+        }
+      },
+      "BleState": {
+        "type": "object",
+        "required": ["state", "connected", "claimed", "owner_station_id", "last_error"],
+        "properties": {
+          "state": {"type": "string", "enum": ["idle", "searching", "connecting", "connected", "owned_elsewhere", "error"]},
+          "connected": {"type": "boolean", "description": "BLE worker 回報的連線狀態；不等於新鮮狀態或已認領。"},
+          "claimed": {"type": "boolean", "description": "BLE 狀態新鮮且 owner_station_id 與目前 Station ID、Station boot 相符。"},
+          "owner_station_id": {"type": "integer", "minimum": 0, "maximum": 65535, "description": "最後 BLE 狀態的 owner，未收到時為 0；可能保留過期值，不能單靠此欄判斷目前認領。"},
+          "last_error": {"type": "string"}
+        }
+      },
+      "ClientRadio": {
+        "type": "object",
+        "required": ["selected", "active", "saved", "verified", "scan_state", "scan_id", "scan_error", "can_scan", "can_select", "candidates"],
+        "properties": {
+          "selected": {"type": "integer", "enum": [0, 1], "description": "RAM 待選頻道；select 不立即改 active 或保存 NVS。"},
+          "active": {"type": "integer", "enum": [0, 1, null], "nullable": true, "description": "Station 目前套用的頻道；無有效 active 頻道為 null。"},
+          "saved": {"type": "integer", "enum": [0, 1], "description": "Station NVS 保存的頻道；選定後須成功 Start 並收到匹配 LoRa STATE 才保存。"},
+          "verified": {"type": "boolean", "description": "目前頻道已有 Start 匹配 LoRa STATE 證據；不等於 NVS 保存成功，須另檢查 saved 與 command。"},
+          "scan_state": {"type": "string", "enum": ["idle", "scanning", "complete", "error"]},
+          "scan_id": {"type": "integer", "format": "int64", "minimum": 0},
+          "scan_error": {"type": "string"},
+          "can_scan": {"type": "boolean"},
+          "can_select": {"type": "boolean"},
+          "candidates": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/components/schemas/RadioCandidate"}}
+        }
+      },
+      "RadioCandidate": {
+        "type": "object",
+        "required": ["id", "label", "frequency_mhz", "sf", "bw_khz", "samples", "busy", "error", "rssi_dbm"],
+        "properties": {
+          "id": {"type": "integer", "enum": [0, 1]},
+          "label": {"type": "string", "enum": ["A", "B"]},
+          "frequency_mhz": {"type": "number", "enum": [923.2, 923.8]},
+          "sf": {"type": "integer", "enum": [9]},
+          "bw_khz": {"type": "integer", "enum": [125]},
+          "samples": {"type": "integer", "minimum": 0, "maximum": 65535},
+          "busy": {"type": "integer", "minimum": 0, "maximum": 65535},
+          "error": {"type": "integer", "minimum": 0, "maximum": 65535},
+          "rssi_dbm": {"type": "number", "nullable": true, "description": "目前固定 null；CAD 只回報偵測／有效樣本／錯誤數，沒有 RSSI 頻譜掃描。"}
+        }
+      }
+    }
+  }
+}

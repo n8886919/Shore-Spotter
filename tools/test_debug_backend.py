@@ -49,6 +49,7 @@ cpp = r'''
 #include <type_traits>
 #include "firmware_version.h"
 #include "protocol.h"
+#include "ble_control_protocol.h"
 #include "client_cadence.h"
 #include "packet_diagnostics.h"
 #include "gnss_snapshot.h"
@@ -102,6 +103,7 @@ struct LogStub {
   template<class...T>void printf(const char*,T...){}
 } Log;
 uint16_t gpsClientId = 0xE91C;
+namespace station_extensions { int activeChannel = 0; }
 uint32_t dataAirtimeMs = 330, telemetryAirtimeMs = 289, gnssDiagnosticAirtimeMs = 494, diagnosticAirtimeMs = 330;
 uint32_t gpsBacklogDrops = 0;
 gnss_snapshot::Collector gnssCollector;
@@ -389,10 +391,10 @@ assert empty["gps"]["observed_hz"] is None
 config = empty["config"]
 assert (config["data_bytes"], config["ack_bytes"], config["telemetry_bytes"], config["diagnostic_bytes"]) == (
     data_bytes, ack_bytes, telemetry_bytes, diagnostic_bytes)
-assert config["send_interval_ms"] == 500 and config["ack_every_n"] == 0 and config["ack_enabled"] is False and config["sf"] == 10
+assert config["send_interval_ms"] == 500 and config["ack_every_n"] == 0 and config["ack_enabled"] is False and config["sf"] == 9
 assert config["rf_frequency_mhz"] == 923.2 and config["bw_khz"] == 125
 assert config["send_mode"] == "latest_valid_fix" and config["status_heartbeat_ms"] == 0 and config["diagnostic_interval_ms"] == 60000
-assert config["sf"] == 10 and config["cr"] == 5
+assert config["sf"] == 9 and config["cr"] == 5
 assert config["bound_client_id"] == 0xE91C and config["gnss_age_uncertainty_ms"] == 200
 assert empty["gps"]["scope"] == "station_local"
 assert empty["gps"]["source_age_ms"] is None and empty["gps"]["epoch_ms_of_day"] is None

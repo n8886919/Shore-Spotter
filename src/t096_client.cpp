@@ -3,31 +3,37 @@
 #include <stdarg.h>
 #include <algorithm>
 #include <RadioLib.h>
+#include <bluefruit.h>
 #include "t096_display.h"
 #include "client_cadence.h"
 #include "client_control.h"
 #include "firmware_version.h"
 #include "gnss_snapshot.h"
+#include "nmea_evidence.h"
+#include "mcu_temperature.h"
 #include "gnss_rate.h"
 #include "gnss_diagnostics.h"
 #include "t096_gnss_config.h"
 #include "protocol.h"
-#include "radio_profile.h"
 #include "t096_control.h"
 #include "t096_pins.h"
 #include "t096_radio_config.h"
 #include "t096_power.h"
+#include "t096_maintenance.h"
 #include "t096_idle.h"
 #include "geo_math.h"
 #include "tracking_policy.h"
 
 namespace {
-constexpr float kFrequencyMhz = radio_profile::frequencyMhz, kBandwidthKhz = radio_profile::bandwidthKhz;
-constexpr uint8_t kSf = radio_profile::spreadingFactor, kCr = radio_profile::codingRate, kSync = radio_profile::syncWord;
+constexpr float kBandwidthKhz = ble_control::kBandwidthKhz;
+constexpr uint8_t kSf = ble_control::kSf, kCr = ble_control::kCodingRate, kSync = ble_control::kSyncWord;
 constexpr uint32_t kTxTimeoutMs = 3000;
 Module module(t096_pins::kLoraNss, t096_pins::kLoraDio1, t096_pins::kLoraReset, t096_pins::kLoraBusy);
 SX1262 radio(&module);
 gnss_snapshot::Collector gnss(115200);
+nmea_evidence::Store nmeaEvidence;
+nmea_evidence::Export nmeaExport;
+mcu_temperature::Sample mcuTemperature;
 client_cadence::Scheduler cadence;
 gnss_rate::Monitor gpsRate;
 t096_gnss::Setup gnssSetup;
@@ -58,16 +64,32 @@ uint32_t nextRadioRetryMs = 0;
 bool radioReady = false, usbIdentityAnnounced = false;
 uint32_t idleWaitCalls = 0, idleBlockedMs = 0;
 t096_control::Controller control(1);
+BLEService bleService(ble_control::kServiceUuid);
+BLECharacteristic bleCommand(ble_control::kCommandUuid), bleStatus(ble_control::kStatusUuid);
+QueueHandle_t bleQueue = nullptr;
+bool bleReady = false;
+char clientMacText[18] = "MAC UNKNOWN";
+uint32_t nextBleStatusMs = 0;
+ble_control::Result bleResult = ble_control::Result::Idle;
+uint16_t bleReplySeq = 0;
+int16_t bleError = 0;
+volatile uint32_t bleQueueDrops = 0;
+volatile bool bleConnectionChanged = false;
+int16_t lastRadioInitError = 0;
 SPIClass displaySpi(NRF_SPIM2, t096_pins::kTftUnusedMiso, t096_pins::kTftSck, t096_pins::kTftMosi);
 T096Display tft(&displaySpi, t096_pins::kTftNss, t096_pins::kTftDc, t096_pins::kTftReset);
 GFXcanvas16 displayLine(160,16); // 5 KiB row buffer: glyph drawing never performs SPI pixel-by-pixel
 t096_power::Battery battery;
 t096_power::Button userButton;
+bool userModePending = false, userModeActive = false;
+t096_maintenance::Fault maintenanceFault;
 bool displayPowered = false, displaySleeping = false, displayWaking = false;
 bool batterySampling = false, batteryProtection = false;
 uint32_t screenUntilMs = 0, displayWakeMs = 0, nextDisplayMs = 0, displayMaxMs = 0;
 uint32_t batterySampleMs = 0, nextBatteryMs = 0;
-uint8_t displayRow = 0;
+uint8_t displayRow = 0, displayPage = 0;
+const char *clientNotice = nullptr;
+uint32_t clientNoticeUntilMs = 0;
 
 // TinyUSB CDC write() waits while a connected host stops draining its FIFO.
 // A console must never stall GNSS/radio; drop the whole bounded line instead.
@@ -82,11 +104,15 @@ void usbLog(const char *format, ...) {
 }
 void setGnssEnabled(bool enabled);
 void wakeClientDisplay(uint32_t now);
+bool configureRadio();
 void printIdentity(const char *prefix) {
-  usbLog("%s T096 v%s client=%04X boot=%08lX RF group=%u %.1fMHz SF%u drive=%ddBm\n",
+  usbLog("%s T096 v%s client=%04X boot=%08lX RF channel=%s %.1fMHz SF%u drive=%ddBm\n",
                 prefix, SHORE_SPOTTER_VERSION, thisClientId,
-                static_cast<unsigned long>(thisBoot), radio_profile::group,
-                kFrequencyMhz, unsigned(kSf), t096_pins::kFemDriveDbm);
+                static_cast<unsigned long>(thisBoot), ble_control::channelName(control.channel()),
+                ble_control::frequencyMhz(control.channel()), unsigned(kSf), t096_pins::kFemDriveDbm);
+  usbLog("BUILD %s %s diagnostics=1\n", __DATE__, __TIME__);
+  usbLog("MAINT UI=8 short=page screen_ms=60000 mode_hold_ms=5000 release_required=1 unclaimed_act=1\n");
+  usbLog("BLE MAC %s\n",clientMacText);
   usbLog("BOOTLOADER raw=%08lX version=%u.%u.%u reset=%08lX\n",
          static_cast<unsigned long>(bootloaderVersion),
          unsigned((bootloaderVersion >> 16) & 0xff),
@@ -117,7 +143,8 @@ void startReceiveWindow() {
   // Latch preamble IRQ without routing it to DIO1; only RX_DONE interrupts.
   rxPreamble = false;
   const int16_t r = radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF,
-      RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK); if (r != RADIOLIB_ERR_NONE) ++rxErrors;
+      RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK);
+  if (r != RADIOLIB_ERR_NONE) { maintenanceFault.record("RF RXST",r); ++rxErrors; usbLog("RADIO receive start failed=%d\n",r); }
   air = r == RADIOLIB_ERR_NONE ? AirState::Receiving : AirState::Idle; airStartedMs = millis();
 }
 void sendBuffered() {
@@ -136,6 +163,7 @@ void sendBuffered() {
     usbLog("RADIO wake failed=%d; retry in 5s\n",r);
   }
   if (r != RADIOLIB_ERR_NONE) {
+    maintenanceFault.record("RF TXST",r);
     ++txErrors;
     usbLog("TX start failed=%d; retry after guard\n",r);
     if (outIsState) confirmationPending = true;
@@ -202,7 +230,7 @@ bool queueDiagnostic(uint32_t now) {
   const uint8_t type = extraKind==0 ? MSG_TELEMETRY : extraKind==1 ? MSG_DIAGNOSTIC : MSG_GNSS_DIAGNOSTIC;
   PacketHeader h{thisClientId,++txSequence,type};
   if(type==MSG_TELEMETRY) {
-    const TelemetryPayload p{battery.mv(),INT8_MIN,255,uint8_t(have && s.haveGga && s.arrivalAgeMs<2000 ? s.satellites : 255)};
+    const TelemetryPayload p{battery.mv(),mcuTemperature.wire(now),protocol::kMcuTemperatureMarker,uint8_t(have && s.haveGga && s.arrivalAgeMs<2000 ? s.satellites : 255)};
     outLength=protocol::encodeTelemetry(out,sizeof(out),h,p);
   } else if(type==MSG_DIAGNOSTIC) {
     const auto &g=gnss.stats();
@@ -221,13 +249,13 @@ void serviceGnss(uint32_t now) {
   if(!gnssEnabled)return;
   if(uint32_t(now-gpsLastServiceMs)>gnss.backlogAllowanceMs()) {
     while(Serial2.available())Serial2.read();
-    gnss.invalidate(now); ++gpsBacklogDrops;
+    nmeaEvidence.interrupted(now); gnss.invalidate(now); ++gpsBacklogDrops;
   }
   gpsLastServiceMs=now;
   static char response[150]; static size_t used=0;
   unsigned budget=512;
   while(Serial2.available() && budget--) {
-    const char c=char(Serial2.read()); gnss.feed(c,now);
+    const char c=char(Serial2.read()); nmeaEvidence.feed(gnss,c,now);
     if(c=='$')used=0;
     if(c=='\n') {
       response[used]=0;
@@ -260,7 +288,7 @@ void serviceReceive(uint32_t now) {
   const bool irq=radioIrq; radioIrq=false;
   if (irq && (flags&RADIOLIB_SX126X_IRQ_RX_DONE)) { uint8_t frame[MAX_PACKET_LEN]={}; const size_t n=radio.getPacketLength();
     const int16_t r=n<=sizeof(frame)?radio.readData(frame,n):RADIOLIB_ERR_PACKET_TOO_LONG; PacketHeader h{}; client_control::Command c{};
-    if (r==RADIOLIB_ERR_NONE && client_control::decodeCommand(frame,n,h,c)) { const auto a=control.apply(h,c,now);
+    if (r==RADIOLIB_ERR_NONE && client_control::decodeCommand(frame,n,h,c)) { const auto a=(batteryProtection && (c.action==client_control::Action::Start || c.action==client_control::Action::Test)) ? t096_control::CommandResult::Ignored : control.apply(h,c,now);
       if (a==t096_control::CommandResult::Applied || a==t096_control::CommandResult::Duplicate) {
         if(a==t096_control::CommandResult::Applied) {
           setGnssEnabled(control.state()==client_control::State::Tracking);
@@ -268,8 +296,12 @@ void serviceReceive(uint32_t now) {
         }
         confirmationPending=true;
       }
-    } else ++rxErrors;
-  } else if (irq && !(flags&RADIOLIB_SX126X_IRQ_TIMEOUT)) ++rxErrors;
+    } else {
+      ++rxErrors;
+      if(r==RADIOLIB_ERR_NONE)maintenanceFault.record("RF FRAME");
+      else maintenanceFault.record("RF RX",r);
+    }
+  } else if (irq && !(flags&RADIOLIB_SX126X_IRQ_TIMEOUT)) { ++rxErrors; maintenanceFault.record("RF RXIRQ",int32_t(flags)); }
   radio.finishReceive(); air=AirState::Idle; femOff();
 }
 void serviceTransmit(uint32_t now) {
@@ -282,10 +314,11 @@ void serviceTransmit(uint32_t now) {
     ++txPackets;
     if (wasState) { control.notedState(now); usbLog("STATE TX done count=%lu\n", static_cast<unsigned long>(txPackets)); }
   } else {
+    maintenanceFault.record(irq?"RF TXIRQ":"RF TXTO",int32_t(flags));
     ++txErrors;
     if (wasState) { confirmationPending=true; usbLog("%s\n","STATE TX failed; retrying"); }
   }
-  if(sent && openWindow) startReceiveWindow(); else femOff();
+  if(sent && openWindow && control.state()!=client_control::State::Ready) startReceiveWindow(); else femOff();
 }
 void setGnssEnabled(bool enabled) {
   // T096 schematic: Vext feeds the GNSS load switch as well as the TFT.
@@ -331,21 +364,108 @@ void initClientDisplay() {
   tft.invertDisplay(true); // match Heltec's plugin-panel factory example
   tft.setSPISpeed(8000000);
   tft.fillScreen(ST77XX_BLACK);tft.setTextWrap(false);
+  // Boot-only text is visible while radio/BLE initialize; no added delay.
+  tft.setTextSize(1);tft.setTextColor(ST77XX_WHITE);tft.setCursor(0,0);
+  tft.print("CLIENT BOOTING");
+  digitalWrite(t096_pins::kTftBacklight,LOW);
+  clientNotice="CLIENT BOOTING";clientNoticeUntilMs=millis()+2000;
   displayPowered=true;
   wakeClientDisplay(millis());
+  screenUntilMs=millis()+t096_power::kAutomaticScreenMs;
   usbLog("%s\n","DISPLAY init 160x80 SPI2 offset=24,0 backlight=44");
+}
+void formatMaintenanceLine(char *line, size_t size, uint8_t page, uint8_t row, uint32_t now) {
+  line[0]=0;
+  if(userButton.previewing()) {
+    const bool active=control.state()==client_control::State::Ready;
+    switch(row) {
+      case 0:snprintf(line,size,"SWITCH TO %s",active?"ACT":"SLP");break;
+      case 1:
+        if(userButton.held())snprintf(line,size,"Release to switch");
+        else snprintf(line,size,"Hold to switch: %lus",(unsigned long)userButton.remainingSeconds(now));
+        break;
+      case 2:snprintf(line,size,active && batteryProtection?"LOW BATTERY: ACT BLOCKED":active?"GPS + LoRa ON":"GPS + LoRa OFF");break;
+      case 3:snprintf(line,size,"BLE + owner unchanged");break;
+      case 4:snprintf(line,size,userButton.held()?"Apply on release":"Release early to cancel");break;
+    }
+    return;
+  }
+  gnss_snapshot::Snapshot s{};
+  const bool have=gnssEnabled && gnss.sample(now,s);
+  const bool fresh=have && s.arrivalAgeMs<tracking_policy::kGpsFreshMs;
+  if(page==0) {
+    switch(row) {
+      case 0:
+        if(clientNotice && int32_t(now-clientNoticeUntilMs)<0)snprintf(line,size,"%s",clientNotice);
+        else snprintf(line,size,"CLIENT ID %04X",thisClientId);
+        break;
+      case 1:snprintf(line,size," sleep   active");break;
+      case 2: {
+        const char *bleState=!bleReady?"ERR":Bluefruit.Periph.connected()?"LINK":Bluefruit.Advertising.isRunning()?"ADV":"OFF";
+        if(control.hasStation())snprintf(line,size,"OWNER %04X, BLE %s",control.station(),bleState);
+        else snprintf(line,size,"OWNER NONE, BLE %s",bleState);
+        break;
+      }
+      case 3: {
+        const char *gpsState=!gnssEnabled?"OFF":!have?"NO EPOCH":!fresh?"STALE":s.fix?"FIX":"NOFIX";
+        const char *rfState=!radioReady?"ERR":radioSleeping?"OFF":"ON";
+        snprintf(line,size,"GPS %s RF %s",gpsState,rfState);
+        break;
+      }
+      case 4:
+        if(batteryProtection) {
+          if(battery.mv())snprintf(line,size,"LOW%.2fV UP%lus CHARGE",battery.mv()/1000.0,(unsigned long)(now/1000));
+          else snprintf(line,size,"LOW BAT UNKNOWN UP %lus",(unsigned long)(now/1000));
+        } else {
+          if(battery.mv())snprintf(line,size,"BAT %.2fV UP %lus",battery.mv()/1000.0,(unsigned long)(now/1000));
+          else snprintf(line,size,"BAT UNKNOWN UP %lus",(unsigned long)(now/1000));
+        }
+        break;
+    }
+  } else {
+    switch(row) {
+      case 0:snprintf(line,size,"VERSION %s",SHORE_SPOTTER_VERSION);break;
+      case 1:
+        // '+' explicitly marks display saturation; underlying counters are intact.
+        snprintf(line,size,"TX %lu%s",(unsigned long)std::min(txPackets,uint32_t(999999)),txPackets>999999?"+":"");break;
+      case 2:
+        snprintf(line,size,"ERR TX%lu%s RX%u",(unsigned long)std::min(txErrors,uint32_t(99999)),txErrors>99999?"+":"",rxErrors);break;
+      case 3: {
+        if(fresh && s.haveGga && s.satellites!=gnss_snapshot::kUnknownSatellites)
+          snprintf(line,size,"SAT %u",s.satellites);
+        else snprintf(line,size,"SAT --");
+        break;
+      }
+      case 4: {
+        char age[12]="--",hdop[6]="--";
+        if(have) {
+          if(fresh)snprintf(age,sizeof(age),"%.1fs",s.arrivalAgeMs/1000.0);
+          else snprintf(age,sizeof(age),"%lus",(unsigned long)(s.arrivalAgeMs/1000));
+        }
+        if(fresh && s.haveGga && isfinite(s.hdop) && s.hdop>=0 && s.hdop<999.95)
+          snprintf(hdop,sizeof(hdop),"%.1f",s.hdop);
+        snprintf(line,size,"AGE %s  HDOP %s",age,hdop);
+        break;
+      }
+      case 5:
+        if(!maintenanceFault.source)snprintf(line,size,"LAST NONE");
+        else if(maintenanceFault.hasCode)snprintf(line,size,"LAST %s %ld",maintenanceFault.source,(long)maintenanceFault.code);
+        else snprintf(line,size,"LAST %s FAIL",maintenanceFault.source);
+        break;
+    }
+  }
 }
 void serviceClientDisplay(uint32_t now) {
   if(!displayPowered)return;
   // Backlight timeout is cheap GPIO and must not wait for a long RF frame.
-  if(int32_t(now-screenUntilMs)>=0 && !userButton.held())
+  if(int32_t(now-screenUntilMs)>=0 && !userButton.previewing())
     digitalWrite(t096_pins::kTftBacklight,HIGH);
   if(air!=AirState::Idle || radioIrq)return;
   if(displayWaking) {
     if(int32_t(now-displayWakeMs)<0)return;
-    displayWaking=false; screenUntilMs=now+t096_power::kScreenMs;
+    displayWaking=false;
   }
-  if(int32_t(now-screenUntilMs)>=0 && !userButton.held()) {
+  if(int32_t(now-screenUntilMs)>=0 && !userButton.previewing()) {
     if(!displaySleeping) {
       digitalWrite(t096_pins::kTftBacklight,HIGH);
       tft.sendCommand(ST77XX_DISPOFF);tft.sendCommand(ST77XX_SLPIN);
@@ -355,36 +475,31 @@ void serviceClientDisplay(uint32_t now) {
     return;
   }
   if(displaySleeping || int32_t(now-nextDisplayMs)<0)return;
-  char line[28]={};uint16_t color=ST77XX_WHITE;
-  switch(displayRow) {
-    case 0:snprintf(line,sizeof(line),"Client %04X",thisClientId);break;
-    case 1:
-      snprintf(line,sizeof(line),"%s%s",batteryProtection?"LOW BATTERY":client_control::name(control.state()),usbVbusPresent()?"  USB":"");
-      color=batteryProtection?ST77XX_RED:ST77XX_GREEN;break;
-    case 2:
-      if(battery.mv())snprintf(line,sizeof(line),"Batt %.2fV ~%u%%",battery.mv()/1000.0,t096_power::batteryPercent(battery.mv()));
-      else snprintf(line,sizeof(line),"Batt unknown");
-      if(battery.warning())color=ST77XX_YELLOW;
-      break;
-    case 3: {
-      gnss_snapshot::Snapshot s{};const bool have=gnssEnabled&&gnss.sample(now,s);
-      const char *quality=!gnssEnabled?"off":!have?"waiting":geo::sig4Text(geo::gpsSignal(s.fix && s.arrivalAgeMs<2000,s.satellites,s.hdop));
-      snprintf(line,sizeof(line),"GPS %s",quality);break;
-    }
-    case 4:
-      if(batteryProtection)snprintf(line,sizeof(line),"Low - charge to recover");
-      else if(userButton.held())snprintf(line,sizeof(line),"Release USER: Ready");
-      else snprintf(line,sizeof(line),"USER hold 2s: Ready");
-      break;
-  }
+  // 26 classic-font cells fit 160 px. Both pages use the same bounded row path.
+  char line[27]={};uint16_t color=ST77XX_WHITE;
+  formatMaintenanceLine(line,sizeof(line),displayPage,displayRow,now);
+  if(batteryProtection || (!bleReady && displayPage==0 && displayRow==2) ||
+     (maintenanceFault.source && displayPage==1 && displayRow==5))color=ST77XX_RED;
+  else if(userButton.previewing() || battery.warning())color=ST77XX_YELLOW;
   const uint32_t started=millis();
   displayLine.fillScreen(ST77XX_BLACK);
   displayLine.setTextWrap(false);displayLine.setTextColor(color);
-  displayLine.setTextSize(displayRow==0?2:1);
-  displayLine.setCursor(0,displayRow==0?0:4);displayLine.print(line);
-  tft.drawRGBBitmap(0,displayRow*16,displayLine.getBuffer(),160,16);
+  displayLine.setTextSize(1);
+  const bool compact=displayPage==1 && !userButton.previewing();
+  const uint8_t rowHeight=compact?13:16;
+  displayLine.setCursor(0,compact?2:4);displayLine.print(line);
+  if(displayPage==0 && displayRow==1 && !userButton.previewing()) {
+    // Labels always remain visible. Ready is sleep; Tracking and RF Test are
+    // active. Outline only the current mode, inside this 160x16 row buffer.
+    // Draw a continuous separator; the classic font glyph for | has a gap.
+    displayLine.drawFastVLine(45,1,14,color);
+    const bool sleeping=control.state()==client_control::State::Ready;
+    displayLine.drawRect(sleeping?3:51,1,sleeping?36:42,14,color);
+  }
+  tft.drawRGBBitmap(0,displayRow*rowHeight,displayLine.getBuffer(),160,rowHeight);
+  if(compact && displayRow==5)tft.fillRect(0,78,160,2,ST77XX_BLACK);
   displayMaxMs=std::max(displayMaxMs,uint32_t(millis()-started));
-  if(++displayRow==5) {
+  if(++displayRow==(compact?6:5)) {
     displayRow=0;nextDisplayMs=millis()+500;
     tft.sendCommand(ST77XX_DISPON);digitalWrite(t096_pins::kTftBacklight,LOW);
   }
@@ -411,10 +526,48 @@ void serviceBattery(uint32_t now) {
 }
 void serviceUserButton(uint32_t now) {
   const auto event=userButton.poll(digitalRead(t096_pins::kUserButton)==LOW,now);
-  if(event==t096_power::ButtonEvent::Short || event==t096_power::ButtonEvent::Hold) wakeClientDisplay(now);
-  if(event==t096_power::ButtonEvent::LongReleased && !batteryProtection) {
-    control.requestReady();setGnssEnabled(false);confirmationPending=true;
-    nextBatteryMs=now;wakeClientDisplay(now);usbLog("%s\n","USER long released: Ready");
+  if(event==t096_power::ButtonEvent::Short) {
+    clientNotice=nullptr;
+    displayPage=(displaySleeping || int32_t(now-screenUntilMs)>=0)?0:uint8_t(displayPage^1);
+    wakeClientDisplay(now);
+    usbLog("USER short page=%u\n",displayPage);
+  } else if(event==t096_power::ButtonEvent::Preview || event==t096_power::ButtonEvent::Hold ||
+            event==t096_power::ButtonEvent::Cancelled) {
+    wakeClientDisplay(now);
+  } else if(event==t096_power::ButtonEvent::LongReleased) {
+    userModeActive=control.state()==client_control::State::Ready;
+    userModePending=true;
+    clientNotice=userModeActive?"ACT WAITING FOR RF":"SLP WAITING FOR RF";
+    clientNoticeUntilMs=now+2000;
+    wakeClientDisplay(now);
+    usbLog("USER mode request=%s wait_rf=%u\n",userModeActive?"ACT":"SLP",air!=AirState::Idle);
+  }
+  // Finish the current RF transaction before touching GNSS/FEM or queued bytes.
+  // Capture the requested direction at release, not after the RF wait.
+  if(userModePending && air==AirState::Idle) {
+    userModePending=false;
+    const auto previous=control;
+    if(!control.requestLocalMode(userModeActive,batteryProtection)) {
+      clientNotice="ACT BLOCKED: LOW BAT";
+      maintenanceFault.record("USER BAT");
+      usbLog("USER ACT rejected: low battery protection\n");
+    } else if(userModeActive && !radioReady && !configureRadio()) {
+      control=previous;
+      clientNotice="ACT FAILED: RF ERROR";
+      usbLog("USER ACT rejected: radio init failed=%d\n",lastRadioInitError);
+    } else {
+      clientNotice=userModeActive?"ACT STARTED":"ENTERED SLP";
+      setGnssEnabled(userModeActive);
+      outLength=0;outIsState=outOpensReceiveWindow=false;dataWaiting=false;
+      confirmationPending=userModeActive;
+      if(!userModeActive)femOff();
+      nextBatteryMs=now;
+      usbLog("USER mode=%s owner=%04X channel=%s boot=%08lX\n",userModeActive?"ACT":"SLP",
+             control.station(),ble_control::channelName(control.channel()),(unsigned long)thisBoot);
+    }
+    nextBleStatusMs=now;
+    clientNoticeUntilMs=now+2000;
+    displayPage=0;wakeClientDisplay(now);
   }
 }
 void serviceLowBattery(uint32_t now) {
@@ -424,41 +577,204 @@ void serviceLowBattery(uint32_t now) {
   // Sample completion is only serviced with an idle radio. Never start a PA
   // transmission in protection; recovery always returns to Ready, not GPS.
   outLength=0;outIsState=outOpensReceiveWindow=false;
-  confirmationPending=!batteryProtection;
+  confirmationPending=false;
   femOff();nextTxStartMs=now;
-  wakeClientDisplay(now);
+  displayPage=0;wakeClientDisplay(now);screenUntilMs=now+t096_power::kAutomaticScreenMs;
   usbLog("POWER protection=%u mv=%u recover=3x3500mV sample_ms=%lu\n",batteryProtection,
          battery.mv(),static_cast<unsigned long>(batteryProtection?t096_power::kBatteryProtectMs:t096_power::kBatteryReadyMs));
 }
 bool configureRadio() {
   radioSleeping=false;
-  const int16_t start = t096_radio::begin(radio, kFrequencyMhz, kBandwidthKhz,
+  const int16_t start = t096_radio::begin(radio, ble_control::frequencyMhz(control.channel()), kBandwidthKhz,
                                           kSf, kCr, kSync, t096_pins::kFemDriveDbm);
   const int16_t dio2 = start == RADIOLIB_ERR_NONE ? radio.setDio2AsRfSwitch(true) : start;
   const int16_t current = dio2 == RADIOLIB_ERR_NONE ? radio.setCurrentLimit(140.0f) : dio2;
+  lastRadioInitError=current;
   radioReady = current == RADIOLIB_ERR_NONE;
   if (radioReady) {
     radio.setDio1Action(onRadioIrq);
     usbLog("%s\n","RADIO init ok");
   } else {
+    maintenanceFault.record("RF INIT",current);
     ++rxErrors;
-    usbLog("RADIO init failed=%d; retry in 5s outside battery protection\n", current);
+    usbLog("RADIO init failed=%d; active mode retries in 5s, Ready waits for Start/Test\n", current);
   }
   return radioReady;
 }
+
+void bleWrite(uint16_t, BLECharacteristic*, uint8_t *data, uint16_t len) {
+  ble_control::Command cmd{};
+  if (!bleQueue || !ble_control::decodeCommand(data,len,cmd)) return;
+  if (xQueueSend(bleQueue,&cmd,0)!=pdTRUE) ++bleQueueDrops;
+  if (loopTask) xTaskNotifyGive(loopTask);
+}
+void bleConnected(uint16_t) { bleConnectionChanged=true; if (loopTask) xTaskNotifyGive(loopTask); }
+void bleDisconnected(uint16_t, uint8_t) { bleConnectionChanged=true; if (loopTask) xTaskNotifyGive(loopTask); }
+void captureClientMac() {
+  ble_gap_addr_t address{};
+  const uint32_t result=sd_ble_gap_addr_get(&address);
+  if(result!=NRF_SUCCESS) {
+    maintenanceFault.record("BLE MAC",int32_t(result));
+    usbLog("BLE address read failed=%lu\n",(unsigned long)result);
+    return;
+  }
+  // Nordic stores address bytes little-endian. Show all six colon-separated bytes.
+  snprintf(clientMacText,sizeof(clientMacText),"%02X:%02X:%02X:%02X:%02X:%02X",
+           address.addr[5],address.addr[4],address.addr[3],address.addr[2],address.addr[1],address.addr[0]);
+}
+void publishBleStatus(uint32_t now) {
+  if (!bleReady) return;
+  const uint8_t flags=(usbVbusPresent()?1:0)|(radioReady?2:0)|(batteryProtection?4:0)|(gnssEnabled?8:0);
+  const ble_control::Status s{control.state(),control.channel(),thisClientId,control.station(),thisBoot,
+    control.command(),battery.mv(),txPackets,rxErrors,flags,bleResult,bleError,kSf,now,control.stationBoot(),bleReplySeq};
+  uint8_t bytes[ble_control::kStatusSize];
+  if (ble_control::encodeStatus(bytes,sizeof(bytes),s)) { bleStatus.write(bytes,sizeof(bytes)); bleStatus.notify(bytes,sizeof(bytes)); }
+  nextBleStatusMs=now+(Bluefruit.Periph.connected()?1000:30000);
+}
+void setupBle() {
+  bleQueue=xQueueCreate(4,sizeof(ble_control::Command));
+  if (!bleQueue) { maintenanceFault.record("BLE QUE");usbLog("BLE queue allocation failed\n"); return; }
+  Bluefruit.autoConnLed(false); // T096 has no verified dedicated Bluefruit LED pin.
+  Bluefruit.configPrphBandwidth(BANDWIDTH_HIGH); // SDK permits MTU 128; Station requires >=64.
+  if (!Bluefruit.begin()) { maintenanceFault.record("BLE INIT");usbLog("BLE init failed\n"); return; }
+  captureClientMac();
+  Bluefruit.Periph.setConnectCallback(bleConnected);
+  Bluefruit.Periph.setDisconnectCallback(bleDisconnected);
+  Bluefruit.setName("Shore-Spotter");
+  const auto serviceError=bleService.begin();
+  if (serviceError!=ERROR_NONE) { maintenanceFault.record("BLE SVC",serviceError);usbLog("BLE service failed=%lu\n",(unsigned long)serviceError); return; }
+  bleCommand.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  bleCommand.setPermission(SECMODE_NO_ACCESS,SECMODE_OPEN);
+  bleCommand.setFixedLen(ble_control::kCommandSize);
+  bleCommand.setWriteCallback(bleWrite);
+  const auto commandError=bleCommand.begin();
+  if (commandError!=ERROR_NONE) { maintenanceFault.record("BLE GATT",commandError);usbLog("BLE command characteristic failed=%lu\n",(unsigned long)commandError); return; }
+  bleStatus.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  bleStatus.setPermission(SECMODE_OPEN,SECMODE_NO_ACCESS);
+  bleStatus.setFixedLen(ble_control::kStatusSize);
+  const auto statusError=bleStatus.begin();
+  if (statusError!=ERROR_NONE) { maintenanceFault.record("BLE STAT",statusError);usbLog("BLE status characteristic failed=%lu\n",(unsigned long)statusError); return; }
+  const uint8_t manufacturer[]={0xff,0xff,'S','S',1,uint8_t(thisClientId),uint8_t(thisClientId>>8)};
+  if (!Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE) ||
+      !Bluefruit.Advertising.addService(bleService) ||
+      !Bluefruit.Advertising.addManufacturerData(manufacturer,sizeof(manufacturer))) { maintenanceFault.record("BLE DATA");usbLog("BLE advertising data failed\n"); return; }
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.setIntervalMS(10000,10000);
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  bleReady=true; publishBleStatus(millis());
+  if (!Bluefruit.Advertising.start(0)) { maintenanceFault.record("BLE ADV");bleReady=false; usbLog("BLE advertising failed\n"); }
+}
+void serviceBle(uint32_t now) {
+  if (!bleReady) return;
+  static uint32_t reportedDrops=0;
+  if (bleQueueDrops!=reportedDrops) { maintenanceFault.record("BLE QUE");reportedDrops=bleQueueDrops; usbLog("BLE queue full drops=%lu\n",static_cast<unsigned long>(reportedDrops)); }
+  ble_control::Command cmd{};
+  if (air==AirState::Idle && xQueueReceive(bleQueue,&cmd,0)==pdTRUE) {
+    const auto previous=control; const auto before=control.state(); const auto oldChannel=control.channel();
+    const auto result=control.applyBle(cmd,batteryProtection);
+    bleReplySeq=cmd.seq; bleError=0;
+    bleResult=result==t096_control::CommandResult::Ignored ? ble_control::Result::Rejected : ble_control::Result::Accepted;
+    if (result==t096_control::CommandResult::Ignored) {
+      bleError=int16_t(previous.rejectionReason(cmd,batteryProtection));
+      maintenanceFault.record("BLE CMD",bleError);
+    }
+    if (result==t096_control::CommandResult::Applied && cmd.op!=ble_control::Op::Claim) {
+      if (before==client_control::State::Ready && control.state()!=client_control::State::Ready &&
+          (!radioReady || oldChannel!=control.channel())) {
+        if (!configureRadio()) { control=previous; bleResult=ble_control::Result::Rejected; bleError=lastRadioInitError; }
+      }
+      setGnssEnabled(control.state()==client_control::State::Tracking);
+      nextBatteryMs=now;
+      if (control.state()==client_control::State::Ready) { confirmationPending=false; outLength=0; }
+      else confirmationPending=true;
+    }
+    publishBleStatus(now);
+  } else if (bleConnectionChanged || int32_t(now-nextBleStatusMs)>=0) { bleConnectionChanged=false; publishBleStatus(now); }
+}
+
+// Respect SoftDevice ownership; direct peripheral acquisition is asynchronous
+// with a hard timeout. No SDK busy loop and no new periodic wake deadline.
+void serviceMcuTemperature(uint32_t now) {
+  if(mcuTemperature.pending) {
+    if(NRF_TEMP->EVENTS_DATARDY || now-mcuTemperature.attemptMs>=mcu_temperature::kTimeoutMs) {
+      const bool ok=NRF_TEMP->EVENTS_DATARDY!=0;
+      const int32_t q=NRF_TEMP->TEMP;
+      NRF_TEMP->TASKS_STOP=1; NRF_TEMP->EVENTS_DATARDY=0;
+      mcuTemperature.finish(now,ok,q);
+    }
+    return;
+  }
+  if(!mcuTemperature.due(now) || air!=AirState::Idle || radioIrq)return;
+  mcuTemperature.start(now);
+  uint8_t enabled=0;
+  if(sd_softdevice_is_enabled(&enabled)!=NRF_SUCCESS) { mcuTemperature.finish(now,false,0);return; }
+  if(enabled) {
+    int32_t q=0;const bool ok=sd_temp_get(&q)==NRF_SUCCESS;
+    mcuTemperature.finish(now,ok,q);
+  } else {
+    NRF_TEMP->EVENTS_DATARDY=0;NRF_TEMP->TASKS_START=1;
+  }
+}
+
+// Read-only console. No input command changes GNSS/RF/power or writes Flash.
+// Retain pending output until accepted; normal USB logs may interleave lines.
+void serviceDiagnosticUsb(uint32_t now) {
+  static char command[32]{}, output[240]{};
+  static size_t used=0, length=0, sent=0;
+  static bool overflow=false;
+  if(!Serial) { used=length=sent=0;overflow=false;nmeaExport=nmea_evidence::Export{};return; }
+  if(!length && nmeaExport.busy()) {
+    nmeaExport.next(output,sizeof(output));length=strlen(output);sent=0;
+  }
+  if(length) {
+    if(Serial.availableForWrite()>=int(length-sent)) {
+      sent+=Serial.write(reinterpret_cast<const uint8_t*>(output+sent),length-sent);
+      if(sent==length)length=sent=0;
+    }
+    return;
+  }
+  for(unsigned budget=0;budget<32 && Serial.available();++budget) {
+    const char c=Serial.read();
+    if(c=='\r')continue;
+    if(c!='\n') {
+      if(used+1<sizeof(command))command[used++]=c;else overflow=true;
+      continue;
+    }
+    command[used]=0;
+    if(!overflow && !strcmp(command,"DIAG NMEA")) {
+      nmeaExport.begin(nmeaEvidence,thisBoot);
+    } else if(!overflow && !strcmp(command,"DIAG STATUS")) {
+      const int8_t value=mcuTemperature.wire(now);
+      snprintf(output,sizeof(output),
+        "@DIAG boot=%08lX fw=" SHORE_SPOTTER_VERSION " mcu_valid=%u mcu_qc=%ld max_qc=%ld age_ms=%lu failures=%lu nmea_total=%lu overwritten=%lu\n",
+        (unsigned long)thisBoot,value!=INT8_MIN,(long)mcuTemperature.quarterC,
+        (long)(mcuTemperature.haveMaximum?mcuTemperature.maximumQuarterC:INT32_MIN),
+        (unsigned long)(mcuTemperature.valid?now-mcuTemperature.sampleMs:UINT32_MAX),
+        (unsigned long)mcuTemperature.failures,(unsigned long)nmeaEvidence.total(),
+        (unsigned long)nmeaEvidence.overwritten());
+      length=strlen(output);sent=0;
+    } else {
+      strcpy(output,"@DIAG ERROR expected: DIAG STATUS or DIAG NMEA\n");length=strlen(output);sent=0;
+    }
+    used=0;overflow=false;return;
+  }
+}
+
 uint32_t idleWaitMs(uint32_t now) {
   t096_idle::Budget wait(now, batteryProtection?t096_power::kBatteryProtectMs:client_control::kReadyPollMs);
   // Keep the existing UART/GNSS/2 Hz pipeline responsive in Tracking/Test.
   if(control.state()!=client_control::State::Ready)wait.cap(1);
+  if(mcuTemperature.pending)wait.cap(1); // finish/stop an already-started conversion
   if(usbVbusPresent())wait.cap(20); // CDC/USB handling while externally powered.
   if(userButton.busy())wait.cap(5); // debounce, held-button and release deadlines.
+  if(bleReady)wait.until(nextBleStatusMs);
   if(radioIrq)wait.cap(0);
   if(air==AirState::Sending)wait.until(airStartedMs+kTxTimeoutMs);
   else if(air==AirState::Receiving)
     wait.until(airStartedMs+(rxPreamble?client_control::kReceiveWindowMs:client_control::kReceiveListenMs));
   else {
     wait.until(batterySampling?batterySampleMs+10:nextBatteryMs);
-    if(radioReady && !batteryProtection) {
+    if(radioReady && !batteryProtection && (control.state()!=client_control::State::Ready || confirmationPending || outLength)) {
       const uint32_t slot=int32_t(nextTxStartMs-now)>0?uint32_t(nextTxStartMs-now):0;
       const uint32_t poll=(confirmationPending||outLength)?0:control.pollWaitMs(now);
       wait.cap(std::max(slot,poll));
@@ -468,9 +784,9 @@ uint32_t idleWaitMs(uint32_t now) {
       else wait.until(nextDisplayMs);
     }
   }
-  if(displayPowered && !displaySleeping && !userButton.held() && int32_t(screenUntilMs-now)>0)
+  if(displayPowered && !displaySleeping && !userButton.previewing() && int32_t(screenUntilMs-now)>0)
     wait.until(screenUntilMs);
-  if(!radioReady && !batteryProtection)wait.until(nextRadioRetryMs+5000);
+  if(!radioReady && !batteryProtection && control.state()!=client_control::State::Ready)wait.until(nextRadioRetryMs+5000);
   return wait.waitMs();
 }
 void waitForWork() {
@@ -479,7 +795,7 @@ void waitForWork() {
     const int16_t result=radio.sleep(); // warm-start sleep retains SX1262 configuration.
     femOff();
     if(result==RADIOLIB_ERR_NONE)radioSleeping=true;
-    else { radioReady=false;nextRadioRetryMs=millis();++rxErrors;usbLog("RADIO sleep failed=%d\n",result); }
+    else { maintenanceFault.record("RF SLEEP",result);radioReady=false;nextRadioRetryMs=millis();++rxErrors;usbLog("RADIO sleep failed=%d\n",result); }
   }
   const uint32_t now=millis(),wait=idleWaitMs(now);
   // A notification sent before this call remains pending; there is no
@@ -514,17 +830,25 @@ void setup() {
   SPI.begin();
   usbLog("%s\n","BOOT stage=radio");
   configureRadio();
+  if (radioReady) {
+    const int16_t sleepResult=radio.sleep(); femOff();
+    if (sleepResult==RADIOLIB_ERR_NONE) radioSleeping=true;
+    else { maintenanceFault.record("RF SLEEP",sleepResult);radioReady=false; nextRadioRetryMs=millis(); ++rxErrors; usbLog("RADIO boot sleep failed=%d\n",sleepResult); }
+  }
   serviceLowBattery(millis());
-  confirmationPending=true; // advertise immediately after a real reboot
+  setupBle();
 }
 void loop() {
   const uint32_t now=millis();
+  serviceMcuTemperature(now);
+  serviceDiagnosticUsb(now);
+  serviceBle(now);
   if (Serial && !usbIdentityAnnounced) { printIdentity("USB"); usbIdentityAnnounced=true; }
   if (!Serial) usbIdentityAnnounced=false;
   if (!radioReady) {
     serviceUserButton(millis());serviceBattery(millis());serviceLowBattery(millis());
     serviceClientDisplay(millis());
-    if (!batteryProtection && t096_control::elapsed(now, nextRadioRetryMs, 5000)) { nextRadioRetryMs=now; configureRadio(); }
+    if (!batteryProtection && control.state()!=client_control::State::Ready && t096_control::elapsed(now, nextRadioRetryMs, 5000)) { nextRadioRetryMs=now; configureRadio(); }
     waitForWork(); return;
   }
   serviceGnss(millis());
@@ -539,7 +863,7 @@ void loop() {
   observeDataDeferral(scheduleNow);
   if(!batteryProtection && air==AirState::Idle && int32_t(scheduleNow-nextTxStartMs)>=0) {
     if(confirmationPending && queueState(scheduleNow)) confirmationPending=false;
-    else if(control.pollDue(scheduleNow))queueState(scheduleNow);
+    else if(control.state()!=client_control::State::Ready && control.pollDue(scheduleNow))queueState(scheduleNow);
     else if(control.probeDue(scheduleNow))queueProbe(scheduleNow);
     else if(!queueDiagnostic(scheduleNow))queueRealPosition(scheduleNow);
     sendBuffered();

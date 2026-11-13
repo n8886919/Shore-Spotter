@@ -1,5 +1,11 @@
 #pragma once
 
-// Single source for the project release version (both Client and Station).
-// This is independent of the LoRa wire version and NVS record versions.
-#define SHORE_SPOTTER_VERSION "0.6-dev"
+// Shared Client/Station release: a.b. All releases within major a interoperate.
+// Increment a for incompatible Client/Station behavior; b for compatible changes.
+// Independent of LoRa wire and NVS record versions. Debug is a build label.
+#define SHORE_SPOTTER_RELEASE "1.0"
+#ifdef FIELD_DIAGNOSTIC
+#define SHORE_SPOTTER_VERSION SHORE_SPOTTER_RELEASE "-debug"
+#else
+#define SHORE_SPOTTER_VERSION SHORE_SPOTTER_RELEASE
+#endif

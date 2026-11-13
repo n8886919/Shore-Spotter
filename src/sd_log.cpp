@@ -1,5 +1,6 @@
 #if defined(ARDUINO)
 #include "sd_log.h"
+#include "runtime_radio_profile.h"
 #include "sd_retention.h"
 #if defined(FIELD_DIAGNOSTIC)
 #include "diagnostic_store.h"
@@ -266,10 +267,11 @@ bool openPart() {
   portENTER_CRITICAL(&mux);
   snprintf(shared.path, sizeof(shared.path), "%s", path + 3);
   portEXIT_CRITICAL(&mux);
+  const auto rfProfile = runtime_radio_profile::get();
   const int n = snprintf(encoded, sizeof(encoded),
       "{\"kind\":\"session\",\"app\":\"shore-spotter\",\"role\":\"%s\",\"schema_version\":1,\"boot_id\":%lu,\"firmware\":\"%s\","
       "\"build\":\"%s %s\",\"protocol\":%u,\"sf\":%d,\"bw_khz\":%.0f,\"cr\":%d,"
-      "\"frequency_mhz\":%.3f,\"clock\":\"boot_ms; _time null until UTC available\","
+      "\"frequency_mhz\":%.3f,\"frequency_scope\":\"session_open_snapshot\",\"clock\":\"boot_ms; _time null until UTC available\","
       "\"packet_queue\":%u,\"sync_ms\":%lu,\"overwrite\":true,\"gps_gate\":%s,\"profile\":\"%s\"}\n",
 #if defined(ROLE_CLIENT)
       "client",
@@ -277,8 +279,8 @@ bool openPart() {
       "station",
 #endif
       (unsigned long)bootId, SHORE_SPOTTER_VERSION, __DATE__, __TIME__, PROTO_VERSION,
-      radio_profile::spreadingFactor, double(radio_profile::bandwidthKhz),
-      radio_profile::codingRate, double(radio_profile::frequencyMhz),
+      rfProfile.sf, double(radio_profile::bandwidthKhz),
+      radio_profile::codingRate, double(rfProfile.frequencyMhz),
       unsigned(kPacketQueue), (unsigned long)kSyncMs,
 #if defined(CLIENT_TRIP_LOG)
       "false", "client-trip-1hz");

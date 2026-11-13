@@ -11,20 +11,21 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(os.environ.get("SHORE_RADIO_POWER_SOURCE", ROOT / "src/main.cpp")).read_text()
+EXT_SOURCE = (ROOT / "include/station_extensions.h").read_text()
 
 
-def block(marker):
-    start = SOURCE.index(marker)
-    body = SOURCE.index("{", start)
+def block(marker, source=SOURCE):
+    start = source.index(marker)
+    body = source.index("{", start)
     depth = 0
     tokens = r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]'
-    for match in re.finditer(tokens, SOURCE[body:]):
+    for match in re.finditer(tokens, source[body:]):
         if match.group() == "{":
             depth += 1
         elif match.group() == "}":
             depth -= 1
             if not depth:
-                return SOURCE[start:body + match.end()]
+                return source[start:body + match.end()]
     raise ValueError(f"Unterminated source block: {marker}")
 
 
@@ -41,8 +42,11 @@ assert not re.search(r'\bradio\.setOutputPower\s*\(', code), \
 
 cpp = r'''
 #include <cassert>
+#include "ble_control_protocol.h"
 #include "radio_profile.h"
+#include "runtime_radio_profile.h"
 #include "station_board.h"
+#include "loop_metrics.h"
 #include <atomic>
 #include <cstdint>
 #include <iostream>
@@ -84,21 +88,40 @@ struct LogStub {
 struct SpiStub { void begin(int, int, int, int) { assert(pmuOnline && pmu.enabled && pmu.voltage==3300); } } SPI;
 struct RadioStub {
   int beginResult = 0, rxResult = 0, boostResult = 0;
+  int frequencyResult = 0;
   unsigned boostCalls=0;
   int setRxBoostedGainMode(bool enabled) { assert(enabled); ++boostCalls; return boostResult; }
   unsigned rxCalls = 0, standbyCalls = 0;
   std::vector<int> powers;
+  std::vector<float> frequencies;
   void (*irq)() = nullptr;
   int begin(float, float, int, int, int, int power) {
     powers.push_back(power); return beginResult;
   }
+  int setFrequency(float frequency) { frequencies.push_back(frequency); return frequencyResult; }
   void setDio1Action(void (*callback)()) { irq = callback; }
   int startReceive() { ++rxCalls; return rxResult; }
   int standby() { ++standbyCalls; return rxResult; }
 } radio;
+struct PreferencesStub {
+  uint8_t channel = 1;
+  uint8_t getUChar(const char *, uint8_t fallback) const { return channel <= 1 ? channel : fallback; }
+} prefs;
+namespace station_extensions {
+int8_t activeChannel = -1;
+uint8_t selectedChannel = 0, savedChannel = 0, desiredChannel = 0;
+bool verified = false, scanning=false,txActive=false;
+void serviceRadio(){}
+const char *lastRfEvent = "";
+float lastRfFrequency = 0;
+void logRf(const char *event, float frequency) { lastRfEvent = event; lastRfFrequency = frequency; }
+}
 void onClientDio1() {}
 void onLoRaDio1() {}
 bool clientTxFlag = true, stationRadioIrq = true;
+bool stationRxReady=false;uint32_t nextStationRxRetryMs=0;
+struct MeasureDuration { explicit MeasureDuration(int&) {} }; int loraDuration=0;
+constexpr uint16_t RADIO_RX_ERR_LIMIT=30;
 '''
 # Preserve the actual role preprocessor branch, instead of copying either power
 # value into the implementation under test. Build this fixture once per role.
@@ -115,10 +138,17 @@ cpp += block("struct ClientRailGuard {") + ";\n"
 cpp += block("static bool prepareRadioPower(") + "\n"
 cpp += block("static bool initRadio(") + "\n"
 cpp += block("static bool recoverRadio(") + "\n"
+cpp += "#if defined(ROLE_STATION)\nnamespace station_extensions {\n" + block("static void begin()", EXT_SOURCE) + "\n}\n"
+cpp += block("static void serviceStationRadio()") + "\n#endif\n"
 cpp += r'''
 void reset() {
   radio = RadioStub{}; Log.clear(); clockMs = 1;
   pmu=PmuStub{}; pmuOnline=initPmu(); Log.clear();
+  prefs=PreferencesStub{};
+  station_extensions::activeChannel=1;station_extensions::selectedChannel=1;
+  station_extensions::savedChannel=1;station_extensions::desiredChannel=1;station_extensions::verified=false;
+  station_extensions::lastRfEvent="";station_extensions::lastRfFrequency=0;
+  runtime_radio_profile::set(923.8f,9);
   radioFailStreak = 5; lastRadioRecoverMs = 0; radioRecoverCount = 0;
   clientTxFlag = stationRadioIrq = true;
 }
@@ -127,6 +157,19 @@ void expectPower() {
   for (const int power : radio.powers) assert(power == EXPECTED_DBM);
 }
 int main() {
+#if defined(ROLE_STATION)
+  reset(); prefs.channel=1; station_extensions::activeChannel=-1;
+  station_extensions::begin();
+  assert(station_extensions::activeChannel==1 && radio.frequencies.size()==1);
+  assert(radio.frequencies.back()==923.8f && station_extensions::savedChannel==1);
+  const auto bootProfile=runtime_radio_profile::get();
+  assert(bootProfile.frequencyMhz==923.8f && bootProfile.sf==9);
+  assert(std::string(station_extensions::lastRfEvent)=="boot" && station_extensions::lastRfFrequency==923.8f);
+  reset(); prefs.channel=0; station_extensions::activeChannel=-1;
+  radio.frequencyResult=-5; station_extensions::begin();
+  assert(station_extensions::activeChannel==-1 && runtime_radio_profile::get().frequencyMhz==0.0f);
+  assert(station_extensions::lastRfFrequency==0.0f);
+#endif
 #if defined(ROLE_CLIENT)
   reset(); clientRailLock.test_and_set();
   const auto before=clockMs; assert(!initRadio()&&clockMs==before&&pmu.sets==0);
@@ -173,9 +216,32 @@ int main() {
   assert(!recoverRadio()); expectPower();
   assert(radio.rxCalls == 0 && radioFailStreak == 5);
   assert(!Log.contains("radio re-init ok"));
+#if defined(ROLE_STATION)
+  assert(station_extensions::activeChannel==-1);
+  assert(runtime_radio_profile::get().frequencyMhz==0.0f && runtime_radio_profile::get().sf==9);
+  // The desired channel survives failure; the next recovery must restore it.
+#endif
   radio.beginResult = 0; clockMs += RADIO_RECOVER_MIN_MS;
   assert(recoverRadio()); expectPower();
   assert(radio.powers.size() == 2 && radio.rxCalls + radio.standbyCalls == 1);
+#if defined(ROLE_STATION)
+  assert(station_extensions::activeChannel==1 && runtime_radio_profile::get().frequencyMhz==923.8f);
+#endif
+#if defined(ROLE_STATION)
+  reset(); radio.frequencyResult=-5;
+  assert(!recoverRadio()); expectPower();
+  assert(station_extensions::activeChannel==-1 && runtime_radio_profile::get().frequencyMhz==0.0f);
+  assert(std::string(station_extensions::lastRfEvent)=="recover failed");
+  radio.frequencyResult=0;clockMs+=RADIO_RECOVER_MIN_MS;
+  assert(recoverRadio() && station_extensions::activeChannel==1);
+  assert(runtime_radio_profile::get().frequencyMhz==923.8f);
+  // RX retry with an unknown channel must perform recovery before arming RX.
+  reset();station_extensions::activeChannel=-1;stationRxReady=false;nextStationRxRetryMs=0;radio.beginResult=-5;
+  serviceStationRadio();assert(!stationRxReady && radio.rxCalls==0 && station_extensions::activeChannel==-1);
+  radio.beginResult=0;clockMs+=RADIO_RECOVER_MIN_MS;
+  serviceStationRadio();assert(stationRxReady && radio.rxCalls==1 && station_extensions::activeChannel==1);
+  assert(runtime_radio_profile::get().frequencyMhz==923.8f);
+#endif
 
   // Reinitialization alone is insufficient if continuous RX cannot restart.
   reset(); radio.rxResult = -6;

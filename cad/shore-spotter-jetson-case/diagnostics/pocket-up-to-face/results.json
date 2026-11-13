@@ -1,0 +1,213 @@
+{
+  "freecad_version": [
+    "1",
+    "1",
+    "4",
+    "20260928 (Git shallow)",
+    "Unknown",
+    "2026/09/28 13:46:34",
+    "(HEAD detached at 4fd3bf320)",
+    "4fd3bf320d9566a27e60069fc8387448aaa3a094"
+  ],
+  "occt_version": "7.8.1",
+  "minimal_case": "80 x 80 x 2 mm plate; four diameter 3.5 mm circles; Pocket UpToFace to opposite plane",
+  "minimal_results": [
+    {
+      "plane": "XY",
+      "circles": 1,
+      "status": "Valid",
+      "null": false,
+      "valid": true,
+      "removed": 19.242255003233367
+    },
+    {
+      "plane": "XY",
+      "circles": 2,
+      "status": "Resulting fused extrusion is null.",
+      "null": true,
+      "valid": false,
+      "removed": null
+    },
+    {
+      "plane": "XY",
+      "circles": 4,
+      "status": "Resulting fused extrusion is null.",
+      "null": true,
+      "valid": false,
+      "removed": null
+    },
+    {
+      "plane": "YZ",
+      "circles": 1,
+      "status": "Valid",
+      "null": false,
+      "valid": true,
+      "removed": 19.242255003233367
+    },
+    {
+      "plane": "YZ",
+      "circles": 2,
+      "status": "Resulting fused extrusion is null.",
+      "null": true,
+      "valid": false,
+      "removed": null
+    },
+    {
+      "plane": "YZ",
+      "circles": 4,
+      "status": "Resulting fused extrusion is null.",
+      "null": true,
+      "valid": false,
+      "removed": null
+    }
+  ],
+  "original_model_parameter_results": [
+    {
+      "type": "Length",
+      "offset": 0,
+      "status": "Valid",
+      "null": false,
+      "volume": 76974.58874354488
+    },
+    {
+      "type": "UpToFace",
+      "offset": 0,
+      "status": "Resulting fused extrusion is null.",
+      "null": false,
+      "volume": 76974.58874354488
+    },
+    {
+      "type": "UpToFace",
+      "offset": 0.01,
+      "status": "Resulting fused extrusion is null.",
+      "null": false,
+      "volume": 76974.58874354488
+    },
+    {
+      "type": "UpToFace",
+      "offset": -0.01,
+      "status": "Resulting fused extrusion is null.",
+      "null": false,
+      "volume": 76974.58874354488
+    },
+    {
+      "type": "UpToFace",
+      "offset": 0.1,
+      "status": "Resulting fused extrusion is null.",
+      "null": false,
+      "volume": 76974.58874354488
+    },
+    {
+      "type": "UpToFace",
+      "offset": -0.1,
+      "status": "Resulting fused extrusion is null.",
+      "null": false,
+      "volume": 76974.58874354488
+    }
+  ],
+  "original_model_subset_results": [
+    {
+      "shape_prism_methods": []
+    },
+    {
+      "subset": [
+        4,
+        5
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "subset": [
+        4,
+        6
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "subset": [
+        4,
+        7
+      ],
+      "status": "Valid"
+    },
+    {
+      "subset": [
+        5,
+        6
+      ],
+      "status": "Valid"
+    },
+    {
+      "subset": [
+        5,
+        7
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "subset": [
+        6,
+        7
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "subset": [
+        4,
+        5,
+        6
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "subset": [
+        4,
+        5,
+        7
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "subset": [
+        4,
+        6,
+        7
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "subset": [
+        5,
+        6,
+        7
+      ],
+      "status": "Valid"
+    },
+    {
+      "subset": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "refine": false,
+      "status": "Resulting fused extrusion is null."
+    },
+    {
+      "exact_sketch_placement": "Placement [Pos=(79.79,0,0), Yaw-Pitch-Roll=(90,0,90)]",
+      "status": "Resulting fused extrusion is null."
+    }
+  ],
+  "source_commit": "4fd3bf320d9566a27e60069fc8387448aaa3a094",
+  "observations": [
+    "Fails before the boolean cut of the base solid.",
+    "Single circles succeed individually.",
+    "Two or four circles fail on independent XY and YZ plates.",
+    "Turning Refine off and small positive/negative offsets did not fix original-model failure.",
+    "The caller catches Base::Exception from makeElementPrismUntil and returns a null prism, losing the more specific lower-level error."
+  ],
+  "suspected_lower_level_cause": "Sequential BRepFeat_MakePrism operations in makeElementPrismUntil use the preceding result as a base and switch to FuseWithBase for later disconnected profiles. Exact OCCT failure has not been instrumented."
+}

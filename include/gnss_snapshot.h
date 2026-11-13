@@ -37,6 +37,18 @@ struct Counters {
   uint32_t missingTime = 0, timeResyncs = 0;
 };
 
+enum class RejectReason : uint8_t { None, Framing, Checksum, Fields, Time, Coordinates, Epoch, NonAscii, Overflow, Resync, Backlog };
+inline const char *rejectName(RejectReason r) {
+  switch(r) {
+    case RejectReason::Framing:return "framing"; case RejectReason::Checksum:return "checksum";
+    case RejectReason::Fields:return "fields"; case RejectReason::Time:return "time";
+    case RejectReason::Coordinates:return "coordinates"; case RejectReason::Epoch:return "epoch";
+    case RejectReason::NonAscii:return "non_ascii"; case RejectReason::Overflow:return "overflow";
+    case RejectReason::Resync:return "resync"; case RejectReason::Backlog:return "backlog";
+    default:return "none";
+  }
+}
+
 class Collector {
  public:
   // The allowance bounds the caller's local UART servicing delay. The caller
@@ -47,6 +59,7 @@ class Collector {
                      uint32_t backlogAllowanceMs = kBacklogAllowanceMs)
       : baud_(baud ? baud : 9600), allowanceMs_(backlogAllowanceMs) {}
 
+  RejectReason lastRejectReason() const { return rejectReason_; }
   const Counters &counters() const { return counters_; }
   const Counters &stats() const { return counters_; }
   uint32_t backlogAllowanceMs() const { return allowanceMs_; }
@@ -77,12 +90,14 @@ class Collector {
         static_cast<unsigned char>(ch) > 126) {
       collecting_ = false;
       recovery_ = Recovery{};
+      rejectReason_ = RejectReason::NonAscii;
       ++counters_.rejectedSentences;
       return;
     }
     if (length_ + 1 >= sizeof(line_)) {
       collecting_ = false;
       recovery_ = Recovery{};
+      rejectReason_ = RejectReason::Overflow;
       ++counters_.overflows;
       ++counters_.rejectedSentences;
       return;
@@ -316,18 +331,20 @@ class Collector {
     return &current_;
   }
 
-  bool rejectSentence() { recovery_ = Recovery{}; return false; }
+  bool rejectSentence(RejectReason reason = RejectReason::Fields) {
+    rejectReason_ = reason; recovery_ = Recovery{}; return false;
+  }
 
   bool consume(uint32_t now) {
     char *star = strchr(line_, '*');
-    if (!star || star - line_ < 6 || strlen(star + 1) != 2) return rejectSentence();
+    if (!star || star - line_ < 6 || strlen(star + 1) != 2) return rejectSentence(RejectReason::Framing);
     const int hi = hex(star[1]), lo = hex(star[2]);
-    if (hi < 0 || lo < 0) { ++counters_.checksumErrors; return rejectSentence(); }
+    if (hi < 0 || lo < 0) { ++counters_.checksumErrors; return rejectSentence(RejectReason::Checksum); }
     uint8_t checksum = 0;
     for (char *p = line_ + 1; p < star; ++p) checksum ^= static_cast<uint8_t>(*p);
     if (checksum != ((hi << 4) | lo)) {
       ++counters_.checksumErrors;
-      return rejectSentence();
+      return rejectSentence(RejectReason::Checksum);
     }
     haveSentence_ = true; lastSentenceMs_ = now;
     // GSV/GSA/VTG/TXT etc. are normal GNSS output, not decoder errors.
@@ -356,7 +373,7 @@ class Collector {
     if ((!rmc && !gga) || (rmc && count < 10) || (gga && count < 10)) return rejectSentence();
     uint32_t utc;
     if (!utcTime(fields[1], utc)) {
-      ++counters_.missingTime; recovery_ = Recovery{}; return rejectSentence();
+      ++counters_.missingTime; recovery_ = Recovery{}; return rejectSentence(RejectReason::Time);
     }
 
     double lat = 0, lon = 0, speed = 0, course = 0, hdop = NAN;
@@ -366,7 +383,7 @@ class Collector {
       if ((strcmp(fields[2], "A") != 0) && (strcmp(fields[2], "V") != 0)) return rejectSentence();
       fix = fields[2][0] == 'A';
       if (fix && (!coordinate(fields[3], fields[4], true, lat) ||
-                  !coordinate(fields[5], fields[6], false, lon))) return rejectSentence();
+                  !coordinate(fields[5], fields[6], false, lon))) return rejectSentence(RejectReason::Coordinates);
       // Explicit estimated/manual/simulated/no-fix mode is not a measured fix.
       if (count > 12 && fields[12][0] &&
           strchr("EMNS", fields[12][0])) fix = false;
@@ -378,7 +395,7 @@ class Collector {
       if (!integer(fields[6], 8, quality)) return rejectSentence();
       fix = quality >= 1 && quality <= 5;
       if (fix && (!coordinate(fields[2], fields[3], true, lat) ||
-                  !coordinate(fields[4], fields[5], false, lon))) return rejectSentence();
+                  !coordinate(fields[4], fields[5], false, lon))) return rejectSentence(RejectReason::Coordinates);
       if (integer(fields[7], 254, sats)) satellites = static_cast<uint8_t>(sats);
       if (!decimal(fields[8], hdop)) hdop = NAN;
     }
@@ -390,7 +407,7 @@ class Collector {
     // movement in the position predictor. Keep it separate from sourceAgeMs.
     if (!fix) recovery_ = Recovery{};
     Epoch *e = selectEpoch(utc, now, now - duration, fix);
-    if (!e) return false;
+    if (!e) { rejectReason_ = RejectReason::Epoch; return false; }
     // The expected RMC+GGA pair is one epoch, not a duplicate transmission.
     if ((rmc && e->rmc) || (gga && e->gga)) ++counters_.duplicateEpochs;
     if (rmc) {
@@ -423,5 +440,6 @@ class Collector {
   Recovery recovery_;
   Epoch current_, previous_;
   Counters counters_;
+  RejectReason rejectReason_ = RejectReason::None;
 };
 }  // namespace gnss_snapshot

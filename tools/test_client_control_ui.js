@@ -1,0 +1,33 @@
+// Exercise the production renderer/request paths without device or RF traffic.
+const assert=require('node:assert/strict');
+const {createPage,settle,html}=require('./test_motion_ui.js');
+(async()=>{
+ const {c,elements:e}=createPage();await settle();
+ const report={client_id:64295,supported:true,state:'ready',age_ms:1000,command:'idle'};
+ c.renderClientControl(report);assert.equal(e.clientPairedId.textContent,'FB27');
+ c.renderClientControl({...report,supported:false,age_ms:100000});
+ assert.equal(e.clientPairedId.textContent,'FB27');assert.equal(e.clientControlState.textContent,'Client 尚未回報');
+ const request=c.httpRequest;
+ c.httpRequest=()=>Promise.reject(new Error('timeout'));
+ await c.refreshClientControl();assert.equal(e.clientPairedId.textContent,'FB27');
+ assert.equal(e.clientControlState.textContent,'Station 連線失敗');assert(e.btnClientStart.disabled);
+ c.renderClientControl({supported:false});assert.equal(e.clientPairedId.textContent,'FB27');
+ c.renderClientControl({...report,client_id:'0'});assert.equal(e.clientPairedId.textContent,'FB27');
+ c.renderClientControl({...report,client_id:0});assert.equal(e.clientPairedId.textContent,'未配對');
+ c.renderClientControl(report);c.httpRequest=()=>Promise.resolve(report);
+ let release;const sent=[];
+ c.formPost=(_path,body)=>{sent.push(body.action);return new Promise(resolve=>{release=resolve;});};
+ const pending=c.sendClientControl('start');
+ assert.equal(e.clientPairedId.textContent,'FB27');assert.match(e.clientControlHint.textContent,/等待 Client/);
+ assert(e.btnClientStart.disabled);release({...report,command:'pending'});await pending;await settle();
+ assert.equal(e.clientPairedId.textContent,'FB27');assert(!e.btnClientStart.disabled);
+ c.renderClientControl({...report,state:'test'});assert(!e.btnClientTestStop.disabled);
+ const stop=e.btnClientTestStop.onclick();assert.equal(sent.at(-1),'stop');
+ release(report);await stop;await settle();assert(e.btnClientTestStop.disabled);
+ c.renderClientControl({...report,client_id:61493});assert.equal(e.clientPairedId.textContent,'F035');
+ c.httpRequest=request;
+ const fresh=createPage();await settle();fresh.c.confirmedClientId=null;
+ fresh.c.renderClientControl({supported:false});assert.equal(fresh.elements.clientPairedId.textContent,'--');
+ assert(!/已記住|M0（固定）|id="btnCompassCenter"|id="stationSd"/.test(html));
+ console.log('PASS confirmed binding survives pending, HTTP failure and stale STATE; explicit zero unpairs; RF test has stop action');
+})().catch(e=>{console.error(e);process.exitCode=1;});

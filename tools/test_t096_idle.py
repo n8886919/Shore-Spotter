@@ -12,10 +12,16 @@ actual = '\n'.join(extract_function(source, name) for name in
 assert 'systemOff(' not in source, 'normal firmware must remain RTC-wakeable'
 cpp = r'''
 #include <cassert>
+#include "t096_maintenance.h"
+t096_maintenance::Fault maintenanceFault;
 #include <algorithm>
 #include "t096_control.h"
 #include "t096_power.h"
 #include "t096_idle.h"
+#include "mcu_temperature.h"
+mcu_temperature::Sample mcuTemperature;
+bool bleReady=false;uint32_t nextBleStatusMs=0;void serviceBle(uint32_t){}
+void serviceMcuTemperature(uint32_t){}void serviceDiagnosticUsb(uint32_t){}
 using TickType_t=uint32_t;using BaseType_t=int;using TaskHandle_t=void*;
 constexpr int pdTRUE=1,pdFALSE=0,RADIOLIB_ERR_NONE=0;
 constexpr uint32_t kTxTimeoutMs=3000;
@@ -50,7 +56,7 @@ bool Serial=false;void printIdentity(const char*){}
 void serviceUserButton(uint32_t){}void serviceBattery(uint32_t){}void serviceLowBattery(uint32_t){}
 void serviceClientDisplay(uint32_t){}void serviceGnss(uint32_t){}
 void serviceTransmit(uint32_t){}void serviceReceive(uint32_t){}void observeDataDeferral(uint32_t){}
-bool configureRadio(){radioReady=true;return true;}
+unsigned radioInitCalls=0;bool configureRadio(){++radioInitCalls;radioReady=true;return true;}
 unsigned sends=0;
 bool queueState(uint32_t){outLength=1;return true;}bool queueProbe(uint32_t){return false;}
 bool queueDiagnostic(uint32_t){return false;}bool queueRealPosition(uint32_t){return false;}
@@ -59,6 +65,8 @@ void sendBuffered(){if(outLength){++sends;outLength=0;control.notedState(millis(
 int main(){
  control.notedState(1000);
  assert(idleWaitMs(1000)==30000);
+ bleReady=true;nextBleStatusMs=2000;assert(idleWaitMs(1000)==1000);bleReady=false;
+ mcuTemperature.pending=true;assert(idleWaitMs(1000)==1);mcuTemperature.pending=false;
  const auto bootState=control.state();
  waitForWork();assert(clockMs==31000&&idleBlockedMs==30000&&radio.sleeps==1&&radioSleeping);
  assert(control.state()==bootState); // state remains in RAM across RTC task blocking.
@@ -80,14 +88,17 @@ int main(){
  userButton.begin(false,1000);usb=true;assert(idleWaitMs(1000)==20);usb=false;
  confirmationPending=true;nextTxStartMs=1300;assert(idleWaitMs(1000)==300);
  nextTxStartMs=1000;assert(!idleWaitMs(1000));confirmationPending=false;
- control.setClientId(0xF035);control.apply({0xF035,1,MSG_CLIENT_CONTROL},{55,client_control::Action::Start,10},1000);
+ control.setClientId(0xF035);control.applyBle({ble_control::Op::Claim,0,0xF035,10,55,0,101},false);control.apply({0xF035,1,MSG_CLIENT_CONTROL},{55,client_control::Action::Start,10},1000);
  assert(idleWaitMs(1000)==1);control.requestReady();
  batteryProtection=true;nextBatteryMs=61000;assert(idleWaitMs(1000)==60000);
  loop();assert(!sends);batteryProtection=false;confirmationPending=true;loop();assert(sends==1);
- // Missing radio retries are bounded; sleep failure remains visible and retryable.
+ confirmationPending=false;clockMs=70000;loop();assert(sends==1); // Ready never sends a periodic STATE.
+ // In Ready, a failed radio does not set a 5 s retry deadline or reinitialize.
  clockMs=1000;radioReady=false;nextRadioRetryMs=1000;nextBatteryMs=31000;
- assert(idleWaitMs(1000)==5000);radioReady=true;radioSleeping=false;radio.result=-7;
- waitForWork();assert(!radioReady&&rxErrors==1&&lastTicks<=pdMS_TO_TICKS(5000));
+ assert(idleWaitMs(1000)==30000);clockMs=7000;nextBatteryMs=37000;loop();
+ assert(!radioReady && radioInitCalls==0);
+ clockMs=1000;radioReady=true;radioSleeping=false;radio.result=-7;
+ waitForWork();assert(!radioReady&&rxErrors==1&&lastTicks==pdMS_TO_TICKS(30000));
  // Relative periodic timers plus absolute future deadlines work through uint32 wrap.
  control.notedState(0xFFFFFFF0U);nextBatteryMs=0xFFFFFFF0U+30000;radioReady=true;radioSleeping=true;
  assert(idleWaitMs(16)==29968);

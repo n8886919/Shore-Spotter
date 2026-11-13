@@ -20,6 +20,8 @@ cpp=r'''
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <cstring>
+#include "alerts.h"
 #include "servo_controller.h"
 #include "servo_motion.h"
 #include "tracking_policy.h"
@@ -62,6 +64,10 @@ struct Http {std::map<std::string,String>params;String body;int code=0;
 '''
 for marker in ['static const char *trackModeStr(', 'static uint32_t clientSampleAgeMs()', 'static bool clientFixFresh()', 'static bool haveBearingFix()', 'static bool gpsModeAvailable() {','static bool gpsTrackingUsable() {','static bool setServoAngle(float deg) {','static void enterManual() {','static void serviceControl() {','static bool selectTrackingMode(TrackMode mode) {','static bool parseAngleArgument(', 'static bool acceptMotionRequest() {','static void appendCommandContext(', 'static String controlReply() {','static String motionSettingsJson() {','static bool saveServoSpeed(', 'static bool requestTrackingMode(', 'static bool compassCalibrationReady() {','static float lockMountOffset(', 'static void appendServoJson(', 'static void loadStationSettings() {']:
  cpp+=block(marker)+'\n'
+# Compile the actual SD alert branch, including its title/severity, without I/O.
+sd_branch=s[s.index('  // SD failures belong'):s.index('  // --- 下水端：連線')]
+cpp+='namespace sd_log {const char *state="recording";const char *stateName(){return state;}}\n'
+cpp+='int sdAlerts(){int count=0;auto add=[&](alerts::Level level,const char *id,const char *,const char *){assert(level==alerts::WARN);assert(std::string(id)=="station_sd");++count;};\n'+sd_branch+'return count;}\n'
 for path,name in [('/api/servo','manualHttp'),('/api/servo/mode','modeHttp'),('/api/servo/center','centerHttp'),('/api/servo/settings','speedHttp'),('/api/track/start','startHttp'),('/api/track/resume','resumeHttp'),('/api/track/pause','pauseHttp'),('/api/track/calibrate','calibrateHttp')]:
  m=re.search(r'httpServer.on\("'+re.escape(path)+r'",\s*HTTP_POST,\s*\[\]\(\)\s*{',s).group();b=block(m);cpp+='void '+name+'()'+b[b.index('{'):]+'\n'
 cpp+=r'''
@@ -71,6 +77,9 @@ void reset(){clockMs=0;servoOutput={};servoSerial={};servoMotion.initializeUs(17
  servoAngleDeg=servoTargetDeg=179.5;gpsCadence={};enterManual();serviceControl();}
 void run(uint32_t duration){const auto end=clockMs+duration;while(clockMs<end){clockMs+=10;if(feed)lastRxMs=clockMs;serviceControl();}}
 int main(){
+ for(const char *state:{"recording","mounting","stopping","stopped","unsupported"}){sd_log::state=state;assert(sdAlerts()==0);}
+ sd_log::state="error";assert(sdAlerts()==1);sd_log::state="recording";assert(sdAlerts()==0);
+ std::cout<<"PASS SD error alert, recovery, intentional stop and unsupported board exclusion\n";
  reset();assert(servoSerial.last=="#00P1500!");assert(servoOutput.channel()==0);
  auth();httpServer.params["mode"]="uart";modeHttp();assert(httpServer.code==400&&trackMode==TrackMode::Manual);
  auth();httpServer.params["angle"]="359";manualHttp();assert(httpServer.code==200);run(7000);
@@ -99,6 +108,21 @@ int main(){
  auth();centerHttp();assert(httpServer.code==200&&trackMode==TrackMode::Manual&&servoMotion.requested()==179.5);run(7000);
  assert(compassCalibrationReady());auth();httpServer.params["bearing"]="90";calibrateHttp();assert(httpServer.code==200&&mountCalibrated&&std::abs(mountOffsetDeg+90.5)<0.01);
  std::cout<<"PASS dual-position gate, stale GPS freezes target and sends final pulse, centre/calibration at 179.5\n";
+ reset();auth();httpServer.params["angle"]="250";manualHttp();run(5000);
+ assert(!compassCalibrationReady());const auto epoch=commandGate.epoch();
+ auth();httpServer.params["bearing"]="90";httpServer.params["physical_center"]="1";calibrateHttp();
+ assert(httpServer.code==200&&servoMotion.position()==179.5&&servoMotion.requested()==179.5);
+ assert(commandGate.epoch()!=epoch&&std::abs(mountOffsetDeg+90.5)<0.01);
+ run(30);assert(servoAngleDeg==179.5&&servoSerial.last=="#00P1500!");
+ auth();httpServer.params["angle"]="200";manualHttp();
+ auth();httpServer.params["bearing"]="90";httpServer.params["physical_center"]="1";calibrateHttp();assert(httpServer.code==409);
+ run(2000);assert(selectTrackingMode(TrackMode::Gps));
+ auth();httpServer.params["bearing"]="90";httpServer.params["physical_center"]="1";calibrateHttp();assert(httpServer.code==409);
+ enterManual();servoMotion.faultUs(micros());
+ auth();httpServer.params["bearing"]="90";httpServer.params["physical_center"]="1";calibrateHttp();assert(httpServer.code==409);
+ reset();auth();httpServer.params["bearing"]="360";httpServer.params["physical_center"]="1";calibrateHttp();assert(httpServer.code==400);
+ auth();httpServer.params["bearing"]="90";httpServer.params["physical_center"]="0";calibrateHttp();assert(httpServer.code==400);
+ std::cout<<"PASS physical centre resync from non-home angle, old epoch invalidation, moving/GPS/fault rejection and invalid inputs\n";
  String js="{";appendServoJson(js);js+="}";std::cout<<"JSON "<<js<<"\n";
 }
 '''

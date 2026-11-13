@@ -176,8 +176,13 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .verticalFields{display:flex;flex-direction:column;gap:12px}.verticalFields label{display:flex;flex-direction:column;gap:5px}
 .verticalFields input{width:100%;min-width:0}.positionToggle{display:flex;gap:0}.positionToggle .seg{flex:1}
 .numberButton{flex:none;min-width:0;border:0;background:transparent;padding:4px;color:var(--acc);text-decoration:underline}
+.linkButton{color:#1264bd;text-decoration:underline;cursor:pointer;font-weight:700}
+.linkButton:disabled{cursor:default;opacity:.55}
+.radioChoice{display:block;margin:12px 0;font-size:15px}
+.radioChoice input{width:auto;margin-right:8px}
+.radioChoice small{display:block;margin:4px 0 0 24px;color:#526459}
 .infoCard a{color:var(--acc)}.infoCard .hint3{color:#6b756f;line-height:1.6}
-#controllerFrame{font-size:13px}dialog{border:1px solid var(--line);border-radius:12px;width:min(360px,90vw);padding:20px;color:var(--fg)}
+dialog{border:1px solid var(--line);border-radius:12px;width:min(360px,90vw);padding:20px;color:var(--fg)}
 dialog::backdrop{background:#11251a66}dialog input{display:block;width:100%;margin-top:8px}
 </style>
 </head>
@@ -230,12 +235,8 @@ dialog::backdrop{background:#11251a66}dialog input{display:block;width:100%;marg
       <h3>定位資訊</h3>
       <table class="positionTable"><thead><tr><th>項目</th><th>Station</th><th>Surfer</th></tr></thead><tbody>
         <tr><th>衛星</th><td id="sSat">--</td><td id="cSat">--</td></tr>
-        <tr><th>HDOP<small>衛星幾何造成的水平誤差放大倍率；越低越好，沒有公尺單位。</small></th><td id="sAcc">--</td><td id="cAcc">--</td></tr>
         <tr><th>座標</th><td id="sMap">--</td><td id="cMap">--</td></tr>
         <tr><th>位置更新</th><td id="sPositionAge">--</td><td id="cPositionAge">--</td></tr>
-        <tr><th>回報誤差半徑</th><td id="stationPositionAccuracy">--</td><td>未提供</td></tr>
-        <tr><th>30 秒散布</th><td id="stationSpread">--</td><td>未計算</td></tr>
-        <tr><th>實際位置誤差</th><td colspan="2">未測得<small>需與已知真實座標比較；手機半徑、HDOP 與散布不能代替真實誤差。</small></td></tr>
       </tbody></table>
       <div id="stationPositionSettings">
         <div class="r"><span>Station 位置來源</span><b id="stationPositionSource">讀取中</b></div>
@@ -243,7 +244,7 @@ dialog::backdrop{background:#11251a66}dialog input{display:block;width:100%;marg
         <div class="r"><span>手機快照時間</span><b id="stationPositionTime">--</b></div>
         <div class="r"><span>磁偏角補償</span><b id="mcDeclination">--</b></div>
         <div class="r"><span>校正偏移</span><b id="mcOff">--</b></div>
-        <details><summary>GNSS 診斷</summary><div class="r"><span>Station 實測 epoch／RMC／GGA</span><b id="gnssRate">--</b></div><div class="r"><span>Station checksum／時間錯誤</span><b id="gnssErrors">--</b></div><div class="r"><span>Surfer GNSS 快照</span><b id="gnssClientAge">--</b></div><p class="hint3">Surfer 是低頻診斷快照；GPS 關閉或回報過期時，舊資料不能當作目前狀態。</p></details>
+        <details><summary>定位診斷</summary><table class="positionTable"><thead><tr><th>項目</th><th>Station</th><th>Surfer</th></tr></thead><tbody>        <tr><th>HDOP</th><td id="sAcc">--</td><td id="cAcc">--</td></tr>        <tr><th>回報誤差半徑</th><td id="stationPositionAccuracy">--</td><td>未提供</td></tr>        <tr><th>30 秒散布</th><td id="stationSpread">--</td><td>未計算</td></tr></tbody></table><p class="hint3">HDOP 是幾何指標；回報半徑與散布都不是實測位置誤差。</p><div class="r"><span>Station 實測 epoch／RMC／GGA</span><b id="gnssRate">--</b></div><div class="r"><span>Station checksum／時間錯誤</span><b id="gnssErrors">--</b></div><div class="r"><span>Surfer GNSS 快照</span><b id="gnssClientAge">--</b></div><p class="hint3">Surfer 是低頻診斷快照；GPS 關閉或回報過期時，舊資料不能當作目前狀態。</p></details>
         <details><summary>手動輸入 Station 座標</summary>
           <div class="extensionFields verticalFields">
             <label>經度<input id="stationPhoneLon" type="text" inputmode="decimal" placeholder="例：121.00000" aria-label="Station 手動經度"></label>
@@ -252,54 +253,50 @@ dialog::backdrop{background:#11251a66}dialog input{display:block;width:100%;marg
           </div>
           <button id="btnManualPhonePosition" type="button">套用座標</button>
         </details>
-        <p id="stationPositionState" class="extensionStatus" role="status" aria-live="polite">沿用原本 HTTPS 手機定位頁。</p>
+        <p id="stationPositionState" class="extensionStatus" role="status" aria-live="polite"></p>
       </div>
     </div>
     <div class="card infoCard">
       <h3>Station Info</h3>
-      <div class="r"><span>溫度／濕度</span><b><span id="sTemp">--</span>／<span id="sHum">--</span></b></div>
-      <div class="r"><span>韌體版本</span><b id="sVersion">--</b></div>
-      <div class="r"><span>SD 記錄</span><b id="stationSd">讀取中</b></div>
       <div id="servoSpeedSettings"><div class="r"><span>Servo 最高速度</span><button id="speedValue" class="numberButton" type="button" disabled>30°／秒</button></div><span id="speedSaveState" class="hint3">讀取速度中</span></div>
-      <div class="calRow"><span>鏡頭指南針校正</span><button id="btnCompassCenter" type="button">鏡頭置中</button></div>
+      <div class="calRow"><span>鏡頭指南針校正</span></div>
       <div class="calRow"><input id="compassBearing" type="text" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" value="90" aria-label="鏡頭指南針角度"><span>°</span><button id="btnCompassCal" type="button">校正</button></div>
       <p class="hint3">北 0°、東 90°、南 180°、西 270°</p>
-      <p id="compassCalState" class="hint3" role="status">先置中、等鏡頭停穩，再校正；校正後再選 GPS。</p>
-    </div>
-    <div class="card infoCard" id="controllerSettings">
-      <h3>控制板</h3>
-      <div class="r"><span>Servo</span><b>Youmi 35 kg · 0–359°</b></div>
-      <div class="r"><span>串口輸出</span><b id="controllerSerial">讀取中</b></div>
-      <div class="r"><span>控制通道</span><b>M0（固定）</b></div>
-      <div class="r"><span>指令角度／目標</span><b id="controllerAngles">--</b></div>
-      <div class="r"><span>脈寬／最後指令</span><b id="controllerFrame">--</b></div>
-      <div class="r"><span>已送指令</span><b id="controllerSent">--</b></div>
-      <div class="r"><span>延後／寫入錯誤</span><b id="controllerErrors">--</b></div>
-      <p class="hint3">Servo 接 M0。控制板沒有已知 ACK 或角度回授，送出成功仍需目視確認；8.4 V 是接線供電值，沒有電壓感測。</p>
-      <p id="controllerState" class="hint3" role="status"></p>
+      <p id="compassCalState" class="hint3" role="status">先切手動，按控制板的置中按鈕，等鏡頭停穩再校正。</p>
     </div>
     <div id="clientControlSettings" class="card infoCard">
       <h3>Surfer Info</h3>
-      <div class="r"><span>配對 Surfer</span><b id="clientPairedId">--</b></div>
+      <div class="r"><span>配對 Surfer</span><button id="clientPairedId" type="button" class="numberButton linkButton" aria-label="更改目標 Client ID">--</button></div>
       <div class="r"><span>GPS</span><b id="clientControlState">未確認</b></div>
       <div class="r"><span>電池</span><b id="cBattV">--</b></div>
-      <div class="r"><span>距上次 STATE</span><b id="clientControlAge">--</b></div>
+      <div class="r"><span>上次回報</span><b id="clientControlAge">--</b></div>
+      <div class="r" id="clientChannelRow" style="display:none"><span>LoRa 頻道</span><button id="clientChannelValue" type="button" class="numberButton linkButton" aria-label="查看頻道與掃描">--</button></div>
+      <div class="extensionActions"><button id="btnClientStart" type="button" disabled>開啟位置回報</button><button id="btnClientStop" type="button" disabled>關閉位置回報</button></div>
+      <details><summary>連線與裝置診斷</summary>
       <div class="r"><span>距上次定位 DATA</span><b id="cAge">--</b></div>
       <div class="r"><span>LoRa</span><b id="cLink">--</b></div>
       <div class="r"><span>DATA FPS（10 s）</span><b id="cFps">--</b></div>
-      <div class="r"><span>RSSI／SNR</span><b><span id="sRssi">--</span>／<span id="sSnr">--</span></b></div>
+      <div class="r"><span>RSSI 訊號強度</span><b id="sRssiQuality">--</b></div>
+      <div class="r"><span>SNR 訊號品質</span><b id="sSnrQuality">--</b></div>
+      <p id="rfQualityHint" class="hint3">等待 Station 資料</p>
+      <details><summary>RF 原始數值</summary><div class="r"><span>RSSI／SNR</span><b><span id="sRssi">--</span>／<span id="sSnr">--</span></b></div></details>
       <div class="r"><span>DATA 缺號比例</span><b id="sDrop">--</b></div>
       <div class="r"><span>距離／方位</span><b><span id="cDist">--</span>／<span id="cBrg">--</span></b></div>
       <div class="r"><span>組別／頻率</span><b id="clientRadioGroup">--</b></div>
       <div class="r"><span>命令</span><b id="clientControlCommand">--</b></div>
-      <div class="extensionActions"><button id="btnClientStart" type="button" disabled>開啟 GPS</button><button id="btnClientStop" type="button" disabled>關閉 GPS</button></div>
-      <details><summary>LoRa RF 測試</summary><div id="clientControlTest" class="extensionStatus">--</div><button id="btnClientTest" type="button" disabled>RF 測試（GPS 關閉）</button></details>
-      <p id="clientControlHint" class="extensionStatus" role="status" aria-live="polite">等待近期 STATE。</p>
+      <div class="r"><span>MCU 溫度</span><b id="cMcuTemp">--</b></div>
+      <div class="r"><span>本次接收最高溫</span><b id="cMcuTempMax">--</b></div>
+      <div class="r"><span>溫度遙測接收年齡</span><b id="cMcuTempAge">--</b></div>
+      <p class="hint3">晶片溫度，非電池／環境溫度；最高值僅計本次接收樣本，年齡自收到遙測起算。</p>
+      <details><summary>無線連線測試</summary><p class="hint3">測試期間關閉 GPS，需手動結束。</p><div id="clientControlTest" class="extensionStatus">--</div><div class="extensionActions"><button id="btnClientTest" type="button" disabled>開始測試</button><button id="btnClientTestStop" type="button" disabled>結束測試</button></div></details></details>
+      <p id="clientControlHint" class="extensionStatus" role="status" aria-live="polite"></p>
     </div>
   </section>
 </main>
 
 <dialog id="speedDialog"><form id="speedForm"><h3>Servo 最高速度</h3><label>每秒角度（1–90）<input id="cfgSpeed" type="text" inputmode="numeric" pattern="[0-9]{1,2}" maxlength="2" value="30"></label><p id="speedError" class="hint3" role="status"></p><div class="extensionActions"><button id="cancelSpeed" type="button">取消</button><button type="submit">儲存</button></div></form></dialog>
+<dialog id="clientBindingDialog" aria-labelledby="clientBindingTitle"><form id="clientBindingForm"><h3 id="clientBindingTitle">更改目標 Client</h3><label>Client ID<input id="clientBindingInput" type="text" maxlength="4" pattern="[0-9A-Fa-f]{1,4}" autocapitalize="characters" autocomplete="off" spellcheck="false" required></label><p class="hint3">輸入 Client 螢幕上的 ID。已認主的 Client 必須重開機，才能改跟另一台 Station。</p><p id="clientBindingError" class="hint3" role="status"></p><div class="extensionActions"><button id="cancelClientBinding" type="button">取消</button><button id="saveClientBinding" type="submit">確認更改</button></div></form></dialog>
+<dialog id="clientRadioDialog" aria-labelledby="clientRadioTitle"><form id="clientRadioForm"><h3 id="clientRadioTitle">LoRa 頻道</h3><p class="hint3">待機時可掃描與選擇；啟動後收到新頻道回報，才保存設定。掃描結果只代表當下觀察。</p><button id="scanClientRadio" type="button" disabled>掃描候選頻道</button><label class="radioChoice"><input id="clientRadioA" type="radio" name="clientRadioChannel" value="0">A · 923.2 MHz<small id="clientRadioAResult">尚未掃描</small></label><label class="radioChoice"><input id="clientRadioB" type="radio" name="clientRadioChannel" value="1">B · 923.8 MHz<small id="clientRadioBResult">尚未掃描</small></label><p id="clientRadioState" class="hint3" role="status"></p><p id="clientRadioError" class="hint3" role="status"></p><div class="extensionActions"><button id="selectClientRadio" type="submit" disabled>確認選擇</button></div></form></dialog>
 <div id="alertBar" class="alertBar"></div>
 <div id="toast"></div>
 
@@ -307,6 +304,7 @@ dialog::backdrop{background:#11251a66}dialog input{display:block;width:100%;marg
 var $=function(id){return document.getElementById(id);};
 var last={track:null,status:null,alerts:[]};
 var trackReceivedMs=null;
+var statusReceivedMs=null;
 var dragging=false;
 var ringGesture=null;
 var servoPendingAngle=null;
@@ -370,11 +368,35 @@ function isMotionUrl(url){return /^\/api\/(servo(?:[/?]|$)|track\/(start|resume|
 // callers share a pending job by key; priority is reconsidered between reads.
 var httpQueue=[],httpActive=null,httpByKey={},httpOrder=0,httpContextAt=-Infinity;
 var HTTP_TIMEOUT_MS=2000;
+var httpGeneration=0,httpSuspended=false,httpRetryAt=0,httpRetryTimer=0;
+var httpFailures=[];
 // Capture when the user commits, before either the slider queue or HTTP queue.
 function controlIntent(){return {deadline:performance.now()+HTTP_TIMEOUT_MS,
+  generation:httpGeneration,
   context:motionContext?{boot:motionContext.control_boot_id,epoch:motionContext.control_epoch}:null};}
 function httpError(message,name){var e=new Error(message);e.name=name||'Error';return e;}
-function httpReject(job,error){if(!job.done){job.done=true;job.reject(error);}}
+function httpReject(job,error){if(!job.done){
+  job.done=true;
+  // Bounded, page-local evidence; never retain request bodies or coordinates.
+  httpFailures.push({at_ms:performance.now(),method:job.method||'GET',
+    path:typeof job.url==='string'?job.url.split('?')[0].slice(0,80):'dynamic',
+    name:String(error.name||'Error').slice(0,32),message:String(error.message||error).slice(0,160)});
+  if(httpFailures.length>16)httpFailures.shift();
+  job.reject(error);
+}}
+function httpCancel(job,error){
+  if(job.cancelled)return;
+  job.cancelled=true;clearTimeout(job.timer);
+  if(httpActive===job&&error.name==='TimeoutError')httpRetryAt=performance.now()+1000;
+  // Reject the exchange ourselves. Abort alone need not settle fetch/body reads
+  // promptly after a network change or a suspended page resumes.
+  if(job.stopExchange)job.stopExchange(error);
+  httpReject(job,error);
+  if(httpActive!==job){
+    httpQueue=httpQueue.filter(function(x){return x!==job;});
+    if(job.key&&httpByKey[job.key]===job)delete httpByKey[job.key];
+  }
+}
 function httpReceiveContext(data){
   var context=data&&data.servo||data;
   if(context&&context.control_epoch!=null&&context.clock_ms!=null&&syncMotionContext(context))httpContextAt=performance.now();
@@ -382,33 +404,51 @@ function httpReceiveContext(data){
 function httpJsonBody(response){return response.json();}
 function httpExchange(job,url,method,read){
   if(job.cancelled)return Promise.reject(httpError('指令或讀取已逾時，請重試','TimeoutError'));
-  var ac=typeof AbortController!=='undefined'?new AbortController():null,expired=false;
-  job.abort=ac;
-  var timer=setTimeout(function(){
-    expired=true;job.cancelled=true;if(ac)ac.abort();
-    httpReject(job,httpError('讀取逾時；若未恢復請重新整理','TimeoutError'));
-  },HTTP_TIMEOUT_MS);
-  var options={cache:'no-store'};if(method)options.method=method;if(ac)options.signal=ac.signal;
-  if(method==='POST'&&job.body!==undefined){options.headers={'Content-Type':job.form?'application/x-www-form-urlencoded;charset=UTF-8':'application/json'};options.body=job.body;}
-  // Do not release httpActive on the timeout alone: unsupported/ineffective
-  // abort must not let a second fetch overlap a still-running body read.
-  return Promise.resolve().then(function(){
-    if(job.cancelled)throw httpError('指令或讀取已逾時，請重試','TimeoutError');
-    return fetch(url,options);
-  }).then(function(response){
-    return read(response).then(function(data){
-      if(expired||job.cancelled)throw httpError('讀取已逾時，忽略延遲回覆','TimeoutError');
-      if(!response.ok||data&&data.ok===false){
-        var error=httpError(data&&data.error||'HTTP '+response.status);error.status=response.status;throw error;
-      }
-      httpReceiveContext(data);return data;
-    });
-  }).finally(function(){clearTimeout(timer);job.abort=null;});
+  return new Promise(function(resolve,reject){
+    var ac=typeof AbortController!=='undefined'?new AbortController():null,finished=false;
+    var deadline=performance.now()+HTTP_TIMEOUT_MS;
+    function finish(error,data){
+      if(finished)return;
+      finished=true;clearTimeout(timer);job.stopExchange=null;
+      if(error)reject(error);else resolve(data);
+    }
+    job.stopExchange=function(error){finish(error);if(ac)ac.abort();};
+    var timer=setTimeout(function(){
+      httpCancel(job,httpError('讀取逾時，將重新讀取狀態；操作未確認請查看最新狀態','TimeoutError'));
+    },HTTP_TIMEOUT_MS);
+    var options={cache:'no-store'};if(method)options.method=method;if(ac)options.signal=ac.signal;
+    if(method==='POST'&&job.body!==undefined){options.headers={'Content-Type':job.form?'application/x-www-form-urlencoded;charset=UTF-8':'application/json'};options.body=job.body;}
+    Promise.resolve().then(function(){
+      if(job.cancelled)throw httpError('指令或讀取已逾時，請重試','TimeoutError');
+      return fetch(url,options);
+    }).then(function(response){
+      if(finished)return;
+      return read(response).then(function(data){
+        if(finished)return;
+        // Timers can be delayed in the background: a late reply is still late.
+        if(performance.now()>=deadline||job.motion&&performance.now()>=job.deadline){
+          httpCancel(job,httpError('讀取已逾時，忽略延遲回覆','TimeoutError'));return;
+        }
+        if(!response.ok||data&&data.ok===false){
+          var error=httpError(data&&data.error||'HTTP '+response.status);error.status=response.status;throw error;
+        }
+        httpReceiveContext(data);finish(null,data);
+      });
+    }).catch(function(error){finish(error);});
+  });
 }
 function httpPump(){
   if(httpActive||!httpQueue.length)return;
+  if(performance.now()<httpRetryAt){
+    if(!httpRetryTimer)httpRetryTimer=setTimeout(function(){httpRetryTimer=0;httpPump();},httpRetryAt-performance.now());
+    return;
+  }
   httpQueue.sort(function(a,b){return a.priority-b.priority||a.order-b.order;});
-  var job=httpQueue.shift();httpActive=job;
+  var job=httpQueue.shift();
+  if(performance.now()>=job.deadline){
+    httpCancel(job,httpError('請求等待逾時，請重試','TimeoutError'));Promise.resolve().then(httpPump);return;
+  }
+  httpActive=job;
   // Non-control requests have a queue timeout and a separate wire timeout.
   // A control's original 2 s intent deadline also covers a context refresh.
   if(!job.motion)clearTimeout(job.timer);
@@ -430,23 +470,28 @@ function httpPump(){
   }else run=run.then(function(){return httpExchange(job,typeof job.url==='function'?job.url():job.url,job.method,job.read);});
   run.then(function(data){if(!job.done){job.done=true;job.resolve(data);}},function(error){httpReject(job,error);})
     .finally(function(){
-      clearTimeout(job.timer);if(job.key)delete httpByKey[job.key];httpActive=null;
+      clearTimeout(job.timer);if(job.key&&httpByKey[job.key]===job)delete httpByKey[job.key];
+      if(httpActive===job)httpActive=null;
       Promise.resolve().then(httpPump);
     });
 }
 function httpRequest(url,priority,key,read,method,intent,body,form){
+  // The HTTPS phone helper can be foreground while its Station opener is hidden.
+  // Keep accepting new helper samples; never replay the old queued position.
+  if(httpSuspended&&!(method==='POST'&&url==='/api/station/position'&&key==='station-phone'))
+    return Promise.reject(httpError('網頁已暫停，回到前景後請重新操作','AbortError'));
   if(key&&httpByKey[key])return httpByKey[key].promise;
   var motion=method==='POST'&&isMotionUrl(url);
-  if(motion){intent=intent||controlIntent();if(performance.now()>=intent.deadline)
+  if(motion){intent=intent||controlIntent();
+    if(intent.generation!==httpGeneration)return Promise.reject(httpError('連線已重新同步，請重新操作','AbortError'));
+    if(performance.now()>=intent.deadline)
     return Promise.reject(httpError('控制指令等待逾時，請重試','TimeoutError'));}
   var job={url:url,priority:priority,key:key,read:read||httpJsonBody,method:method,
     motion:motion,order:++httpOrder,deadline:motion?intent.deadline:performance.now()+HTTP_TIMEOUT_MS,
     context:motion?intent.context:null,body:body,form:!!form};
   job.promise=new Promise(function(resolve,reject){job.resolve=resolve;job.reject=reject;});
   job.timer=setTimeout(function(){
-    job.cancelled=true;if(job.abort)job.abort.abort();
-    httpReject(job,httpError(job.motion?'控制指令等待逾時，請重試':'讀取排隊逾時','TimeoutError'));
-    if(httpActive!==job){httpQueue=httpQueue.filter(function(x){return x!==job;});if(key)delete httpByKey[key];}
+    httpCancel(job,httpError(job.motion?'控制指令逾時；操作未確認請查看最新狀態':'讀取排隊逾時','TimeoutError'));
   },Math.max(0,job.deadline-performance.now()));
   if(key)httpByKey[key]=job;httpQueue.push(job);httpPump();return job.promise;
 }
@@ -736,7 +781,7 @@ function showSpeedSetting(j){
   lastSavedSpeed=j.speed;speedLoaded=true;
   $('cfgSpeed').value=j.speed;
   $('cfgSpeed').disabled=false;$('speedValue').disabled=false;$('speedValue').textContent=j.speed+'°／秒';
-  $('speedSaveState').textContent='已記住 '+j.speed+'°／秒';return true;
+  $('speedSaveState').textContent='';return true;
 }
 function loadSpeedSetting(){
   return httpRequest('/api/servo/settings',1,'speed')
@@ -805,24 +850,12 @@ function mapLink(point){
   return '<a href="https://www.google.com/maps/search/?api=1&amp;query='+encodeURIComponent(point.lat+','+point.lon)+'" target="_blank" rel="noopener noreferrer">Google Maps ↗</a>';
 }
 function ageLabel(ms){return Number.isFinite(ms)&&ms>=0?(ms/1000).toFixed(1)+' s':'--';}
-function renderController(sv){
-  var c=sv.controller||{};
-  $('controllerSerial').textContent=sv.output_ready?'TX GPIO'+c.tx_gpio+' · '+c.baud+' · 8N1':'輸出未就緒';
-  $('controllerAngles').textContent=Number(sv.angle).toFixed(1)+'°／'+Number(sv.target).toFixed(1)+'°';
-  $('controllerFrame').textContent=c.pulse_us?c.pulse_us+' μs · '+c.last_frame:'--';
-  $('controllerSent').textContent=Number.isFinite(c.tx_commands)?String(c.tx_commands):'--';
-  $('controllerErrors').textContent=Number.isFinite(c.tx_deferred)?c.tx_deferred+'／'+c.tx_errors:'--';
-}
 function refreshGnssDebug(){return httpRequest('/api/debug?limit=1',2,'gnss-debug').then(function(j){
   var g=j.gps||{},c=j.client_gnss||{},stream=g.stream||{};
   $('gnssRate').textContent=[g.observed_hz,g.rmc_hz,g.gga_hz].map(function(n){return Number.isFinite(n)?n.toFixed(2):'--';}).join('／')+' Hz';
   $('gnssErrors').textContent=(g.checksum_errors==null?'--':g.checksum_errors)+'／'+(stream.missing_or_invalid_time==null?'--':stream.missing_or_invalid_time);
   $('gnssClientAge').textContent=c.received?ageLabel(c.rx_age_ms)+(c.fresh?'':'（過期）'):'尚未收到';
 }).catch(function(){$('gnssRate').textContent='讀取失敗';});}
-function refreshSd(){return httpRequest('/api/sd/status',2,'sd-status').then(function(j){
-  var label=({recording:'記錄中',stopped:'已停止',error:'異常',unavailable:'無 SD',idle:'待命',ready:'就緒'})[j.state]||j.state||'未確認';
-  $('stationSd').textContent=label;
-}).catch(function(){$('stationSd').textContent='讀取失敗';});}
 // GPS quality grade (same thresholds as the firmware, shared by both ends).
 function gpsGrade(sats,hdop){
   if(!Number.isFinite(sats)||!Number.isFinite(hdop)||sats<0||hdop<0||sats<=0)return 'miss';
@@ -886,6 +919,7 @@ var refreshing=false;
 function rfAlive(d){return typeof d.rf_alive==='boolean'?d.rf_alive:!!d.linked;}
 function rfStatus(d){return rfAlive(d)?(d.linked?'已連線':'收到遙測，等待 DATA'):'未連線';}
 function renderSignalLights(){
+  renderRfQuality();
   var fresh=trackReceivedMs!=null&&performance.now()-trackReceivedMs<=3000,d=fresh?last.track:null;
   [['signalStation',d&&d.station.fix,'有定位','無定位'],
    ['signalClient',d&&d.client.fix,'有定位','無定位'],
@@ -917,9 +951,7 @@ function refresh(){
     $('sAcc').textContent=last.position&&last.position.source==='phone'?'--':d.station.fix&&Number.isFinite(d.station.hdop)?d.station.hdop.toFixed(1):'--';
     $('sMap').innerHTML=mapLink(d.station);$('cMap').innerHTML=mapLink(d.client);
     $('sPositionAge').textContent=last.position&&last.position.source==='phone'?ageLabel(last.position.age_ms):ageLabel(d.station.position_age_ms);
-    $('cPositionAge').textContent=ageLabel(d.client.rx_age_ms);renderController(d.servo);
-    $('sTemp').textContent=d.station.temp_c==null?'--':d.station.temp_c+'°C';
-    $('sHum').textContent=d.station.humidity_pct==null?'--':d.station.humidity_pct+'%';
+    $('cPositionAge').textContent=ageLabel(d.client.rx_age_ms);
     $('mcOff').textContent=d.servo.calibrated?d.servo.mount_offset_deg.toFixed(1)+'°':'未校正';
     var stationAverage=d.station_average||{};
     $('stationSpread').textContent=stationAverage.samples&&Number.isFinite(stationAverage.rms_m)?
@@ -936,9 +968,18 @@ function refresh(){
     $('cAge').textContent=d.client.last_rx_sec>=0?d.client.last_rx_sec+' s':'--';
     var mv=last.clientControl&&last.clientControl.supported&&last.clientControl.battery_mv||d.telemetry.batt_mv;
     $('cBattV').textContent=mv>0?(mv/1000).toFixed(3)+' V · '+battPct(mv)+'%（估計）':'--';
+    renderMcuTemperature(d.telemetry);
     $('cFps').textContent=Number.isFinite(d.lora_fps_10s)?d.lora_fps_10s.toFixed(1):'--';
     if(page==='radar')drawRadar(d,dist);
   }).catch(function(){}).then(function(){refreshing=false;});
+}
+
+function renderMcuTemperature(t){
+  t=t||{};
+  var mcu=t.temp_kind==='mcu';
+  $('cMcuTemp').textContent=mcu&&t.mcu_temp_fresh===true&&Number.isFinite(t.mcu_temp_c)?t.mcu_temp_c+'°C':'--';
+  $('cMcuTempMax').textContent=mcu&&Number.isFinite(t.mcu_temp_max_received_c)?t.mcu_temp_max_received_c+'°C':'--';
+  $('cMcuTempAge').textContent=mcu&&Number.isFinite(t.mcu_temp_rx_age_ms)?Math.floor(t.mcu_temp_rx_age_ms/1000)+' s':'--';
 }
 
 // ---- 現場提醒 -------------------------------------------------------------
@@ -975,17 +1016,39 @@ function renderAlerts(list){
   bar.firstChild.onclick=function(){alertsFold=!alertsFold;alertsSig='';renderAlerts(last.alerts);};
 }
 
+// Display bands, not receiver sensitivity or a packet-delivery guarantee.
+// Keep the existing Good RSSI and Good/OK SNR bands; RSSI OK has a 10 dB lower band.
+function rfQualityWord(value,good,ok){
+  if(value===null)return 'Off';
+  if(!Number.isFinite(value))return '--';
+  return value>=good?'Good':value>=ok?'OK':'Bad';
+}
+function renderRfQuality(){
+  // Status polls every 3 s; allow a delayed poll, but never retain health indefinitely.
+  var fresh=statusReceivedMs!=null&&performance.now()-statusReceivedMs<=6000;
+  var lora=fresh&&last.status?last.status.lora:null;
+  [['sRssiQuality',lora&&lora.rssi,-105,-115],['sSnrQuality',lora&&lora.snr,7,0]].forEach(function(item){
+    var word=lora?rfQualityWord(item[1],item[2],item[3]):'--';
+    $(item[0]).textContent=word;
+    $(item[0]).style.color=word==='Good'?'var(--ok)':word==='OK'?'var(--warn)':word==='Bad'?'var(--bad)':'var(--mut)';
+  });
+  $('sRssi').textContent=lora&&Number.isFinite(lora.rssi)?lora.rssi.toFixed(0)+' dBm':'--';
+  $('sSnr').textContent=lora&&Number.isFinite(lora.snr)?lora.snr.toFixed(1)+' dB':'--';
+  $('rfQualityHint').textContent=!lora?'Station 資料未取得或已過期':
+    lora.rssi===null||lora.snr===null?'Off：沒有近期 RF 樣本，不代表 Client 關機':
+    !Number.isFinite(lora.rssi)||!Number.isFinite(lora.snr)?'RF 指標資料不完整':
+    '最近收到的 RF 樣本；Good 不代表 GPS 已定位或沒有漏包';
+}
 function refreshStatus(){
   return httpRequest('/api/status',2,'status').then(function(s){
     last.status=s;
+    statusReceivedMs=performance.now();
     last.status_received_at=new Date().toISOString();
     last.alerts=s.alerts||[];
     renderAlerts(last.alerts);
-    $('sRssi').textContent=s.lora.rssi!=null?s.lora.rssi.toFixed(0)+' dBm':'--';
-    $('sSnr').textContent=s.lora.snr!=null?s.lora.snr.toFixed(1)+' dB':'--';
+    renderRfQuality();
     $('sDrop').textContent=s.lora.rx_data>0&&Number.isFinite(s.lora.drop_rate)?(s.lora.drop_rate*100).toFixed(1)+'%':'--';
-    $('sVersion').textContent=s.health.firmware_version?'v'+s.health.firmware_version:'未標版';
-  }).catch(function(){});
+  }).catch(function(){statusReceivedMs=null;renderRfQuality();});
 }
 
 // Battery %: 0% at 3.2 V, 100% at 4.15 V (matches the firmware scale).
@@ -1242,7 +1305,7 @@ function drawMap(d,dist){
 var PHONE_HELPER_ORIGIN='https://n8886919.github.io';
 var PHONE_HELPER_URL=PHONE_HELPER_ORIGIN+'/Shore-Spotter/phone-location.html';
 var phonePopup=null,stationPositionBusy=false,queuedPhonePosition=null;
-var clientControlBusy=false;
+var clientControlBusy=false,clientBindingBusy=false,clientRadioBusy=false,clientBindingEpoch=0,clientControlReadBusy=false,clientRadioReadBusy=false;
 function formEncode(values){
   return Object.keys(values).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(values[k]);}).join('&');
 }
@@ -1319,63 +1382,137 @@ $('btnGnssPosition').onclick=function(){
 };
 function clientStateText(state){return ({ready:'關閉',tracking:'開啟',test:'關閉',storage:'關閉',unknown:'未確認'})[state]||'未確認';}
 function clientCommandText(command){return ({idle:'無待命令',pending:'等待 Client 確認',confirmed:'Client 已確認',timeout:'等待逾時',error:'命令錯誤'})[command]||'--';}
-function renderClientControl(j){
+var confirmedClientId=null;
+function renderClientControl(j,connectionFailed){
   last.clientControl=j||{};
   j=j||{};var supported=j.supported===true,command=clientCommandText(j.command);
   $('clientRadioGroup').textContent=Number.isFinite(j.frequency_mhz)?(j.rf_group===0?'A':j.rf_group===1?'B':'?')+' / '+j.frequency_mhz.toFixed(1)+' MHz':'--';
-  $('clientPairedId').textContent=j.client_id>0?Number(j.client_id).toString(16).toUpperCase().padStart(4,'0'):'未配對';
-  $('clientControlState').textContent=supported?clientStateText(j.state):'未收到近期 STATE';
-  $('clientControlAge').textContent=supported&&Number.isFinite(j.age_ms)?(j.age_ms/1000).toFixed(1)+' s':'--';
+  if(Number.isInteger(j.client_id)&&j.client_id>=0&&j.client_id<65535)confirmedClientId=j.client_id;
+  $('clientPairedId').textContent=confirmedClientId===null?'--':confirmedClientId===0?'未配對':confirmedClientId.toString(16).toUpperCase().padStart(4,'0');
+  $('clientPairedId').disabled=clientBindingBusy||clientControlBusy||clientRadioBusy||j.command==='pending'||!!(last.clientRadio&&last.clientRadio.scan_state==='scanning');
+  $('clientChannelRow').style.display=j.api_version>=2?'':'none';
+  $('clientControlState').textContent=connectionFailed?'Station 連線失敗':supported?clientStateText(j.state):'Client 尚未回報';
+  $('clientControlAge').textContent=!connectionFailed&&Number.isFinite(j.age_ms)?(j.age_ms/1000).toFixed(1)+' s':'--';
   $('clientControlCommand').textContent=command+(j.command_id!=null?' #'+j.command_id:'');
   var test=Number.isFinite(j.test_received)?'RF：收 '+j.test_received+'／漏 '+(Number.isFinite(j.test_missing)?j.test_missing:'--')+
     '，'+(Number.isFinite(j.test_rssi)?j.test_rssi.toFixed(0)+' dBm':'--')+'，'+(Number.isFinite(j.test_snr)?j.test_snr.toFixed(1)+' dB':'--')+
     '，最大間隔 '+(Number.isFinite(j.test_max_gap_ms)?j.test_max_gap_ms+' ms':'--'):'RF：尚無測試結果';
   $('clientControlTest').textContent=test;
-  $('clientControlHint').textContent=supported?(j.last_error?'最後錯誤：'+j.last_error:
-    j.command==='pending'?'命令已入隊，等待 T096 STATE 確認。':
-    j.state==='storage'?'收到舊版收納回覆，請核對 Client 韌體；無法由這筆回覆確認睡眠或喚醒。':
-    '待機保留程式狀態，多數時間睡眠，每 30 秒交換指令；無線條件正常時通常約 30 秒內可啟動 GPS。啟動／待機不會切換 Servo GPS 模式。'):
-    '尚未收到近期 T096 STATE；目前狀態未確認。';
-  ['btnClientStart','btnClientStop','btnClientTest'].forEach(function(id){$(id).disabled=!supported||clientControlBusy;});
+  $('clientControlHint').textContent=connectionFailed?'Station 連線失敗':j.last_error?'最後錯誤：'+j.last_error:
+    j.command==='pending'?'等待 Client 確認…':j.command==='timeout'?'Client 未確認命令，請重試':
+    j.command==='error'?'命令失敗，請重試':supported&&j.state==='test'?'無線連線測試中，GPS 關閉':
+    supported&&j.state==='storage'?'Client 回報舊版收納狀態，請核對韌體':'';
+  if(!connectionFailed&&j.ble){
+    if(j.ble.state==='owned_elsewhere')$('clientControlHint').textContent='Client 由另一台 Station 控制，需重開 Client 才能改站';
+    else if(!supported&&confirmedClientId>0)$('clientControlHint').textContent=j.ble.state==='error'?'Client BLE 連線異常：'+(j.ble.last_error||'請查看診斷'):'等待 Client 連線…';
+  }
+  var allowed=supported&&(j.api_version>=2?j.can_control===true:true)&&!clientControlBusy&&!clientBindingBusy&&j.command!=='pending';
+  ['btnClientStart','btnClientStop','btnClientTest','btnClientTestStop'].forEach(function(id){$(id).disabled=!allowed;});
+  $('btnClientTestStop').disabled=!allowed||j.state!=='test';
+  if(j.api_version>=2){$('btnClientStart').disabled=!allowed||j.state!=='ready';$('btnClientTest').disabled=!allowed||j.state!=='ready';$('btnClientStop').disabled=!allowed||j.state==='ready';}
 }
-function refreshClientControl(){return httpRequest('/api/client/control',2,'client-control').then(renderClientControl).catch(function(){renderClientControl({supported:false});});}
+function refreshClientControl(){
+  if(clientControlReadBusy)return Promise.resolve();
+  var epoch=clientBindingEpoch;clientControlReadBusy=true;
+  return httpRequest('/api/client/control',2,'client-control').then(function(j){if(epoch===clientBindingEpoch)renderClientControl(j);})
+    .catch(function(){if(epoch===clientBindingEpoch)renderClientControl(Object.assign({},last.clientControl,{supported:false}),true);})
+    .finally(function(){clientControlReadBusy=false;});
+}
 function sendClientControl(action){
-  if(clientControlBusy)return;clientControlBusy=true;renderClientControl({supported:true,state:'unknown',command:'pending'});
+  if(clientControlBusy||clientBindingBusy||last.clientControl&&last.clientControl.command==='pending')return;
+  clientControlBusy=true;renderClientControl(Object.assign({},last.clientControl,{command:'pending'}));
   return formPost('/api/client/control',{action:action},'client-command').then(function(j){renderClientControl(j);})
     .catch(function(e){toast(e.message||'Client 命令未確認');$('clientControlHint').textContent='命令未確認：'+(e.message||'連線失敗');})
     .finally(function(){clientControlBusy=false;refreshClientControl();});
 }
 $('btnClientStart').onclick=function(){sendClientControl('start');};
 $('btnClientStop').onclick=function(){sendClientControl('stop');};
-$('btnClientTest').onclick=function(){sendClientControl('test');};
+$('btnClientTest').onclick=function(){return sendClientControl('test');};
+$('btnClientTestStop').onclick=function(){return sendClientControl('stop');};
+
+$('clientPairedId').onclick=function(){
+  if($('clientPairedId').disabled)return;
+  $('clientBindingInput').value=confirmedClientId>0?confirmedClientId.toString(16).toUpperCase().padStart(4,'0'):'';
+  $('clientBindingError').textContent='';$('clientBindingDialog').showModal();$('clientBindingInput').focus();$('clientBindingInput').select();
+};
+function bindingControlsBusy(busy){['clientBindingInput','saveClientBinding','cancelClientBinding'].forEach(function(id){$(id).disabled=busy;});}
+$('cancelClientBinding').onclick=function(){if(!clientBindingBusy)$('clientBindingDialog').close();};
+$('clientBindingDialog').addEventListener('cancel',function(e){if(clientBindingBusy)e.preventDefault();});
+$('clientBindingForm').onsubmit=function(e){
+  e.preventDefault();if(clientBindingBusy)return Promise.resolve();
+  var value=$('clientBindingInput').value.trim().toUpperCase(),id=parseInt(value,16);
+  if(!/^[0-9A-F]{1,4}$/.test(value)||id===0||id===16||id===65535){$('clientBindingError').textContent='請輸入有效的 1–4 碼十六進位 Client ID';return Promise.resolve();}
+  clientBindingBusy=true;++clientBindingEpoch;bindingControlsBusy(true);$('clientBindingError').textContent='確認更改中…';
+  renderClientControl(last.clientControl);
+  return formPost('/api/whitelist',{action:'set',id:value},'client-binding').then(function(j){
+    if(!j||!Array.isArray(j.whitelist)||j.whitelist.length!==1||typeof j.whitelist[0]!=='string'||!/^[0-9A-Fa-f]{1,4}$/.test(j.whitelist[0])||parseInt(j.whitelist[0],16)!==id)throw new Error('Station 回覆與目標 ID 不一致');
+    ++clientBindingEpoch;confirmedClientId=id;last.clientRadio=null;
+    renderClientControl({client_id:id,supported:false,state:'unknown',command:'idle'});
+    $('clientBindingDialog').close();
+  }).catch(function(err){$('clientBindingError').textContent='更改未確認：'+(err.message||'連線失敗')+'。請先查看 Station 回報的 ID，再決定是否重試。';})
+    .finally(function(){clientBindingBusy=false;bindingControlsBusy(false);renderClientControl(last.clientControl);refreshClientControl();refreshClientRadio();});
+};
+function radioCandidateText(c){
+  if(!c||!Number.isFinite(c.samples)||c.samples===0)return c&&c.error?'掃描失敗（'+c.error+'）':'尚無有效掃描樣本';
+  return '偵測到訊號 '+c.busy+'／'+c.samples+' 次'+(c.error?'；錯誤 '+c.error+' 次':'');
+}
+function renderClientRadio(j,failed){
+  if(!failed)last.clientRadio=j;
+  j=j||{};var scanning=j.scan_state==='scanning',available=!failed&&j.can_select===true&&!clientRadioBusy;
+  var c=Array.isArray(j.candidates)?j.candidates:[],selected=c.find(function(x){return x.id===j.selected;});
+  $('clientChannelValue').textContent=selected?selected.label+' · '+Number(selected.frequency_mhz).toFixed(1)+' MHz'+(j.selected!==j.saved?'（待驗證）':''):'--';
+  $('scanClientRadio').disabled=failed||j.can_scan!==true||clientRadioBusy||scanning;
+  $('selectClientRadio').disabled=!available||scanning;
+  $('clientRadioA').disabled=$('clientRadioB').disabled=!available||scanning;
+  $('clientRadioAResult').textContent=radioCandidateText(c.find(function(x){return x.id===0;}));
+  $('clientRadioBResult').textContent=radioCandidateText(c.find(function(x){return x.id===1;}));
+  $('clientRadioState').textContent=failed?'Station 連線失敗':scanning?'掃描中…':j.scan_state==='error'?'掃描失敗：'+(j.scan_error||'未知錯誤'):
+    !j.can_select?'Client 連線並回待機後，才能掃描與選擇頻道':j.selected!==j.saved?'頻道已選擇，啟動驗證成功後才會保存':j.scan_state==='complete'?'掃描完成；偵測次數不代表頻道一定可用':'';
+}
+function refreshClientRadio(){
+  if(clientRadioReadBusy)return Promise.resolve();
+  var epoch=clientBindingEpoch;clientRadioReadBusy=true;
+  return httpRequest('/api/client/radio',2,'client-radio').then(function(j){if(epoch===clientBindingEpoch)renderClientRadio(j);})
+    .catch(function(){if(epoch===clientBindingEpoch)renderClientRadio(last.clientRadio,true);})
+    .finally(function(){clientRadioReadBusy=false;});
+}
+$('clientChannelValue').onclick=function(){
+  var j=last.clientRadio||{};$('clientRadioA').checked=j.selected===0;$('clientRadioB').checked=j.selected===1;
+  $('clientRadioError').textContent='';$('clientRadioDialog').showModal();return refreshClientRadio();
+};
+function outsideClientRadio(e){
+  var dialog=$('clientRadioDialog'),r=dialog.getBoundingClientRect();
+  return e.target===dialog&&(e.clientX<r.left||e.clientX>r.left+r.width||e.clientY<r.top||e.clientY>r.top+r.height);
+}
+var clientRadioBackdropDown=false;
+$('clientRadioDialog').addEventListener('pointerdown',function(e){clientRadioBackdropDown=outsideClientRadio(e);});
+$('clientRadioDialog').addEventListener('click',function(e){
+  if(clientRadioBackdropDown&&outsideClientRadio(e)&&!clientRadioBusy)$('clientRadioDialog').close();
+  clientRadioBackdropDown=false;
+});
+$('clientRadioDialog').addEventListener('cancel',function(e){if(clientRadioBusy)e.preventDefault();});
+function postClientRadio(values){
+  if(clientRadioBusy)return Promise.resolve();clientRadioBusy=true;var epoch=clientBindingEpoch;
+  $('clientRadioError').textContent='';renderClientRadio(last.clientRadio);
+  return formPost('/api/client/radio',values,'client-radio-command').then(function(j){
+    if(epoch!==clientBindingEpoch)return;
+    if(!j||!Array.isArray(j.candidates)||!Number.isInteger(j.selected))throw new Error('頻道回覆不完整');
+    renderClientRadio(j);if(values.action==='select')$('clientRadioDialog').close();
+  }).catch(function(e){$('clientRadioError').textContent='操作未確認：'+(e.message||'連線失敗')+'，請查看最新狀態。';})
+    .finally(function(){clientRadioBusy=false;refreshClientRadio();refreshClientControl();});
+}
+$('scanClientRadio').onclick=function(){if(!$('scanClientRadio').disabled)return postClientRadio({action:'scan'});};
+$('clientRadioForm').onsubmit=function(e){
+  e.preventDefault();if($('selectClientRadio').disabled)return Promise.resolve();
+  var value=$('clientRadioA').checked?0:$('clientRadioB').checked?1:null;
+  if(value===null){$('clientRadioError').textContent='請選擇頻道';return Promise.resolve();}
+  return postClientRadio({action:'select',channel:value});
+};
 
 showPage('radar');
 refresh();refreshStatus();
 // ---- camera compass calibration ----
 var compassRequestId=0;
-$('btnCompassCenter').onclick=function(){
-  if(controlChanging){toast('控制操作處理中，請稍後再鏡頭置中');return;}
-  cancelRingGesture();
-  var requestId=++compassRequestId,intent=controlIntent();
-  controlChanging=true;$('btnCompassCenter').disabled=true;
-  clearTimeout(servoSendTimer);servoSendTimer=0;servoPendingAngle=null;servoPendingIntent=null;
-  servoDragEnded=false;dragging=false;$('sld').disabled=true;
-  renderServoRing();
-  // Invalidate the cached centre state before sending the move.
-  compassServoState=null;
-  $('compassCalState').textContent='正在切為手動並鏡頭置中…';
-  return servoRequest.then(function(){return post('/api/servo/center',intent);})
-    .then(function(j){
-      if(j.ok!==true||j.mode!=='manual'||j.target!==179.5)
-        throw new Error('回中回覆不完整');
-      if(requestId===compassRequestId)
-        $('compassCalState').textContent='已送出鏡頭置中；等鏡頭停穩後再按校正';
-    }).catch(function(e){
-      if(requestId===compassRequestId)$('compassCalState').textContent='回中未確認：'+(e.message||'連線失敗')+'，可重試';
-    }).then(function(){
-      controlChanging=false;$('btnCompassCenter').disabled=false;return refresh();
-    });
-};
 $('btnCompassCal').onclick=function(){
   var requestId=++compassRequestId;
   var text=$('compassBearing').value.trim();
@@ -1385,14 +1522,15 @@ $('btnCompassCal').onclick=function(){
     toast($('compassCalState').textContent);return;
   }
   if(controlChanging||servoSending||servoPendingAngle!==null||dragging||
-     !compassServoState||compassServoState.calibration_ready!==true){
-    var hint='請先鏡頭置中 並等鏡頭停穩，再按校正';
+     !compassServoState||compassServoState.mode!=='manual'||compassServoState.moving||!compassServoState.output_ready||compassServoState.motion_fault){
+    var hint='請先切手動，按控制板置中並等鏡頭停穩，再按校正';
     $('compassCalState').textContent=hint;toast(hint);return;
   }
-  // The backend rechecks centre after queueing, so stale UI cannot calibrate
-  // a servo that has moved since the last status poll.
+  // Operator confirms physical centering; backend rechecks manual/settled state.
+  controlChanging=true;$('btnCompassCal').disabled=true;
+  if(last.track)applyMode(last.track.servo);
   $('compassCalState').textContent='校正送出中…';
-  return post('/api/track/calibrate?bearing='+encodeURIComponent(text),controlIntent())
+  return post('/api/track/calibrate?physical_center=1&bearing='+encodeURIComponent(text),controlIntent())
     .then(function(j){
       if(requestId!==compassRequestId)return;
       if(j.ok!==true||j.method!=='compass'||!Number.isFinite(j.bearing)||
@@ -1403,19 +1541,58 @@ $('btnCompassCal').onclick=function(){
       return refresh();
     }).catch(function(e){
       if(requestId===compassRequestId)$('compassCalState').textContent='校正未確認：'+(e.message||'連線失敗')+'，可重試';
-    });
+    }).finally(function(){controlChanging=false;$('btnCompassCal').disabled=false;return refresh();});
 };
 
 refreshStatus();          // 提醒不要等到第一個 3 秒週期才出現
 refreshStationPosition();
 refreshClientControl();
+refreshClientRadio();
 setInterval(refresh,1000);
 setInterval(refreshStatus,3000);
 setInterval(refreshStationPosition,3000);
 setInterval(refreshClientControl,3000);
+setInterval(function(){if(last.clientControl&&last.clientControl.api_version>=2)refreshClientRadio();},3000);
 loadSpeedSetting();
-refreshSd();refreshGnssDebug();
-setInterval(refreshSd,3000);setInterval(refreshGnssDebug,10000);
+refreshGnssDebug();
+setInterval(refreshGnssDebug,10000);
+
+// A hidden page may keep old TCP reads and gestures across a Station reboot.
+// Invalidate unsent intent; recovery only reads state and never retries a POST.
+var httpResumeTimer=0;
+function resetHttpSession(){
+  ++httpGeneration;httpContextAt=-Infinity;
+  var jobs=httpQueue.slice();if(httpActive)jobs.push(httpActive);
+  jobs.forEach(function(job){httpCancel(job,httpError('連線已重新同步；操作未確認請查看最新狀態','AbortError'));});
+  clearTimeout(httpRetryTimer);httpRetryTimer=0;httpRetryAt=0;
+  cancelRingGesture();servoGestureCancelled=true;
+  clearTimeout(servoSendTimer);servoSendTimer=0;servoPendingAngle=null;servoPendingIntent=null;
+  queuedPhonePosition=null;
+  servoDragEnded=false;dragging=false;activePointers={};
+  trackReceivedMs=null;statusReceivedMs=null;renderSignalLights();renderServoRing();
+}
+function suspendWeb(){
+  clearTimeout(httpResumeTimer);httpResumeTimer=0;
+  httpSuspended=true;resetHttpSession();
+}
+function resumeWeb(){
+  if(document.visibilityState==='hidden'||httpResumeTimer)return;
+  httpSuspended=false;resetHttpSession();
+  // Let rejected consumers release their busy flags before refreshing. Coalesce
+  // visibility/pageshow/online signals from the same foreground transition.
+  httpResumeTimer=setTimeout(function(){
+    httpResumeTimer=0;
+    refresh();refreshStatus();refreshStationPosition();refreshClientControl();refreshClientRadio();refreshGnssDebug();
+    if(!speedLoaded)loadSpeedSetting();
+  },0);
+}
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState==='hidden')suspendWeb();else resumeWeb();
+});
+window.addEventListener('pagehide',suspendWeb);
+window.addEventListener('pageshow',function(e){if(e.persisted)resumeWeb();});
+window.addEventListener('online',resumeWeb);
+if(document.visibilityState==='hidden')suspendWeb();
 </script>
 </body>
 </html>

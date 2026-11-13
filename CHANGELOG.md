@@ -2,12 +2,175 @@
 
 專案從 **0.1** 開始標版。韌體版本的唯一來源是
 [`include/firmware_version.h`](include/firmware_version.h)；Client／Station 共用。
-一般後續發版依序 0.2、0.3；若只修補既有版本，可用 0.1.1。
+從 1.0 起固定使用 **a.b**：同主版本 a 的所有子版本 b，Client／Station 必須互相相容；
+不相容變更必須提升 a。一般版本不加 dev；`FIELD_DIAGNOSTIC` 專用建置顯示 `1.0-debug`，
+debug 是建置標記，不是第三段版本號。舊版歷史與當時實測字串保留原樣。
 版本號不取代 LoRa `PROTO_VERSION`、NVS 格式版本或實機部署驗證。
 每次功能、修正、介面或設定行為異動都更新本檔；尚未定版先記在「未發行」，
 正式標版時移入對應版本，保留日期、相容性與驗證紀錄。
 
 ## 未發行
+
+- **2026-11-14 Android 手機定位只採 GPS**：移除 NETWORK provider 訂閱，收樣與送出前都拒絕非 GPS 來源，
+  避免較新的基地台／Wi-Fi 估算位置覆蓋衛星定位；GPS 停用／不支援時顯示等待或原因，不自動改用其他來源。
+  保留前景自動更新、最多 1 Hz／10 秒 freshness 與 Station 相同快照確認，Wi-Fi／熱點連線用途不變。
+  三組 JUnit 共 5 案例、assembleDebug、16 KB ELF／APK 對齊與 zipalign 通過，lint 0 errors／26 warnings。
+  尚未安裝手機或完成戶外驗收，未修改或燒錄 Station／Client，詳見 [App 紀錄](docs/android-app-2026-11-13.md)。
+
+- **2026-11-13 Android 整合 App 0.1**：新增獨立 `tw.shorespotter.app`，Pixel 10 橫向滿版相機、
+  無聲錄影／同檔暫停繼續、可調解析度／FPS、縮放／對焦，錄影不因展收原生控制／資訊而中斷。
+  控制直連既有 API，保留位置回報啟停、GPS／手動、手動角度；資訊只留兩端電量、定位、校正、速度及 IP。
+  不照搬網頁，移除 App 地圖／雷達、重複標頭／重整、所有兩端 SD 與工程診斷；原網頁 debug 保留。
+  提醒疊在影像，手機電量／充電狀態與剩餘 GB 移至右下畫質右側，以 13sp 上下兩行共用同一個半透明背景、沒有白框；
+  上行接電時顯示綠色閃電 icon＋N%，拔電為「電量 N%」，接電且滿電也保留閃電與百分比，下行顯示剩餘 GB。最新閃電 icon／百分比改動尚未部署到手機。
+  海邊狀態改實心背景、粗體與模式勾選，就緒綠 `#7acd9c`、沙色等待、粉紅 `#e99a94` 未確認／斷線／錯誤、灰色停用；
+  尚未取得第一筆定位為沙色等待。紅綠提高飽和度，五種文字對比為 11.24／6.71／8.40／5.24／5.42:1。
+  橫向留 8dp、面板按鈕垂直留 12dp 間距，移除整條頂列背景，上方底板同高 32dp／觸控區 48dp。
+  頂列只留定位／Station，固定寬 112／128dp，移除儲存 chip；文字變動不推動位置。錄影／暫停／倍率／畫質／資源區均高 48dp、距底部 26dp 對齊。
+  畫質寬 128dp／距右 172dp，資源區寬 144dp／距右 20dp；倍率／畫質保留白色細框，開面板時與資源區一起隱藏、收合後恢復。
+  一般按鈕底板維持 6dp 小圓角長方形；錄影鍵改半透明圓形底板，中心紅圓／停止方塊 alpha `0xb3`、底板 `0x99`，移除白色外框。
+  移除 1×／2×／5×，倍率滑桿列縮至前次寬度 80%、再以 `max(200dp, 螢幕寬 - 464dp)` 夾限，左側預留錄影／暫停區；8dp 軌道／28dp 拖曳點不變。
+  點按 Station 面板外的相機預覽可收合，不重新綁定相機或改變錄影。
+  App 主畫面／對話框攔住手機內建音量鍵，不調音量、不當錄影鍵，不改全域設定；外接輸入另辨識，尚未加入遙控錄影。
+  手機定位前景固定更新，移除停止／開始更新；存在但停用的 provider 仍訂閱，以便重新啟用後恢復。
+  主畫面連線／控制／資訊合併為「Station 控制／Station 斷線」兩狀態單一入口，內容整合一頁，未連線只可設 IP、不能進入控制／資訊，失聯收起並停用。
+  IP 欄不要求協定，改數字鍵盤支援多個點、完成即連線；新增 `shore-spotter-android` skill 與唯讀實機檢查工具供 agent 接續。
+  新 Android 位置最多 1 Hz／10 秒 freshness，核對 Station 回覆才確認；動作保留 boot／epoch／seq／2 秒期限、
+  202 受理與操作 confirmed 分開，不自動重送舊意圖。CameraX 1.6.2 修復舊 JNI 16 KB 對齊警告。
+  Pixel 10／Android 17 已安裝；build、三組 JUnit、lint、16 KB 靜態檢查通過；
+  1080p／4K 60 目標短片無音軌、暫停繼續、原生控制展收／縮放、Station 手機位置接收與 Surfer 啟停已確認。
+  實機影片與驗收界線見 [App 紀錄](docs/android-app-2026-11-13.md)／[使用方式](android/README.md)。
+  本 App 變更未修改或燒錄兩端韌體，未進行 Servo 動作或戶外驗收。
+
+- **2026-11-13 Station Web 逾時恢復（584C 已部署）**：HTTP 2 秒逾時不再依賴 abort 完成才釋放佇列，
+  遲到 fetch／本文不更新資料或控制世代；逾時後冷卻 1 秒。背景化取消舊讀取與未送出操作，
+  回到前景／快取恢復／online 時重新讀取狀態，清除舊資料新鮮度；POST 不重試、舊控制意圖失效，
+  保留後端新鮮度與期限，HTTPS 手機定位仍可送新位置給背景 opener，不重放舊待送位置。
+  新增 16 筆有界頁面錯誤摘要，不改版面、RF／GPS／BLE 或後端追蹤／Servo 規則。
+  修復前卡住 fetch 案例 2／2 失敗；新增 13／13、9 組既有網頁回歸、LilyGO Station build
+  與 binary 內 HTML 核對通過，詳見 [修復紀錄](docs/web-recovery-2026-11-13.md)。
+  使用者授權後 USB application-only 寫入 584C app1，Flash hash／新 boot `352284237`／實機 HTML 核對通過，
+  F035 同 boot／BLE claimed／Ready／B 與速限保存確認；Client 未更新，未送 HTTP Servo／Client 指令。
+  BLE 約 uptime 141 秒才觀察到恢復，SD 文字持續寫入但快照停止增加／跳過計數上升，兩項仍待查；戶外恢復尚待驗收。
+
+- **2026-10-30 Station 584C 改綁 F035**：核對 USB serial／MAC `48:CA:43:57:58:4C`、
+  hostname、既有 1.0 韌體與 boot 後，透過 `/api/whitelist?action=set&id=F035` 將 FB27 替換為 F035。
+  HTTP 200 與 GET 讀回確認保存；後續 BLE connected／claimed、owner 584C、Ready、`can_control=true`，
+  兩次新鮮狀態的 Client boot 同為 `D52C5A29`（age 888／846 ms）。Servo 維持 manual／179.5°；
+  未重新 build／燒錄或啟動 Tracking／Test。詳見 [維護紀錄](docs/t096-maintenance-2026-10-28.md)。
+
+- **2026-10-30 T096 F035 更新完成**：將目前接上的 F035（USB serial `C3BFA5F76F915E4A`）
+  由 0.6.1-dev 更新為目前工作目錄的 1.0／UI=8；native 140／140 與 13 組相關主機回歸、
+  獨立目錄 Client build、ZIP CRC／application-only manifest／SoftDevice 0xB6 核對通過。
+  application-only DFU exit 0／`Device programmed.`，同 serial 返回 application USB；
+  新 boot `CF8DCA00`、1.0／UI=8、USB DIAG 同 boot 回覆已確認。Station 未重燒或修改綁定，
+  BLE 認領、實體按鍵／TFT 及戶外 GPS／RF 尚未驗收；見 [維護紀錄](docs/t096-maintenance-2026-10-28.md)。
+
+- **2026-10-28 T096 USER ACT／SLP（UI=8，FB27 已部署）**：長按滿 5 秒放開改為 Ready → Tracking、Tracking／Test → Ready；
+  未認領亦可本機 ACT，保留 owner／BLE／boot／命令序號與 runtime 頻道（開機 A，本次改 B 後沿用 B）。
+  RF 忙碌等現有交易結束；低電禁止啟動，初始化失敗保留 RF 原始錯誤；舊 LoRa 重播不能誤確認已被本機切換的模式。
+  加入 CLIENT BOOTING 開機提示、ACT STARTED／ENTERED SLP 兩秒文字與低電／RF 失敗提示，不增加阻塞等待。
+  USER 短按與 60 秒查看不變，重啟與換 Station 改用 RST。13 組主機回歸、native 140／140 通過；
+  顯示提示追加後 13 組回歸與 T096 build 通過（RAM 19,724／Flash 200,008 bytes），ZIP CRC 通過。
+  FB27 已 application-only DFU，新 boot E4017F95／UI=8／BLE owner 584C／Ready 確認；實體按鍵與文字仍待驗收。
+  詳見 [維護紀錄](docs/t096-maintenance-2026-10-28.md)。
+
+- **2026-10-28 私有 Wi-Fi 設定**：依使用者提供的連線資訊更新本機 `include/wifi_config.h`，
+  已確認受 Git ignore 保護且未追蹤；不在版本文件記錄 SSID／密碼。Station 重新 build 通過，尚未燒錄或驗證新設定連線。
+
+- **2026-10-28 Station 部署完成**：使用者授權先更新 Station；584C OTA 因漏核對 Wi-Fi 設定而未回原網路，
+  已以先前成功部署設定隔離重建，核對 USB serial／MAC 後 application-only 寫入 app1，hash 通過。
+  RTS reset 未恢復，watchdog reset 後新 boot `2025037645`／HTTP／核准 HTML／FB27 新鮮 STATE／SD 錄製已確認。
+  BLE 仍 searching，重連改善尚未驗證；Client UI=7、後續 RF 顯示與另行更新的私人 Wi-Fi 設定未部署。
+  過程與後續驗證見 [BLE 重連紀錄](docs/ble-reconnect-2026-10-28.md)。
+
+- **2026-10-28 RF 指標易讀化（2026-11-13 已部署 584C）**：Surfer 診斷的 RSSI／SNR 分為訊號強度、訊號品質兩列，
+  各顯示 Good／OK／Bad／Off，原始數值收在折疊內。Off 僅表示沒有近期 RF 樣本；
+  網頁失聯／資料過期顯示 `--`，不誤稱 Client 關機。不改後端綜合分級、RF、GPS 或 Servo 行為。
+  motion UI（含分級邊界／原始值／過期／恢復）、radar layout、Client control UI、BLE UI 四組回歸通過；
+  `pio run -e tbeam-station` build 通過（Flash 1,927,546 bytes），`git diff --check` 通過。
+  此階段未燒錄；11/13 隨使用者授權的 HTTP 恢復產物部署至 584C，實際 HTML 一致性已核對，見上述修復紀錄。
+
+- **2026-10-28 BLE 重連查證與介面修正（Station 已部署，Client 未部署）**：核對實際 NimBLE 分支，舊 `connect(...,5000)`
+  未採用 5000，內部期限為 30000 ms，不能用五秒逾時解釋舊 61 秒觀察。
+  Station 改 passive scan／目標廣播到達即由 worker 結束掃描，增加有界掃描等待、切換目標檢查與
+  SDK 固定佇列階段計時／失敗原因；Client 10 秒廣播、owner 與 GPS／LoRa 行為不變。
+  T096 UI=7 首行改動態 `CLIENT ID xxxx`，真實 BLE MAC 保留 USB 診斷；頻道彈窗移除取消、
+  點窗外關閉且不送出草稿；按鈕改「開啟位置回報／關閉位置回報」。
+  10 組針對性主機回歸、雙端 build、隔離彈窗與 TFT 原字型 mock 通過；
+  見 [本輪紀錄](docs/ble-reconnect-2026-10-28.md)。實機延遲改善仍未驗證。
+
+- **2026-10-28 室內驗收交接**：新增 [驗收與接續任務](docs/indoor-acceptance-handoff-2026-10-28.md)，
+  記錄使用者按鍵／Test／A/B 保存／重啟／網頁驗收、BLE 重連約 22～61 秒待查、三項尚未實作介面需求。
+  同步助手入口；未修改韌體、build 或部署，不將重連速度、多 Station 或戶外項目列為通過。
+
+- **2026-10-28 文件一致性整理**：README、交接／功能入口與通用規格同步現行 1.0／T096 UI=6；
+  舊 Ready 30 秒 LoRa、USER 2 秒回 Ready、四區 UI／網頁置中及舊版本資料明確分為歷史。
+  綁定／控制 OpenAPI 統一 api_version=2、BLE／LoRa 新鮮度、ready_poll_ms=0、409／503 與同 ID no-op；
+  TEL 主表補 humidity=254，區分 manifest A/SF10 與 runtime A/B 皆 SF9。
+  補齊實體置中校正、頻道保存與 SD runtime 快照；區分速度 UI 整數／API 小數及最近 RF／DATA 平均 RSSI，
+  保留各版實際部署／待驗證界線。
+  兩份 OpenAPI JSON／local refs／共有契約、196 個本機文件連結通過；binding API、Station BLE backend、
+  BLE codec、T096 維護電源與 motion backend 五組相關主機回歸通過。本項未修改韌體或重新 build／部署。
+
+- T096 診斷頁版本文字改為 `VERSION 1.0`（UI=6），韌體版本仍為 1.0；顯示回歸與 build 通過，FB27 已燒錄，新 boot／BLE 認領確認。
+
+## 1.0 — 2026-10-28
+
+- 建立 a.b 雙端相容規則；取代 0.x 開發系列，不承諾與舊 0.x 相容。正常韌體版本為 1.0，診斷專用建置為 1.0-debug。
+- T096 UI=5：首頁維持五行，電壓與 UP 同列；診斷頁六行加回完整 SAT、AGE、HDOP，保留所有系統／傳輸診斷。七組相關主機回歸、雙端 build 通過；584C／FB27 已 application-only 燒錄，新 boot／1.0／BLE 認領／SD recording 確認。實體畫面仍待目視；詳見 [維護紀錄](docs/t096-maintenance-2026-10-28.md)。
+
+- **2026-10-28 T096 維護首頁 UI=4**：完整 MAC 六組以冒號分隔；sleep／active 中間改畫連續實線，
+  不使用有缺口的字型直線。GPS／RF 狀態同行、RF SLEEP 文字改 OFF；GPS 衛星／HDOP／年齡與電壓同列，
+  保留首頁診斷資訊與既有按鍵／控制行為。兩組顯示／按鍵回歸與 build 通過，原字型 mock 預覽確認實線；
+  FB27 已 application-only DFU，新 boot 4E9805E0／UI=4／BLE 自動認領確認。驗證與部署見 [維護紀錄](docs/t096-maintenance-2026-10-28.md)。
+
+- **2026-10-28 T096 維護首頁 UI=3**：第一行改實際完整 BLE MAC（`AA:BB:CC:DDEEFF`），
+  第二行固定 sleep／active 並框出目前模式（Ready／Tracking 或 Test）；owner 改十六進位並與 BLE 同行。
+  移除畫面 USB，GPS 狀態／衛星／HDOP／年齡集中首頁；診斷頁只留版本、uptime、TX／錯誤與 LAST。
+  三組相關回歸與 Client build 通過，原字型 mock 預覽確認邊框；FB27 已 application-only DFU，
+  新 boot B881BE78／UI=3／實際 BLE MAC 與 Station 自動認領已確認，實體畫面仍待目視驗收。
+  按鍵、控制狀態與 BLE／LoRa 協定不變；驗證與部署見 [維護紀錄](docs/t096-maintenance-2026-10-28.md)。
+
+- **2026-10-28 T096 開蓋維護介面**：USER 短按亮屏 60 秒／切換連線與診斷兩頁；
+  長按滿 5 秒後放開重啟，1–5 秒放開取消，移除長按 2 秒回 Ready。
+  顯示十進位 Client／owner ID、實際 BLE／GPS／RF、電壓、epoch 年齡／衛星／HDOP、TX／錯誤計數與最後 RF／BLE 失敗原碼。
+  開機／低電自動畫面仍約 5 秒，開機已按住必須先放開；owner 仍僅於重新開機解除。
+  140 native、11 組 T096／BLE 與 RF power 回歸、Client build 通過；FB27 已 application-only DFU，
+  新 boot／維護標記／BLE 自動重新認領與 Ready 已確認；實體按鍵、螢幕與跨 Station 換機仍待操作驗收。
+  驗證／部署與換 Station 操作見 [維護介面紀錄](docs/t096-maintenance-2026-10-28.md)。
+
+- **2026-10-27 BLE 待機／開機認領與手動換頻（0.7.0-dev）**：T096 待機改為 BLE 每 10 秒可連線廣播，
+  不再定期使用 LoRa 收發；Station 自動呼叫已指定的 Client，第一個有效認領來源持有本次開機控制權，
+  斷線與回待機不釋放，只能重開 Client 才換 Station。GPS／LoRa 啟動與無 GPS 的 RF 測試仍分開。
+  Station 增加非阻塞候選頻道 CAD 掃描、待機選頻與實際 LoRa 回報驗證後保存；A／B 候選皆用 SF9。
+  Surfer ID 改為藍色可點文字，編輯框需確認才修改；網頁與未來 iOS／Android App 共用 Wi-Fi HTTP API，
+  不由 App 直接控制 Client。實作、API 與驗證界線見 [BLE 版本紀錄](docs/ble-control-2026-10-27.md)。
+  140 native＋46 Python／Node 主機腳本通過（全套與修正後相關重跑），T096／LilyGO Station build 通過，隔離網頁預覽完成。
+  Ready 不重試 RF 初始化、Station 故障後恢復原工作頻道及 SD runtime 頻率已加回歸。
+  **2026-10-28 已 application-only USB 部署 584C／FB27**：新 boot／BLE 自動認領／實機 HTML 一致、
+  B 頻道 5 個測試封包無缺號與 Stop 回 Ready 通過；配對、60°/s 及 SD recording 保留。
+  掃頻與跨頻保存、待機電流、戶外 RF、GPS 與 Servo 仍未做本版驗收。
+
+- **2026-10-27 資訊頁精簡與配對狀態修正**：移除控制板規格、版本、正常溫濕度／SD 與速度保存成功文字，
+  詳細定位／RF／MCU 數值收進診斷；SD error 接進提醒。保留已確認 Client ID，HTTP 失敗與 STATE 過期分開顯示，
+  僅明確 `client_id=0` 顯示未配對。移除網頁置中，新增操作者確認實體置中的校正參數／中位同步，保留舊 API。
+  RF 測試改名無線連線測試並增加結束操作。584C 已以 USB application-only 更新、hash 驗證通過；新開機、HTML 逐 byte 一致、FB27 持續 STATE、60°/s 與 SD recording 保留。驗證與部署狀態見 [本次紀錄](docs/info-page-2026-10-27.md)。
+
+- **2026-10-27 App Client 綁定 API 契約**：整理既有 `/api/whitelist` 的讀取、替換、解除、NVS 保存與錯誤語意，
+  加入 iOS／Android 共用串接流程及 OpenAPI 子集，區分設定成功與新鮮 STATE／控制命令確認。
+  實際 handler／NVS 主機回歸與 Station downlink 回歸通過；沿用現有端點與韌體行為，不需為本次文件／測試重新燒錄。
+  串接入口見 [App 綁定契約](docs/client-binding-api.md)；手機 App 尚未實作／驗收。
+
+- **2026-10-22 T096 健康診斷（0.6.1-dev）**：MCU 溫度每 30 秒機會式取樣，
+  不增加待機週期喚醒；SoftDevice 依其 API 讀取，裸 peripheral 有 10 ms 非阻塞逾時及 STOP。
+  既有 11-byte TEL 的 humidity=254 明示 MCU 溫度／無濕度，保留 wire v5 與原本發送頻率；
+  舊 Station 會拒絕此保留碼，因此須先更新 Station。新 API 將 MCU 與環境溫度分開，
+  顯示接收最高溫／接收年齡、逾期 unknown，不套用環境溫度警告或自動停機。
+  GNSS parser 增加拒收原因，不改接受／定位規則；T096 固定 4 筆 RAM 原始 bytes 證據，
+  含時間／截斷／覆寫計數，只經唯讀 USB `DIAG STATUS`、`DIAG NMEA` 匯出，不寫 Flash。
+  140 native＋39 Python/Node 通過；584C／F035 已更新 0.6.1-dev，fresh boot、MCU USB／LoRa／網頁、原始 NMEA 匯出及 Ready 逾期 unknown 通過。
+  實作、驗證與部署紀錄見 [T096 健康診斷](docs/t096-health-diagnostics-2026-10-22.md)。
 
 - **2026-10-16 USB 匯出隔離 SDK log**：ESP-IDF 訊息改由固定容量、跨 task 保護的佇列，
   在主迴圈經既有 LogTee 寫入診斷紀錄；SDK 不再直接寫入 SD／DIAG 的 USB 封裝串流。

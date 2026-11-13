@@ -10,15 +10,24 @@ import subprocess
 import tempfile
 
 source = Path("include/station_extensions.h").read_text()
-start = source.index("namespace station_extensions {")
-end = source.index("static String positionJson()", start)
-actual = source[start:end]
+def block(marker):
+    start = source.index(marker)
+    body = source.index("{", start)
+    depth = 0
+    for match in re.finditer(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]', source[body:]):
+        if match.group() == "{": depth += 1
+        elif match.group() == "}":
+            depth -= 1
+            if not depth: return source[start:body + match.end()]
+    raise ValueError(marker)
+actual = "\n".join(block(m) for m in ("static bool accept(", "static void serviceRadio()"))
 
 cpp = r'''
 #include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <cstring>
 #include "protocol.h"
 #include "client_control.h"
 #include "station_client_link.h"
@@ -56,7 +65,15 @@ struct FakeRadio {
   int16_t finishTransmit() { ++finishCalls; return finishResult; }
   int16_t startReceive() { ++rxCalls; return RADIOLIB_ERR_NONE; }
 } radio;
-
+struct { size_t putUChar(const char*,uint8_t){return 1;} } prefs;
+namespace station_extensions {
+station_client_link::Link link;
+bool txActive=false,rendezvous=false,commandViaBle=false,haveRf=false,haveLoraState=false,verified=false,scanning=false;
+uint32_t txStarted=0,rendezvousMs=0,nextSendMs=0,lastRfMs=0,lastLoraStateMs=0;
+uint8_t txBuffer[CLIENT_CONTROL_PACKET_LEN]{},selectedChannel=0,savedChannel=0;
+int8_t activeChannel=0;
+client_control::Status loraStatus{};
+void serviceBle(){} void serviceScan(){}
 '''+actual+"\n} // namespace station_extensions\n"+r'''
 
 static void reset() {
@@ -66,8 +83,8 @@ static void reset() {
   stationRadioIrq = false; stationRxReady = true; nextStationRxRetryMs = 0;
   radio = FakeRadio{}; txFrontendCalls = 0; txFrontend = false; nowMs = 0;
 }
-static void state(uint32_t boot, uint16_t station = 0, uint16_t command = 0,
-                  client_control::State value = client_control::State::Ready) {
+static void state(uint32_t boot, uint16_t station = 99, uint16_t command = 0,
+                  client_control::State value = client_control::State::Tracking) {
   uint8_t b[CLIENT_STATE_PACKET_LEN]{};
   const PacketHeader h{5, 17, MSG_CLIENT_STATE};
   const client_control::Status s{boot, value, station, command, nowMs, 3900, 3, 0, false};
@@ -111,11 +128,11 @@ int main() {
   nowMs = 1030; station_extensions::serviceRadio();
   assert(!station_extensions::txActive && !txFrontend && stationRxReady);
   assert(station_extensions::link.lastError == RADIOLIB_ERR_TX_TIMEOUT && radio.finishCalls == 1);
-  reset();state(77,0,0,client_control::State::Tracking);
+  reset();state(77,nodeId,0,client_control::State::Tracking);
   assert(station_extensions::link.request(client_control::Action::Stop,nowMs,nodeId));
   assert(station_extensions::link.pending());
   const uint16_t stopId=station_extensions::link.commandId;
-  nowMs=10;state(77,0,0,client_control::State::Tracking);
+  nowMs=10;state(77,nodeId,0,client_control::State::Tracking);
   nowMs=30;station_extensions::serviceRadio();
   assert(client_control::decodeCommand(radio.sent,radio.sentLength,h,c));
   assert(c.action==client_control::Action::Stop);

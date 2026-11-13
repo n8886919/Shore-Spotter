@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shore Spotter Android"
+  short_description: "Develop and verify the Shore Spotter Android app"
+  default_prompt: "Use $shore-spotter-android to inspect or test the Shore Spotter app within the authorized phone and hardware scope."

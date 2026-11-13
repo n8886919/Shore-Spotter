@@ -18,12 +18,17 @@ class Link {
     if(pending() && uint32_t(now-commandMs)>=client_control::kCommandTimeoutMs) command="timeout";
   }
   void observe(uint16_t id,const client_control::Status &s,uint32_t now,uint16_t station) {
+    // A delayed transport snapshot must not roll state back after a newer
+    // command was already observed on the other transport.
+    if(have && client==id && status.boot==s.boot && status.station==station &&
+       s.station==station && int16_t(s.command-status.command)<0)return;
+    const bool newBoot=!have || client!=id || status.boot!=s.boot;
     if(have && (client!=id || status.boot!=s.boot)) {
       command=pending()?"error":"idle";
       commandId=0;resetProbes();
     }
     status=s;client=id;receivedMs=now;have=true;
-    if(s.station==station && !pending())commandId=s.command;
+    if(s.station==station && !pending() && (newBoot || int16_t(s.command-commandId)>0))commandId=s.command;
     if(pending() && s.boot==requestedBoot && s.station==station && s.command==commandId) {
       const auto expected=action==client_control::Action::Start ? client_control::State::Tracking :
         action==client_control::Action::Test ? client_control::State::Test :

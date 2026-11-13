@@ -1,0 +1,13 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const source=fs.readFileSync('include/web_ui.h','utf8');
+const actual=source.match(/function renderMcuTemperature\(t\)\{[\s\S]*?\n\}/)[0];
+const els={};const ctx={$:id=>els[id]||(els[id]={textContent:''}),Number,Math};
+vm.createContext(ctx);vm.runInContext(actual,ctx);
+const render=t=>ctx.renderMcuTemperature(t);
+render({temp_kind:'mcu',mcu_temp_fresh:true,mcu_temp_c:0,mcu_temp_max_received_c:32,mcu_temp_rx_age_ms:1500});
+assert.equal(els.cMcuTemp.textContent,'0°C');assert.equal(els.cMcuTempMax.textContent,'32°C');assert.equal(els.cMcuTempAge.textContent,'1 s');
+render({temp_kind:'mcu',mcu_temp_fresh:false,mcu_temp_c:25,mcu_temp_max_received_c:32,mcu_temp_rx_age_ms:60000});assert.equal(els.cMcuTemp.textContent,'--');
+render({temp_kind:'environment',temp_c:28,humidity_pct:60});assert.equal(els.cMcuTemp.textContent,'--');assert.equal(els.cMcuTempMax.textContent,'--');
+render();assert.equal(els.cMcuTempAge.textContent,'--');
+assert(source.includes('非電池／環境溫度'));
+console.log('PASS MCU UI provenance, zero, stale, old firmware and unknown');

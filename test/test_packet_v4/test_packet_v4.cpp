@@ -180,8 +180,23 @@ void test_telemetry_golden_exact_satellite_diagnostics_and_unknowns() {
   TEST_ASSERT_TRUE(protocol::decodeTelemetry(buf, sizeof(buf), h, out));
   TEST_ASSERT_EQUAL(INT8_MIN, out.tempC); TEST_ASSERT_EQUAL(255, out.satellites);
   buf[9] = 101; TEST_ASSERT_FALSE(protocol::decodeTelemetry(buf, sizeof(buf), h, out));
-  telemetry.humidityPct = 254;
-  TEST_ASSERT_EQUAL_UINT32(0, protocol::encodeTelemetry(buf, sizeof(buf), header, telemetry));
+  telemetry.humidityPct = protocol::kMcuTemperatureMarker;
+  TEST_ASSERT_EQUAL_UINT32(11, protocol::encodeTelemetry(buf, sizeof(buf), header, telemetry));
+  TEST_ASSERT_TRUE(protocol::decodeTelemetry(buf, sizeof(buf), h, out));
+  TEST_ASSERT_EQUAL(INT8_MIN, out.tempC); TEST_ASSERT_EQUAL(254, out.humidityPct);
+  for(int temperature=-40;temperature<=85;++temperature) {
+    telemetry.tempC=temperature;
+    TEST_ASSERT_EQUAL_UINT32(11, protocol::encodeTelemetry(buf, sizeof(buf), header, telemetry));
+    TEST_ASSERT_TRUE(protocol::decodeTelemetry(buf, sizeof(buf), h, out));
+    TEST_ASSERT_EQUAL(temperature,out.tempC);
+  }
+  telemetry.tempC=86; TEST_ASSERT_EQUAL_UINT32(0,protocol::encodeTelemetry(buf,sizeof(buf),header,telemetry));
+  telemetry.tempC=-41; TEST_ASSERT_EQUAL_UINT32(0,protocol::encodeTelemetry(buf,sizeof(buf),header,telemetry));
+  telemetry.tempC=25;
+  for(int humidity=101;humidity<254;++humidity) {
+    telemetry.humidityPct=humidity;
+    TEST_ASSERT_EQUAL_UINT32(0,protocol::encodeTelemetry(buf,sizeof(buf),header,telemetry));
+  }
 }
 
 void test_all_codecs_reject_wrong_type_short_capacity_and_extra_bytes() {

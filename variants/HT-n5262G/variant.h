@@ -16,6 +16,9 @@
 #define PIN_LED1 28
 #define LED_BUILTIN PIN_LED1
 #define LED_STATE_ON 1
+// Bluefruit requires this symbol even with autoConnLed(false). This firmware
+// assigns no connection LED: the Adafruit core ignores pins >= PINS_COUNT.
+#define LED_BLUE PINS_COUNT
 #define PIN_BUTTON1 42
 
 #define PIN_A0 21

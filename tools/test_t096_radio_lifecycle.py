@@ -46,6 +46,10 @@ def main() -> None:
 #include <cstddef>
 #include <cstdint>
 #include <cassert>
+#include "t096_maintenance.h"
+t096_maintenance::Fault maintenanceFault;
+#include <cstdio>
+#include <cstring>
 using std::size_t;
 struct PacketHeader;
 constexpr int16_t RADIOLIB_ERR_NONE = 0, RADIOLIB_ERR_PACKET_TOO_LONG = -1;
@@ -57,7 +61,7 @@ constexpr uint32_t kTxTimeoutMs = 3000;
 uint32_t clockMs = 0; uint32_t millis() {{ return clockMs; }} void delay(unsigned) {{ ++clockMs; }}
 namespace client_control {{
 constexpr uint32_t kReceiveWindowMs = 800, kReceiveListenMs = 85;
-enum class State {{ Ready, Tracking, Test, Storage }}; struct Command {{}};
+enum class State {{ Ready, Tracking, Test, Storage }}; enum class Action {{ Start, Stop, Test }}; struct Command {{ Action action=Action::Stop; }};
 inline bool decodeCommand(const uint8_t*, size_t, ::PacketHeader&, Command&) {{ return true; }}
 }}
 namespace t096_control {{
@@ -68,17 +72,18 @@ struct PacketHeader {{}};
 struct FakeControl {{
   bool applied = false;
   t096_control::CommandResult apply(const PacketHeader&, const client_control::Command&, uint32_t) {{ applied = true; return t096_control::CommandResult::Applied; }}
-  client_control::State state() const {{ return client_control::State::Ready; }}
+  client_control::State current = client_control::State::Tracking;
+  client_control::State state() const {{ return current; }}
   void notedState(uint32_t) {{}} void cancelStorage(uint32_t) {{}}
 }} control;
-template<class... T> void usbLog(const char*, T...) {{}}
+char lastLog[160]={{}}; template<class... T> void usbLog(const char* fmt, T... args) {{ std::snprintf(lastLog,sizeof(lastLog),fmt,args...); }}
 struct FakeRadio {{
   uint32_t flags = 0; bool receiveStarted = false,asleep=false;
-  int16_t wakeResult=0,transmitResult=0;unsigned wakeCalls=0,startCalls=0;
+  int16_t wakeResult=0,transmitResult=0,receiveResult=0;unsigned wakeCalls=0,startCalls=0;
   int16_t standby() {{++wakeCalls;if(!wakeResult)asleep=false;return wakeResult;}}
   // Installed SX126x TX staging reads packet type before waking the chip.
   int16_t startTransmit(const uint8_t*,size_t) {{++startCalls;return asleep?-2:transmitResult;}}
-  int16_t startReceive(uint32_t,uint32_t,uint32_t) {{ receiveStarted = true; flags=0; return RADIOLIB_ERR_NONE; }}
+  int16_t startReceive(uint32_t,uint32_t,uint32_t) {{ receiveStarted = true; flags=0; return receiveResult; }}
   uint32_t getIrqFlags() {{ return flags; }} size_t getPacketLength() {{ return 12; }}
   int16_t readData(uint8_t*, size_t) {{ return RADIOLIB_ERR_NONE; }}
   void finishReceive() {{}} void finishTransmit() {{}}
@@ -86,7 +91,7 @@ struct FakeRadio {{
 enum class AirState : uint8_t {{ Idle, Sending, Receiving }};
 AirState air = AirState::Idle;
 bool radioIrq = false, confirmationPending = false, outOpensReceiveWindow = false, outIsState = false, sleepAfterStateTx = false;
-bool rxPreamble=false,radioSleeping=false,radioReady=true; uint32_t txErrors=0,nextBatteryMs=0,nextTxStartMs=0,nextRadioRetryMs=0;
+bool batteryProtection=false,rxPreamble=false,radioSleeping=false,radioReady=true; uint32_t txErrors=0,nextBatteryMs=0,nextTxStartMs=0,nextRadioRetryMs=0;
 uint8_t out[64] = {{}}; size_t outLength = 0; uint16_t rxErrors = 0; uint32_t airStartedMs = 0, txPackets = 0;
 void femTx() {{delay(1);}} void femRx() {{ delay(1); }} void femOff() {{}} void setGnssEnabled(bool) {{}} void armSystemOff(uint32_t) {{}}
 bool usbVbusPresent() {{ return false; }} void enterSystemOff() {{}}
@@ -117,6 +122,9 @@ int main() {{
   radio.wakeResult=0;radioReady=true;clockMs=30;outLength=1;outIsState=true;radio.transmitResult=-7;
   sendBuffered();assert(air==AirState::Idle&&confirmationPending&&!outLength&&nextTxStartMs==530);
   assert(txErrors==2&&txPackets==0);radio.transmitResult=0;
+  radio.receiveResult=-23; rxErrors=0; startReceiveWindow();
+  assert(air==AirState::Idle && rxErrors==1 && std::strstr(lastLog,"failed=-23"));
+  radio.receiveResult=0;
   clockMs = 100; resetTxDone(); actualDispatch();
   if (air != AirState::Receiving || !radio.receiveStarted || airStartedMs != 101) return 1;
   radio.flags = RADIOLIB_SX126X_IRQ_RX_DONE; radioIrq = true; actualDispatch();
@@ -128,6 +136,9 @@ int main() {{
   clockMs=airStartedMs+85; serviceReceive(millis()); if(air!=AirState::Receiving)return 7;
   clockMs=airStartedMs+500; serviceReceive(millis()); if(air!=AirState::Receiving)return 8;
   clockMs=airStartedMs+800; serviceReceive(millis()); if(air!=AirState::Idle)return 9;
+  clockMs=170;resetTxDone();control.current=client_control::State::Ready;outIsState=true;actualDispatch();
+  assert(air==AirState::Idle && !radio.receiveStarted && txPackets>0);
+  control.current=client_control::State::Tracking;
   clockMs = 200; resetTxDone(); cachedDispatch();
   if (air != AirState::Idle || !radio.receiveStarted) return 3;
   air = AirState::Receiving; radioIrq = false; airStartedMs = 0xFFFFFFF0u; clockMs = 0x00000311u;
@@ -140,7 +151,7 @@ int main() {{
         cpp = pathlib.Path(directory) / "t096_actual_radio.cpp"
         binary = pathlib.Path(directory) / "t096_actual_radio"
         cpp.write_text(harness, encoding="utf-8")
-        subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(binary)], check=True)
+        subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", "-I"+str(ROOT/"include"), str(cpp), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
     print("PASS: actual retained-radio wake before TX, failure guards, TX-done/FEM-RX/command/wrap lifecycle")
 

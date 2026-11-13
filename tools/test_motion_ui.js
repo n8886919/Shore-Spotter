@@ -35,7 +35,10 @@ function setPrediction(enabled){
  track.servo.prediction_enabled=enabled;track.servo.prediction_alpha=prediction.alpha;
 }
 function contextFields(){return {control_boot_id:track.servo.control_boot_id,control_epoch:track.servo.control_epoch,command_seq:track.servo.command_seq,clock_ms:track.servo.clock_ms};}
-const c={document:{getElementById:id=>elements[id],activeElement:null},window:{addEventListener(){}},console,Promise,Date,Math,Number,AbortController,performance:{now:()=>1000},
+const documentEvents={},windowEvents={};
+const c={document:{getElementById:id=>elements[id],activeElement:null,visibilityState:'visible',
+ addEventListener(name,fn){(documentEvents[name]||= []).push(fn);}},
+ window:{addEventListener(name,fn){(windowEvents[name]||= []).push(fn);}},console,Promise,Date,Math,Number,AbortController,performance:{now:()=>1000},
  setTimeout:()=>1,clearTimeout(){},setInterval:()=>1,clearInterval(){},
  fetch(url,options={}){
   const u=new URL(url,'http://test');let payload={},ok=true,status=200;
@@ -56,11 +59,14 @@ const c={document:{getElementById:id=>elements[id],activeElement:null},window:{a
     else if(api.invalidPredictionPost)payload={ok:true,enabled:'true'};
     else {setPrediction(u.searchParams.get('enabled')==='1');payload={ok:true,...prediction,...contextFields()};}
    }else if(u.pathname==='/api/track/calibrate'){
-    assert.deepEqual([...u.searchParams.keys()].sort(),['bearing','epoch','seq','stamp']);
+    assert.deepEqual([...u.searchParams.keys()].sort(),['bearing','epoch','physical_center','seq','stamp']);
     if(api.calibrationNetworkError)return Promise.reject(new Error('network failure'));
     if(api.failCalibration){ok=false;status=api.failCalibration;payload={ok:false,error:'calibration rejected'};}
     else if(api.invalidCalibrationPost)payload={ok:true};
     else {
+     assert.equal(u.searchParams.get('physical_center'),'1');
+     track.servo.angle=track.servo.target=179.5;
+     ++track.servo.control_epoch;track.servo.command_seq=0;
      const bearing=Number(u.searchParams.get('bearing'));track.servo.calibrated=true;
      track.servo.mount_offset_deg=(bearing+track.servo.angle)%360;
      if(track.servo.mount_offset_deg>180)track.servo.mount_offset_deg-=360;
@@ -101,14 +107,18 @@ c.document.documentElement={style:{setProperty(k,v){viewportWrites[k]=v;}}};
 if(options.visualViewport)c.window.visualViewport=options.visualViewport;
 Object.assign(c,options.context||{});
 vm.createContext(c);vm.runInContext(script,c);
-return {c,track,settings,prediction,elements,posts,api,holdNext,setPrediction,viewportWrites};
+function documentEvent(name,event={}){for(const fn of documentEvents[name]||[])fn(event);}
+function windowEvent(name,event={}){for(const fn of windowEvents[name]||[])fn(event);}
+return {c,track,settings,prediction,elements,posts,api,holdNext,setPrediction,viewportWrites,documentEvent,windowEvent};
 }
 async function settle(){for(let i=0;i<150;i++)await Promise.resolve();}
 
 if(require.main===module)(async()=>{
  const p=createPage();await settle();const {c,elements:e,track}=p;await c.refresh();await settle();
  assert(!e.mUart&&!e.cfgPrediction&&!e.sFix&&!e.cFix);
- assert.equal(e.sld.disabled,false);assert.equal(e.stationSd.textContent,'記錄中');
+ assert.equal(e.sld.disabled,false);
+ assert(!e.stationSd&&!e.sVersion&&!e.sTemp&&!e.sHum&&!e.controllerSettings&&!e.btnCompassCenter);
+ assert.equal(e.speedSaveState.textContent,'');
  assert.equal(e.clientControlState.textContent,'關閉');assert.match(e.cBattV.textContent,/4\.000 V/);
  assert.equal(c.satWord(0),'無');assert.equal(c.satWord(5),'少');assert.equal(c.satWord(6),'中');assert.equal(c.satWord(12),'多');
  assert.equal(c.fmtAcc(1.2),'HDOP 1.2');assert.equal(c.mapLink({fix:false,lat:24,lon:121}),'--');
@@ -118,12 +128,38 @@ if(require.main===module)(async()=>{
  e.cfgSpeed.value='35';await e.speedForm.onsubmit({preventDefault(){}});await settle();assert(!e.speedDialog.open);assert.equal(p.settings.speed,35);
  e.speedValue.onclick();e.cfgSpeed.value='40';e.cancelSpeed.onclick();assert.equal(p.settings.speed,35);
  Object.assign(track.servo,{mode:'gps',gps_available:true});await c.refresh();assert(e.sld.disabled);
- Object.assign(track.servo,{mode:'manual',angle:179.5,target:179.5});await c.refresh();await e.btnCompassCenter.onclick();assert.equal(track.servo.target,179.5);
+ Object.assign(track.servo,{mode:'manual',angle:250,target:250,calibration_ready:false});await c.refresh();
+ e.compassBearing.value='90';await e.btnCompassCal.onclick();await settle();
+ assert.equal(track.servo.target,179.5);assert.match(e.compassCalState.textContent,/已校正/);
+ assert(!p.posts.some(u=>u.pathname==='/api/servo/center'));
+ Object.assign(track.servo,{mode:'gps',gps_available:true});await c.refresh();
+ const before=p.posts.length;await e.btnCompassCal.onclick();assert.equal(p.posts.length,before);
+ Object.assign(track.servo,{mode:'manual',moving:true});await c.refresh();
+ await e.btnCompassCal.onclick();assert.equal(p.posts.length,before);
+ Object.assign(track.servo,{moving:false});await c.refresh();
  e.compassBearing.value='90.5';e.btnCompassCal.onclick();assert.match(e.compassCalState.textContent,/整數/);
  e.compassBearing.value='360';e.btnCompassCal.onclick();assert.match(e.compassCalState.textContent,/整數/);
  c.renderClientControl({supported:true,state:'tracking',age_ms:100});assert.equal(e.clientControlState.textContent,'開啟');
- c.renderClientControl({supported:false,state:'tracking',age_ms:100000});assert.match(e.clientControlState.textContent,/STATE/);
+ c.renderClientControl({supported:false,state:'tracking',age_ms:100000});assert.equal(e.clientControlState.textContent,'Client 尚未回報');
  assert(p.posts.every(u=>!u.pathname.includes('prediction')&&!u.pathname.includes('controller')));
- console.log('PASS real UI: map links, satellite words, HDOP, GPS states/freshness, fixed M0, speed modal save/cancel/validation, centre and mode isolation');
+ // RF quality is independent of GPS DATA; each metric keeps its own grade.
+ function rf(rssi,snr){c.last.status={lora:{rssi,snr}};c.statusReceivedMs=1000;c.renderRfQuality();}
+ rf(-53,11);assert.equal(e.sRssiQuality.textContent,'Good');assert.equal(e.sSnrQuality.textContent,'Good');
+ assert.equal(e.sRssi.textContent,'-53 dBm');assert.equal(e.sSnr.textContent,'11.0 dB');
+ rf(-105,0);assert.equal(e.sRssiQuality.textContent,'Good');assert.equal(e.sSnrQuality.textContent,'OK');
+ rf(-115,7);assert.equal(e.sRssiQuality.textContent,'OK');assert.equal(e.sSnrQuality.textContent,'Good');
+ rf(-115.1,-0.1);assert.equal(e.sRssiQuality.textContent,'Bad');assert.equal(e.sSnrQuality.textContent,'Bad');
+ rf(0,-5);assert.equal(e.sRssiQuality.textContent,'Good');assert.equal(e.sSnrQuality.textContent,'Bad');
+ rf(null,null);assert.equal(e.sRssiQuality.textContent,'Off');assert.equal(e.sSnrQuality.textContent,'Off');
+ assert.match(e.rfQualityHint.textContent,/不代表 Client 關機/);
+ rf(undefined,NaN);assert.equal(e.sRssiQuality.textContent,'--');assert.equal(e.sSnrQuality.textContent,'--');
+ rf(-53,11);c.performance.now=()=>7001;c.renderSignalLights();
+ assert.equal(e.sRssiQuality.textContent,'--');assert.equal(e.sRssi.textContent,'--');
+ c.performance.now=()=>1000;await c.refreshStatus();assert.equal(e.sRssiQuality.textContent,'Good');
+ const request=c.httpRequest;c.httpRequest=()=>Promise.reject(new Error('offline'));await c.refreshStatus();
+ assert.equal(e.sSnrQuality.textContent,'--');assert.equal(e.sSnr.textContent,'--');
+ c.httpRequest=request;await c.refreshStatus();assert.equal(e.sSnrQuality.textContent,'OK');
+ console.log('PASS independent RF grades, boundaries, missing samples, browser stale/failure/recovery and raw values');
+ console.log('PASS real UI: map links, satellite words, HDOP, GPS states/freshness, removed clutter, speed modal save/cancel/validation, physical-centre calibration and mode isolation');
 })().catch(e=>{console.error(e);process.exitCode=1;});
 module.exports={createPage,settle,html,script};

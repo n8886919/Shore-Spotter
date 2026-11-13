@@ -1,6 +1,16 @@
 # 介面規格（Interface）
 
-## 2026-10-11 現行控制與介面
+## 1.0 現行 BLE Client 控制與換頻
+
+現行原始碼為 1.0，BLE 契約沿用 0.7.0-dev。2026-10-28 的 1.0 雙端部署、後續 Client UI=6 與驗證界線
+見 [維護紀錄](t096-maintenance-2026-10-28.md) 最新節；0.7.0-dev 的舊部署證據保留原版本。
+
+本次新增／變更的 `/api/client/control`、`/api/client/radio`、BLE 封包、開機認領與 App 契約，
+見本文現行 Client API 小節與 [BLE 版本紀錄](ble-control-2026-10-27.md)。Ready 改走 BLE，沒有 30 秒 LoRa 輪詢；
+`supported`、`can_control`、`state_source` 分開，BLE 回報不算 LoRa RF 活動。
+原有 LoRa wire v5、定位／Servo 契約保留。舊 Ready 輪詢紀錄另行標示，不用於現行 API 判斷。
+
+## 現行控制與介面（2026-10-28）
 
 正式原始碼已整合 Youmi 35 kg（5–8.4 V、359°）＋串口控制板，固定 **M0**。
 Station UART2 **9600 8N1、TX GPIO43、RX 不配置**；`#00P0500!`～`#00P2500!`，無換行。
@@ -10,27 +20,30 @@ UART 寫入成功只證明 Station 交給 UART，不能證明控制板接受或 
 只留手動／GPS；舊 115200 SET／SET2／SYNC 外部輸入不再編入正常 Station，`mode=uart/jetson` 回 400。
 GPS α UI、預測運算與設定 API 已移除；`/api/track/prediction` 回 404，舊 NVS 鍵不讀寫。
 GPS 仍使用兩端有效且新鮮的位置、磁偏角與校正，失效轉完最後有效目標；不自動切換來源。
-共用速限預設 30°/s、整數 1～90，NVS `servospd` 保存；GPS 目標每 50 ms 重算。
+共用速限預設 30°/s、範圍 1～90；UI 輸入整數，API 可接受有限小數並以 0.001°/s 保存至 NVS `servospd`。GPS 目標每 50 ms 重算。
 
-資訊頁四區：**定位資訊／Station Info／控制板／Surfer Info**。
+2026-10-27 資訊頁更新：**定位資訊／Station Info／Surfer Info** 三區；完整規格與部署狀態見 [網頁設計](web-ui-design.md)。
 座標只顯示 Google Maps 連結；手填欄位由上至下經度／緯度／誤差。
 卫星顯示無／少／中／多；HDOP 下方說明其為幾何指標，不能換算成已知實際誤差。
 手機回報半徑、Station 30 秒 RMS 散布、實際誤差分開；真實誤差需對照已知參考位置。
-Station 顯示自有溫濕度與 SD 記錄狀態，無運行時間／Servo 來源／SD 錯誤計數；
+Station 保留速度與指南針校正；正常溫濕度、SD 狀態及版本不常駐，SD 錯誤加入提醒；
 Surfer 顯示電池、GPS 開啟／關閉、STATE／DATA 年齡與 RF 品質，無 USB 供電列。
-GPS 狀態只依近期 STATE；未知或過期不假裝為關閉。
-控制板區顯示 M0、串口、命令角度／脈寬／字串與 UART 計數，實際角度為未知。
+GPS 開關狀態依 `/api/client/control` 選用的新鮮 BLE／LoRa 狀態；未知或過期不假裝為關閉，定位有效性另看 DATA。
+控制板卡已移除；底層 API／診斷保留，實際角度仍為未知。
 磁偏角移到定位資訊；速度點數字開視窗、儲存成功才關閉，指南針整數 0～359、預設 90。
-「鏡頭置中」回 179.5°；停穩後填北 0°、東 90°、南 180°、西 270°重新校正（只存 RAM）。
+網頁置中按鈕已移除。先切手動、按控制板實體置中鍵，停穩後填指南針讀數校正（只存 RAM）；
+`physical_center=1` 同步 179.5° 基準並撤銷舊控制世代，下一輪送出中位脈寬，無實體回授。
 手動完整圓軌道 0～359°，0／359 在下、90 左、180 上、270 右，放開才送、端點不環繞。
-UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw 角度；地理方位另依校正計算。
+UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；API 保留 raw 角度；地理方位另依校正計算。
 手機定位權限流程延後、不加複製診斷摘要。
 
-部署目標：LilyGO 584C，B 組 923.8 MHz／SF9、wire v5；OTA 結果另見本次驗證記錄。
-主機通過 140 項 native、實際 HTTP／UART／GPS gate／NVS、圓形操作及地圖回歸。
-實體 M0 接線、UART 接受、轉向、端點、帶載及戶外 GPS 精度仍待驗收。
+10/16 已記錄使用者確認 Youmi／控制板實體驗收；10/27 新增實體置中校正仍待操作驗收。
+目前部署與各版主機／實機驗證見 [交接入口](assistant-handoff.md)，不以舊版結果代替新版完整追蹤驗收。
 
-## 以下為前版規格／歷史紀錄（控制與 UI 差異以上節為準）
+## wire／HTTP 契約與歷史紀錄
+
+下列 RF、TEL、Client 綁定／控制／選頻小節已依 1.0 原始碼更新，BLE 行為沿用 0.7.0-dev。其餘早期運動控制與 UI
+描述保留歷史脈絡，差異以上節現行控制與介面為準；不應把歷史 UART／PWM／α 欄位當成現行控制入口。
 
 本文件彙整 Shore Spotter 的 wire／HTTP 契約及欄位對應：
 
@@ -48,7 +61,7 @@ UI 刻度延續鏡頭方向反向映射 `ui=359-raw`；控制板區顯示 raw �
 
 # 1. LoRa 封包
 
-本節對應 **0.6-dev／LoRa 協定 v5** 的本機實作；板上部署、GNSS 實際更新率及戶外
+本節對應 **1.0／LoRa 協定 v5** 的本機實作；板上部署、GNSS 實際更新率及戶外
 RF／機構行為仍須實測。v5 與舊 v4／v3 不相容，Client、Station 都須更新；不存在自動降版。
 韌體版本與 wire 協定版本分別由 `firmware_version.h`、`protocol.h` 定義。
 
@@ -64,26 +77,29 @@ Station SD 記錄與 USB 狀態、開始／停止、列檔／讀回及檔案格�
 
 | 參數 | 值 |
 |---|---|
-| 中心頻率 | group A（保留原頻道，設備待登記）923.2 MHz；group B（Heltec V4 Station + T096 Client）923.8 MHz；不掃描／不協商 |
+| 中心頻率 | runtime 候選 A（channel=0）923.2 MHz；B（channel=1）923.8 MHz；Station 可手動 CAD 掃描／選頻，透過 BLE 控制 T096 套用 |
 | 頻寬 | 125 kHz |
-| Spreading Factor | A 組 SF10；B 組 SF9（兩端必須一致） |
+| Spreading Factor | 現行 Station／T096 的 A、B runtime 皆 SF9；兩端必須一致 |
 | Coding Rate | 4/5 |
 | Sync Word | `0x12` |
 | 前導碼／標頭 | 8 symbols／explicit header，PHY CRC 開啟 |
-| 固定發射功率 | group A Client 20 dBm；group B 為 SX1262 0 dBm chip drive。Station 僅在近期 STATE window 內送 control；數值不是天線端輸出量測 |
-| DATA 排程 | 最新有效定位即送，受 airtime＋80 ms guard 限制；失效通知一次，無 DATA 心跳 |
-| ACK | 已移除，無下行回覆 |
+| 固定發射功率 | T096 為 SX1262 0 dBm chip drive，外接 FEM；既有 T-Beam Client 為 20 dBm。Station 的 LoRa control 僅使用活躍狀態的近期 STATE window；數值不是天線端輸出量測 |
+| DATA 排程 | 最新有效定位依各 Client 排程發送；T096 最早每 500 ms 一個時槽，既有 T-Beam 受 airtime＋80 ms guard 限制；失效通知一次，無 DATA 心跳 |
+| DATA ACK | 已移除；控制下行與命令確認另走 CONTROL／STATE，不是 DATA ACK |
 | TELEMETRY／DIAGNOSTIC | T-Beam Client 各約 60 秒；T096 每 5 秒輪替 TEL／DIAG／GNSS（各約 15 秒），另有 STATE，可延後定位 |
 
 同組兩端頻率、BW、SF、Sync Word 必須一致。explicit header 帶有發送端的 payload
 Coding Rate；本專案 Client 發送使用 4/5。頻率設定不是整套設備的法規／審驗認定。
-目前未實作頻道掃描或協商切頻。Client ID 或 Sync Word 的資料過濾不會消除同頻 RF 碰撞。
+CAD 每候選執行五次，只記錄 LoRa 偵測／有效樣本／錯誤數，不是完整頻譜分析；沒有自動選頻。
+選擇只改 RAM，Start 收到匹配 LoRa STATE 後才保存 Station 偏好；詳見 `/api/client/radio`。
+Client ID 或 Sync Word 的資料過濾不會消除同頻 RF 碰撞。
 開機與無線電重建均使用各角色固定功率；Client 不讀寫舊 `shorespt_client/txpwr`、
-`atpc` NVS 鍵，也不清除它們。固定功率不隨接收品質調整；目前 A 組 SF10／B 組 SF9，均無 DATA ACK，排程如下。
+`atpc` NVS 鍵，也不清除它們。固定功率不隨接收品質調整；現行 A／B 均為 SF9、無 DATA ACK。
+`radio_profile.h` 仍保留舊 T-Beam Client 的 A=SF10 編譯預設；它不是目前 Station／T096 的 runtime 契約。
 
 ## 封包類型與空中時間
 
-| type | 名稱 | 大小（含共用標頭） | A：SF10 | B：SF9 | 用途 |
+| type | 名稱 | 大小（含共用標頭） | 舊 SF10 profile | 現行 A／B：SF9 | 用途 |
 |---|---|---:|---:|---:|---|
 | 1 | MSG_DATA | 18 B | 329.728 ms | 185.344 ms | 完整 E7 位置、速度向量與定位品質；無來源 age |
 | 4 | MSG_TELEMETRY | 11 B | 288.768 ms | 144.384 ms | 電量、溫濕度與精確衛星數 |
@@ -94,7 +110,8 @@ Coding Rate；本專案 Client 發送使用 4/5。頻率設定不是整套設備
 | 9 | MSG_LINK_TEST | 18 B | 329.728 ms | 185.344 ms | T096→Station RF test counter |
 
 type 2（舊 ACK）與 type 3（舊 HELLO）不接受。wire 升為 v5；所有類型標頭均用新版本，
-Client／Station 必須一起更新，舊格式拒收，無自動降版。SF9 與 SF10 不互通；B 組改 SF9 時須同步更新參與收發的兩端，舊 v4 仍拒收。
+Client／Station 必須一起更新，舊格式拒收，無自動降版。SF9 與 SF10 不互通；舊 A=SF10 profile
+不能直接配合現行 A=SF9，舊 v4 仍拒收。
 2 Hz 是 GPS 請求值，實際 DATA 頻率由有效新定位、RF 占用與診斷共同決定，不能由設定推定收包率。
 
 ### 不阻塞的發送與空檔
@@ -113,7 +130,7 @@ RMC／GGA 尚未配對時最多短等 150 ms；新 GGA 可提供位置但不借�
 本機發射失敗仍消耗該筆發送機會，避免緊密重試；沒有 ACK／舊定位重傳。
 
 DATA、TEL、DIAG 各有獨立序號，GNSS DIAG 每包使用獨立 seq；診斷不消耗 DATA seq。
-A 組 SF10 的 DATA／DIAG 約 330 ms，GNSS DIAG 約 494 ms，TEL 約 289 ms；B 組 SF9
+舊 SF10 profile 的 DATA／DIAG 約 330 ms，GNSS DIAG 約 494 ms，TEL 約 289 ms；現行 A／B 的 SF9
 分別為 DATA 186／DIAG 165／GNSS 268／TEL 145 ms（向上取整）。既有 T-Beam Client 所有包在實際 TxDone 後
 至少留 80 ms guard。TEL／DIAG 約 60 秒一次；GNSS 每包約 60 秒取樣一次。
 診斷不依賴有效定位：無 fix 時仍送。每秒最多一包診斷，同時到期優先 TEL、DIAG、GNSS DIAG；
@@ -207,8 +224,8 @@ RSSI／SNR 仍由 Station 接收時量測，供網頁與雲端診斷；Client �
 | offset | bytes | 欄位 | 編碼／未知值 |
 |---|---:|---|---|
 | 6–7 | 2 | batteryMv | uint16 mV；0未知 |
-| 8 | 1 | tempC | int8整數°C；−128未知 |
-| 9 | 1 | humidityPct | uint8 0–100%；255未知，其餘值拒收 |
+| 8 | 1 | tempC | int8 整數°C；−128 未知；humidityPct=254 時為 MCU 溫度，只接受 −40..85 或 −128 |
+| 9 | 1 | humidityPct | uint8 0–100%／255 未知為環境來源；254 為 MCU 溫度且無濕度；101..253 拒收 |
 | 10 | 1 | satellites | 精確衛星數；255未知，僅低頻診斷，不參與即時追蹤門檻 |
 
 ## DIAGNOSTIC（17 bytes＝標頭6＋資料11）
@@ -262,7 +279,13 @@ uint32 年齡未知為 UINT32_MAX；uint16 年齡 65535 未知、65534 表示 �
 | 8 `MSG_CLIENT_STATE` | 28 B | `boot` u32、`state` u8（Ready=1、Tracking=2、Test=3、Storage=4）、`station` u16、`command` u16、`uptime` u32、`batteryMv` u16（0 unknown）、`txPackets` u32、`rxErrors` u16、`charging` u8（只能0／1） |
 | 9 `MSG_LINK_TEST` | 18 B | `boot` u32（不可0）、`counter` u32、`uptime` u32 |
 
-T096 STATE TX 後先聽85 ms，只有preamble/header才延長RX（上限800 ms）；Station 只有 pending command 時，在該 STATE rendezvous 等 20 ms 才嘗試
+現行 Ready 只使用 BLE，不發送定期 LoRa STATE，也沒有 LoRa 接收窗口。Client 以本次開機
+第一個有效 BLE Claim 固定 owner；回 Ready、BLE 斷線與 Station 重開不解除 owner。
+同 Station 可重連並重建 Station boot 認領；換 Station 須重新啟動 Client。這不是 Bluetooth bonding 或密碼學認證。
+
+Tracking／Test 的 T096 STATE TX 後先聽85 ms，只有preamble/header才延長RX（上限800 ms）；
+Station 在沒有新鮮 BLE 路徑、但有相符 owner／boot／command 的活躍 LoRa STATE 時可接受控制。
+只有 pending LoRa command 時，在該 STATE rendezvous 等 20 ms 才嘗試
 一次 type 7。排程到達時 STATE 已過 40 ms 就跳過；同一窗口不重送 wake／命令，
 pending 可等後續 STATE 再嘗試，直到確認／錯誤／65秒逾時。TX completed、startTransmit failure
 或 1 秒未收到 TX_DONE 均關閉 FEM 並回 Station RX。Station 以 client/boot/station/command/期望 state
@@ -270,15 +293,15 @@ pending 可等後續 STATE 再嘗試，直到確認／錯誤／65秒逾時。TX 
 timeout（65 秒）。probe 支援 uint32 wrap，重複／倒退 counter 不計入，`missing` 是相鄰 counter 推估，非
 完整空中丟包證據。
 
-Ready 的30秒計時以成功的上一筆 STATE TX_DONE 為基準，不是固定整點輪詢，也不是每次重啟。
-發射／確認及其他期限會影響實際間隔；10/10 純電池 Start confirmed 實測30.776秒，
-正常約一輪、約31秒，失聯或錯過窗口仍可能逾時。詳細時序見 [RTC待機](t096-rtc-standby-2026-10-09.md)。
+**歷史（2026-10-10，BLE Ready 改版前）：** Ready 曾以 STATE TX_DONE 後 30 秒為下一輪基準，純電池 Start
+confirmed 曾量到 30.776 秒。這不是現行 BLE Ready 的喚醒或連線期限；舊時序只供回溯，見 [RTC待機](t096-rtc-standby-2026-10-09.md)。
 
 ## 單一 Client 綁定
 
 Station只接受綁定的client_id。NVS `gpsclient`保留既有綁定；若尚無該鍵，遷移舊`wl`第一個
 有效ID，舊空集合保持未綁定。**全新Station預設未綁定（0）**，需從網頁指定自己的Client。
-ID取自ESP32 MAC末16 bits，並非全域唯一；多套仍須確認沒有重號、沒有多台Station誤綁同一Client。
+Client ID 為硬體衍生的 16-bit 識別，ESP32 與 T096 依各自硬體產生，並非全域唯一；
+多套仍須確認沒有重號、沒有多台 Station 誤綁同一 Client。
 
 變更／清空綁定會回手動並清除舊Client位置、遙測、診斷、濕度基準與滾動統計；NVS寫入失敗
 不更換RAM狀態。`add`不能擴成第二個Client。ID、序號與CRC用來配對／拒收錯誤資料，沒有認證能力。
@@ -312,18 +335,58 @@ Station 內嵌頁是 HTTP，不能自行保證取得瀏覽器定位；使用者�
 
 ## `GET` / `POST /api/client/control`
 
-GET 回 T096 最近 STATE：`supported`（90 秒內有綁定 STATE）、`client_id`、`boot_id`、`state`、`age_ms`、
-battery/charging、`command`／`command_id`、RF test `tx_packets`／`test_received`／`test_missing`／RSSI／SNR／
-max gap，以及 group/frequency、`ready_poll_ms=30000`、`storage_after_hours=0`（已取消自動SystemOFF）。
-POST 接受 `action=start|stop|test|store`；2026-10-09 起 `store` 是舊API的Stop別名，發出的LoRa命令為Stop，
-預期回覆Ready。Web只提供啟動GPS／回待機及RF測試；直接舊LoRa Store也由新版T096轉Ready，
-但舊Station仍期待Storage時會判確認錯誤。封包數值／長度／wire v5保留。`charging`僅USB VBUS，非太陽能充電狀態。
-低电保護停止RF，因此supported=false只代表近期STATE不足，不能推斷實際電源狀態。
+本節是 **1.0／`api_version=2` 現行原始碼契約**（BLE 行為沿用 0.7.0-dev）；完整機器可讀欄位見 [控制 OpenAPI](openapi-client-control.json)。
+GET 回目前 Client 狀態與最近操作快照；BLE 優先於 LoRa 顯示，兩者不能共用固定 90 秒判斷。
 
-新鮮且綁定的 STATE、沒有 pending command 且未被其他 Station 指派時，POST 回 **202**。202 只表示
-pending 等待下一個 STATE window，絕不表示 Client 已收包、已切換 state 或已開始儲存；須看後續完全
-匹配的 STATE 才是 `confirmed`。缺新鮮 STATE、已有 pending 或 Station 不符回 409。此入口不改 Station
-Servo/GPS/UART mode；`test` 只送 RF probe，不偽造 GPS/DATA/方位。
+| 欄位 | 現行含義 |
+|---|---|
+| `api_version` | 固定 2 |
+| `client_id` | Station 保存的十進位 Client ID；0 為未綁定，與 Client 是否在線分開 |
+| `supported` | 有可顯示的新鮮 BLE 或 LoRa 狀態；不等於已認領或可以控制 |
+| `state_source` | `ble`／`lora`／`none`。BLE 須仍連線、ID 與狀態順序有效，最近 boot／uptime 前進未滿 3000 ms；重讀相同 uptime 不延長期限。否則可用接收未滿 90000 ms 的 LoRa STATE；已知其他 owner 時不沿用 LoRa |
+| `boot_id`／`state`／`age_ms` | 目前顯示 Client 的 boot／狀態／來源年齡；無新鮮來源時為 null／unknown／null。BLE 年齡從 boot／uptime 前進計，LoRa 從 STATE 接收計，不是 GPS 定位年齡 |
+| `ble.state` | `idle`／`searching`／`connecting`／`connected`／`owned_elsewhere`／`error` |
+| `ble.connected`／`claimed` | worker 回報連線／新鮮狀態的 owner 與本 Station ID、Station boot 相符；connected 不等於 claimed |
+| `ble.owner_station_id`／`last_error` | 最後 BLE 狀態的 owner（未收到為0，可能保留舊值）／worker 錯誤字串；owner 單值不證明現在可控制 |
+| `can_control` | 無 pending／掃描／TX，且有本 Station 的新鮮 BLE 認領，或相符 boot／command／owner 的活躍 Tracking／Test LoRa STATE。特定 action 仍有頻道檢查 |
+| `station_boot_id`＋`operation_id` | 最近控制操作的比對鍵；只保留目前 Station 開機的最新操作，沒有操作歷史或冪等查詢 |
+| `command`／`command_id` | `idle`／`pending`／`confirmed`／`error`／`timeout`，以及16-bit命令序號；BLE Claim 也推進序號，不等於 operation_id |
+| `battery_mv`／`charging` | 新鮮狀態電池 mV／USB VBUS；無新鮮狀態皆 null，未知電壓亦 null。VBUS 不證明太陽能充電或淨充電電流 |
+| `ready_poll_ms`／`storage_after_hours` | 都為0；Ready 無定期 LoRa STATE／接收窗口，且無自動 SystemOFF |
+| `ble_advertising_ms` | 10000，未連線時可連線廣播間隔；不是連線期限，也不是只開放十秒 |
+| `rf_group`／`frequency_mhz` | 目前 active 頻道／頻率；無 active 時 group 回 saved、frequency 為 null。A=0／923.2 MHz、B=1／923.8 MHz，runtime 都是 SF9 |
+
+另保留 RF test `tx_packets`／`test_received`／`test_missing`／`test_rssi`／`test_snr`／`test_max_gap_ms`，
+以及整數 `last_error`。BLE 不刷新 LoRa RF 活動、RSSI／SNR 或定位時間；`supported=false` 不能推斷 Client 關機。
+
+POST 使用 URL query `action=start|stop|test|store`，空 body；`store` 是 Stop 別名，回 Ready。
+新鮮 BLE 已認領時優先使用 BLE；否則只允許相符 owner／boot／command 的活躍 Tracking／Test LoRa 路徑。
+Start／Test 若活躍頻道與選定頻道不符，須先停止回 Ready。無效 action 回 400；前述條件不符、
+已有 pending、掃描／TX 進行中或頻道不符回 409，body 為 `{"error":"..."}`。
+Station 套用頻率、啟動接收或 BLE 排入失敗回 503，body 是完整 control 快照；`operation_id` 可能已增加，
+`command=error`。部分失敗路徑 `last_error` 仍可為0，不能只靠錯誤碼判成功。
+
+**HTTP 202 只表示操作已受理**。App 記錄 `station_boot_id`＋`operation_id`，後續 GET 比對同一操作，
+等待 `command=confirmed|error|timeout`；65秒未確認轉 timeout。Start 必須匹配 Client boot／owner／command
+與 Tracking 狀態的 **LoRa STATE**，並在選定頻道收到才確認；BLE accepted 不足以確認 Start。
+Stop／Test 可由相符 BLE／LoRa 狀態確認。這不證明 GPS fix、Servo 動作或完整 RF 下行已驗收。
+HTTP 結果不明先讀快照，不自動重送控制命令。此入口不改 Station Servo 模式；`test` 只送 RF probe，不偽造 GPS/DATA/方位。
+
+## `GET` / `POST /api/client/radio`
+
+GET 回 `selected`（RAM 待選）、`active`（Station 已套用，失敗可為null）、`saved`（NVS 偏好）、
+`verified`、`scan_state=idle|scanning|complete|error`、`scan_id`／`scan_error`、`can_scan`／`can_select`，
+以及兩個 `candidates`：A=0／923.2 MHz、B=1／923.8 MHz；均 `sf=9`、`bw_khz=125`。
+候選另有 `samples`／`busy`／`error` 計數及固定 null 的 `rssi_dbm`；CAD 不提供 RSSI 頻譜。
+
+POST 使用 URL query、空 body：`action=scan` 或 `action=select&channel=0|1`。兩者都要求 BLE 新鮮且
+由本 Station claim、Client Ready、Station active 頻道與 RX 可用、沒有 pending／掃描／TX；不符先回409。
+`scan` 回202，後續 GET 等 complete 或 error；`select` 回200，只修改待選值。action／channel非法回400。
+錯誤 body 為 `{"error":"..."}`。掃描每候選最多五次 CAD，完成還原頻率，沒有自動選頻。
+
+Start／Test 會套用 selected；只有 Start 收到匹配 LoRa STATE 才嘗試保存 NVS。`verified=true` 表示已取得
+該上行證據，仍需檢查 `saved` 與 `command` 判斷保存成功；NVS 失敗可同時 verified=true、command=error。
+停止不自動改頻，失敗不自動跳頻；重新開機或改綁會捨棄尚未保存的 selected。
 
 ## `GET /`
 
@@ -455,22 +518,23 @@ mDNS 可用性仍取決於操作手機所在網路，現有 IP 入口仍可用�
 | 欄位 | 說明 |
 |---|---|
 | `linked` / `data_fresh` | 5 秒內接受過 DATA；不代表 GPS 仍新鮮，不再用於判斷有沒有收到低頻遙測 |
-| `rf_alive` | 90 秒內接受過綁定 Client 的 DATA／TEL／DIAG／GNSS 任一封包；錯誤、拒收或未綁定來源不刷新；不延長追蹤期限 |
-| `rf_age_ms` | 距最後接受綁定 Client 任一有效封包的 ms；從未收到為 null |
+| `rf_alive` | 90 秒內接受過綁定 Client 的 DATA／TEL／DIAG／GNSS／STATE／LINK_TEST 任一 LoRa 封包；BLE、錯誤、拒收或未綁定來源不刷新；不延長定位期限 |
+| `rf_age_ms` | 距最後接受綁定 Client 任一有效 LoRa 封包的 ms；從未收到為 null，BLE 不刷新 |
 | `lora_fps_10s` | Station 最近 10,000 ms 實際接受的 DATA 封包數 ÷ 10，單位 FPS；不計 TEL／DIAG、CRC 錯誤或拒收包。固定時間窗，開機未滿 10 秒也除以 10；斷流自然降至 0，與 5 秒 linked 門檻分開 |
 | `bearing` | 攝影站 → Surfer 方位角（度），無效時為 `-1` |
-| `client.fix` | 已通過來源age＋airtime＋接收年齡＋200 ms不確定量門檻的fix，0表示目前不可用 |
+| `client.fix` | 已接受 DATA 的 fix 有效且接收後未滿 2000 ms；0表示目前不可用。不合成來源 age 或 airtime 推算門檻 |
 | `client.speed_cms` | 速度換算為cm/s，10 cm/s一格；未知為`null`，是否可外推另看velocity_valid |
 | `client.course_deg10` | 行進方向0.1°；未知為`null`，不可只靠非null判斷仍新鮮 |
 | `client.velocity_valid` | 位置仍新鮮且速度向量可外推；false不必然代表位置不可用 |
 | `client.satellite_class` | DATA即時衛星分級：0未知、1為0–5、2為6–7、3為≥8，不是假造精確顆數 |
 | `client.satellites` / `satellites_age_ms` | 低頻TEL精確顆數／距收到TEL的ms；無資料或顆數未知為null，TEL滿90秒也不再呈現顆數 |
 | `client.rx_age_ms` / `source_age_ms` / `sample_age_ms` | 接收後時間／null／null；v5 不量測完整定位延遲 |
-| `client.age_basis` | 固定`nmea_epoch_aligned_arrival`，是估計時間基準，非GNSS測量時鐘同步 |
+| `client.age_basis` | 固定`rx_elapsed_only`，僅接收後時間；GNSS內部延遲未知 |
 | `client.last_rx_sec` | 距上次收到DATA的秒數；從未收到為`-1`，失聯後仍累計 |
-| `telemetry.batt_mv` | Surfer端電池電壓mV；採90秒內最新有效TEL或T096 STATE電量，unknown/過期0。此欄有值不代表收到溫濕度TEL |
-| `telemetry.temp_c` | Surfer 端溫度，`null` = 無感測器 |
-| `telemetry.humidity_pct` | Surfer 端濕度 %，`null` = 無感測器 |
+| `telemetry.batt_mv` | Surfer端電池電壓mV；採90秒內最新有效TEL或link快取狀態（可來自BLE／LoRa）的電量，unknown/過期0。此期限不同於control顯示期限，有值不代表收到溫濕度TEL |
+| `telemetry.temp_c` | 環境來源整數°C，未知或MCU來源為null |
+| `telemetry.humidity_pct` | 環境來源0–100%；未知或MCU來源標記254時為null |
+| `telemetry.temp_kind`／`mcu_temp_c` | mcu／environment／null；MCU目前溫度僅有效且接收未滿60秒時有值，非環境溫度，完整MCU欄位見文末 |
 | `station.fix` | 攝影站本身的 GPS fix 狀態 |
 | `station.temp_c` | 攝影站本機溫度，`null` = 無感測器 |
 | `station.humidity_pct` | 攝影站本機濕度，`null` = 無感測器 |
@@ -484,7 +548,7 @@ mDNS 可用性仍取決於操作手機所在網路，現有 IP 入口仍可用�
 | `servo.north_reference` | 指南針輸入基準，固定 `magnetic` |
 | `servo.declination_deg` | 磁北轉真北需加的角度（東正西負），`null` = 位置／日期或模型不可用 |
 | `servo.calibrated` | 是否已有有效校正參考；開機 90°預設參考即為 true|
-| `servo.calibration_ready` | 命令位置、限速器位置及目標均精確為 90°，且沒有命令移動；不是機械位置回饋 |
+| `servo.calibration_ready` | 舊軟體置中路徑：命令位置、限速器位置及目標均精確為 179.5° 且無移動；不代表實體置中／回饋 |
 | `servo.mount_offset_deg` | Servo→磁北座標的安裝偏移角，開機預設 90°，重新校正只存 RAM |
 | `station.satellites` | Station本機TinyGPS顯示資訊，`-1`未知；真正追蹤gate另用同epoch collector |
 | `client.hdop` / `station.hdop` | Client未知為`null`，Station顯示資訊未知為`-1`；Client為向上量化的即時DATA值 |
@@ -944,6 +1008,10 @@ POST 必須是 **`Content-Type: application/json`、有 Content-Length 的 JSON 
 
 列出單一 GPS client 綁定；端點名稱沿用，容量固定為 1。
 
+iOS／Android App 可直接共用此 API。完整串接流程、ID 轉換、錯誤處理與
+「已儲存／收到近期 STATE」區分見 [App 綁定契約](client-binding-api.md)，
+機器可讀規格見 [OpenAPI JSON](openapi-client-binding.json)。
+
 **Response**
 
 ```json
@@ -966,10 +1034,10 @@ POST 必須是 **`Content-Type: application/json`、有 Content-Length 的 JSON 
 | 參數 | 值 | 說明 |
 |---|---|---|
 | `action` | `set` | 明確指定／替換唯一 ID |
-| `action` | `add` | 未綁定時新增；已綁定相同 ID 為 no-op，不同 ID 回 409 |
+| `action` | `add` | 未綁定時新增；已綁定相同 ID 為 no-op，不重寫 NVS，不同 ID 回 409 |
 | `action` | `remove` | 移除 ID |
 | `action` | `clear` | 清空所有 |
-| `id` | `AB12` | 1–4 碼十六進位，set/add/remove 必填；0、STATION_ID、FFFF 不可用 |
+| `id` | `AB12` | 1–4 碼十六進位，set/add/remove 必填；0000、0010、FFFF（含短碼）不可用；不得加0x或空白 |
 
 **範例**
 
@@ -991,8 +1059,11 @@ POST /api/whitelist?action=clear
 }
 ```
 
-綁定錯誤回應：400（參數非法）、409（add 第二個 ID）、503（NVS 寫入失敗）。
-移除不同於綁定的有效 ID 不改變現有綁定。
+成功回200僅表示綁定已保存，不表示 Client 在線或已認領。實際修改後 Station 自動搜尋新目標。
+綁定錯誤回應：400（參數非法）、409（add 第二個 ID，或實際改綁／解除遇到命令 pending、掃描、TX 進行中）、
+503（BLE 寫入鎖忙碌或 NVS 寫入失敗）；錯誤 body 為 `{"ok":false,"error":"..."}`，保留原綁定與 Client RAM 狀態。
+相同 ID 的 set/add、已未綁定時 clear、remove 不同有效 ID 皆為 no-op，不重置狀態也不重寫 NVS。
+改綁不會解除 Client 本次開機 owner；與控制請求的 HTTP 202／confirmed 必須分開判斷。
 
 ## 共用運動狀態欄位
 
@@ -1027,36 +1098,32 @@ status／track 的 `servo` 都增加下列欄位：
 
 ## `POST /api/servo/center`
 
-資訊頁「回到 90°」。要求新鮮 epoch／seq／stamp，先檢查 PWM／motion fault；失敗回 503，
-保留原模式與目標。成功一次切為 manual、更新控制世代並撤銷 GPS／UART／待完成 GPS 目標，
-透過共用限速器要求 90°，不直接寫 PWM、不清除指南針校正或速度設定、不自動恢復追蹤。
-回覆為共用控制 JSON：`ok`、`mode=manual`、`angle`、`target=90` 與新的控制上下文。
-200 代表回中目標已接受，並不代表實體鏡頭已到位；以 `servo.calibration_ready` 判斷命令到位，
-並目視確認停穩。過期／重播／舊世代請求回 409，不改變控制狀態。
+保留既有 API，網頁已無此按鈕。要求新鮮 epoch／seq／stamp，檢查 UART 輸出與 motion fault；
+成功切為 manual、更新控制世代，透過共用限速器要求 179.5°，不自動恢復追蹤。
+200 只代表目標已接受，不是實體到位；`servo.calibration_ready` 僅判斷軟體精確中位且無待完成移動。
 
 ## `POST /api/track/calibrate`
 
 輸入鏡頭上普通磁針指南針的讀數（磁北），北 0°、東 90°、南 180°、西 270°。
 
 ```text
-POST /api/track/calibrate?bearing=90
+POST /api/track/calibrate?bearing=90&physical_center=1&epoch=...&seq=...&stamp=...
 ```
 
-只接受有限十進位數字 `0 <= bearing < 360`，最多 16 個字元，不接受科學記號或地標 lat/lon。
-僅在 Servo 命令位置、限速器位置及目標均精確為 90°，且沒有命令移動時接受。
-非 90°／尚未抵達／已排入離開 90° 的目標皆回 409，保留原 RAM 參考；不以顯示四捨五入判斷。
-每次成功覆蓋 RAM 參考，校正不需 GPS／磁偏角，也不切模式或解除 PWM 故障。
-
-網頁按鈕保留可點，非 90° 或其他控制操作處理中會跳出通知；後端於請求送達再次檢查，
-避免狀態過期造成誤校正。請求仍需 epoch／seq／stamp，失敗顯示原因，不自動重送。
-角度是軟體命令，不是機械位置回饋，操作者仍需等鏡頭與磁針實際停穩。
+`bearing` 為有限十進位數字 `0 <= bearing < 360`，最多 16 字元；UI 只接受整數。
+`physical_center=1` 是操作者已按控制板實體置中鍵並等停穩的確認，不是感測回授。
+後端要求 manual、輸出正常、無 motion fault、限速器停止且命令已跟上；否則 409，參考不變。
+成功用 179.5° 作校正基準，同步限速器／目標並重設控制世代，下一輪送出相同中位脈寬。
+新請求須先取得新控制上下文；不清除故障、不切入 GPS。其他 `physical_center` 值回 400。
+未帶此參數保持舊 API 行為：軟體角度、限速器位置／目標都須精確為 179.5° 且無移動。
+校正只寫 RAM，不需要 GPS 或磁偏角。失敗顯示原因、不自動重送；實際停穩由操作者確認。
 
 ```text
 mount_offset = compass_bearing + servo_angle
 ```
 
 只有固定腳架的鏡頭磁針參考，不使用板上磁力計。不讀寫 mount*／mag* NVS；
-重開機恢復 90°有效偏移；腳架方向與該參考不同時重新校正。
+重開機恢復 269.5° 有效偏移；腳架方向與該參考不同時重新校正。
 
 GPS 追蹤使用 `servo_angle = mount_offset + declination - true_bearing`。
 磁偏角東正西負，依攝影站 GPS 位置與 UTC 日期使用 WMM2025 離線表，適用北緯 18–28°、
@@ -1226,7 +1293,7 @@ UART session 重新進入後需新的完整 SET。PWM 不可用回 503；成功�
 | wire／來源欄位 | 封包 | API欄位 | 轉換／限制 |
 |---|---|---|---|
 | latE7／lonE7 | DATA | `client.lat`／`client.lon` | signed32 ÷10⁷；必須同看fix |
-| fix | DATA | `client.fix` | 再套用source＋airtime＋RX age＋200 ms門檻，不直接永久照搬bit |
+| fix | DATA | `client.fix` | 要求DATA fix有效且RX age <2000 ms，不直接永久照搬bit，不合成來源年齡 |
 | speedDmS | DATA | `client.speed_cms` | ×10 cm/s；255→null，解析度10 cm/s |
 | courseDeg10 | DATA | `client.course_deg10` | 保留0.1°單位；4095→null |
 | velocityValid | DATA | `client.velocity_valid` | 再要求Client fix仍新鮮；決定是否可外推 |
@@ -1235,8 +1302,8 @@ UART session 重新進入後需新的完整 SET。PWM 不可用回 503；成功�
 | 無 | v5 DATA | `client.source_age_ms` | 固定 null，來源延遲未量測 |
 | 無 | v5 DATA | `client.sample_age_ms` | 固定 null，不再合成推算定位年齡 |
 | DATA RxDone時間 | Station | `client.rx_age_ms`／`last_rx_sec` | 距接收的ms／秒，不等於來源測量年齡 |
-| batteryMv | TEL／T096 STATE | `telemetry.batt_mv` | 90秒內最新有效mV；未知0；TEL溫濕度接收年齡不變 |
-| tempC／humidityPct | TEL | `telemetry.temp_c`／`humidity_pct` | 整數°C／%；未知→null |
+| batteryMv | TEL／T096 BLE或LoRa狀態快取 | `telemetry.batt_mv` | 90秒內最新有效mV；未知0；TEL溫濕度接收年齡不變，與control來源顯示期限分開 |
+| tempC／humidityPct | TEL | `telemetry.temp_c`／`humidity_pct` | 環境來源為整數°C／%，未知→null；humidityPct=254 時兩欄皆 null，改讀 temp_kind=mcu 與 mcu_temp_c |
 | satellites | TEL | `client.satellites` | 精確低頻顆數；未知或TEL滿90秒→null，不作即時gate |
 | TEL RxDone時間 | Station | `client.satellites_age_ms`／`telemetry.last_rx_sec` | TEL接收年齡，不代表衛星數精確測量時間 |
 | epochIntervalMs等 | DIAG | `/api/debug.client_diagnostic` | Client低頻解析／排程快照，帶獨立接收年齡 |
@@ -1272,3 +1339,19 @@ T096 的 DATA seq 獨立於 STATE／PROBE／診斷；新 STATE boot 會清除 St
 Station只對尚未送任何HTTP bytes的已accept連線套用250 ms期限，避免瀏覽器preconnect占住單一入口5秒。
 若已有其他TCP連線排隊，首批bytes的100 ms寬限過後便讓位，避免排隊連線先進入TCP重傳。
 `/api/status.timing.http_idle_closed`為本次boot累計清理次數；已開始的請求／SSE不套用。
+
+
+## 2026-10-22 T096 MCU 溫度擴充（wire v5／11-byte TEL）
+
+`MSG_TELEMETRY` 長度、頻率與 tempC byte 不變；`humidityPct=254` 是 MCU 溫度來源標記，
+並代表沒有濕度，不能解讀成 254%。MCU tempC 為攝氏整數四捨五入，-40..85 有效、INT8_MIN 無效；
+其他 101..253 濕度仍非法。0..100／255 保留舊環境來源語意。舊 Station 會拒絕 254，應先更新 Station。
+
+`/api/track.telemetry` 新增：`temp_kind`（mcu/environment/null）、`mcu_temp_c`（有效且接收未逾 60 s）、
+`mcu_temp_max_received_c`（本次 Station 接收最高，非 MCU 全程最高）、`mcu_temp_rx_age_ms`、
+`mcu_temp_sample_interval_ms=30000`、`mcu_temp_fresh`。MCU 來源的舊 `temp_c` 與 `humidity_pct` 為 null，
+不讓既有 API 使用者誤作環境溫度。實際取樣可能早於收包最多近 60 s（Client 舊樣本有效期限），
+接收年齡不是完整樣本年齡；發生新量測失敗後，下一個 TEL 立即傳 INT8_MIN。
+Ready 不增加 TEL；取樣只搭既有喚醒，低電保護的取樣間隔可能更長。原始四分之一攝氏度值及 Client
+開機後最高值可用 USB `DIAG STATUS` 讀取，欄位 `mcu_qc`／`max_qc` 除以 4；先判 `mcu_valid`。
+USB 異常 NMEA 契約見 [健康診斷](t096-health-diagnostics-2026-10-22.md)。

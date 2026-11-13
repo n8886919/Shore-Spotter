@@ -1,3 +1,5 @@
+2026-10-27（0.7.0-dev，2026-10-28 已部署至 584C／FB27）：Station session header 使用 runtime 頻率／SF 快照，`frequency_scope=session_open_snapshot`；同檔切頻依 `[RF]` 事件判讀，不能把 header 視為全檔固定頻率。見 [BLE 版本紀錄](ble-control-2026-10-27.md)。
+
 # Station／Client SD 循環記錄
 
 > **板型範圍：** 本文的 SD 流程適用於有 SD 的 LilyGO T-Beam Client／Station；T096 正常版無 SD，Heltec V4 Station 用有限容量 [Flash 診斷](heltec-field-ready.md)。目前 T096 F035 外測以 LilyGO Station SD 為主要記錄來源，現況見 [交接入口](assistant-handoff.md)。
@@ -204,3 +206,10 @@ SD／DIAG 匯出期間沿用既有 USB 隔離，SDK 訊息仍可進入診斷歷�
 超長訊息標示 `SDK log truncated`，溢位明確回報 `log queue overflow: dropped=N`。
 此機制涵蓋 ESP-IDF logger，不宣稱能攔截 ROM panic 或任何第三方直接 `printf`。
 主機工具仍嚴格驗證原始長度與 CRC，不會移除可疑文字後假裝匯出成功。
+
+## 2026-10-27 網頁異常提醒（已部署 584C）
+
+正常 SD 狀態不常駐資訊頁。`/api/status.alerts` 在 SD `state=error` 時提供
+`station_sd`／warn 提醒；恢復 recording 即移除。主動 STOP、mounting／stopping、
+V4 unsupported 不視為錯誤。`/api/sd/status` 保留原始原因、計數與丟棄資訊供診斷；
+網頁不再另外輪詢該端點。環境感測提醒、SD 記錄與 USB 操作行為保持。

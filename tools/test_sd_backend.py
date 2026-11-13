@@ -142,14 +142,15 @@ int main(int argc,char**argv){
  if(scenario=="rotate") {data[sd_log::fd].resize(sd_log::kRotateBytes, ' ');sd_log::fileBytes=sd_log::kRotateBytes;}
  if(scenario!="rotate")sd_log::stop();
  run(scenario=="rotate"?5500:500);
- if(scenario=="success"){
+ if(scenario=="success"||scenario=="runtime"){
+   if(scenario=="runtime")runtime_radio_profile::set(923.8f,9);
    assert(sd_log::stopped());assert(sd_log::start());run(100);
    sd_log::submit(sample,micros());sd_log::stop();run(500);assert(paths.size()==2&&paths[0]!=paths[1]);
  }
  if(scenario=="rotate") {sd_log::stop();run(500);}
  if(scenario=="short")assert(shortTriggered&&sd_log::shared.unconfirmedBytes>0&&sd_log::shared.bytes>sd_log::shared.syncedBytes);
  std::cout<<sd_log::statusJson()<<'\n';
- if(scenario=="success"||scenario=="queue")for(auto &f:data)std::cout<<f.second;
+ if(scenario=="success"||scenario=="runtime"||scenario=="queue")for(auto &f:data)std::cout<<f.second;
 }
 """
 def main():
@@ -161,12 +162,12 @@ def main():
         (folder/'main.cpp').write_text(MAIN)
         subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-DARDUINO','-DROLE_STATION',
                         '-I'+str(folder),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'src'),str(folder/'main.cpp'),'-o',str(folder/'test')],check=True)
-        for scenario in ['success','queue','mount','open','power','write','short','sync','read','rotate','cancel','usb','format']:
+        for scenario in ['success','runtime','queue','mount','open','power','write','short','sync','read','rotate','cancel','usb','format']:
             result=subprocess.check_output([str(folder/'test'),scenario],text=True)
             rows=[json.loads(line) for line in result.splitlines()]
             status=rows[0]
             if scenario in ['cancel','usb','format']:assert status['state']=='stopped'
-            elif scenario in ['success','queue','rotate']:
+            elif scenario in ['success','runtime','queue','rotate']:
                 assert status['state']=='stopped',status
                 assert status['bytes']==status['synced_bytes'],status
                 assert status['readback_checks']>=2,status
@@ -182,7 +183,11 @@ def main():
                 snap=next(r for r in rows[1:] if r['kind']=='station_snapshot');assert snap['_time'] is None
                 assert len([r for r in rows[1:] if r['kind']=='session'])==2
                 for session in [r for r in rows[1:] if r['kind']=='session']:
-                    assert session['sf']==10 and session['frequency_mhz']==923.2,session
+                    assert session['sf']==9 and session['frequency_mhz']==923.2,session
+            if scenario=='runtime':
+                sessions=[r for r in rows[1:] if r['kind']=='session']
+                assert [(r['sf'],r['frequency_mhz']) for r in sessions]==[(9,923.2),(9,923.8)],sessions
+                assert all(r['frequency_scope']=='session_open_snapshot' for r in sessions)
             print('PASS SD',scenario)
         # B builds must record actual SF9/923.8, including after stop/restart.
         subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-DARDUINO','-DROLE_STATION',

@@ -42,6 +42,7 @@ cpp = r'''
 #include <vector>
 #include "loop_metrics.h"
 #include "protocol.h"
+#include "mcu_temperature.h"
 #include "rf_reception.h"
 #include "gnss_snapshot.h"
 #include "gnss_diagnostics.h"
@@ -85,6 +86,7 @@ for name in ["SEND_INTERVAL_MS", "GPS_FIX_MAX_AGE_MS", "RSSI_WINDOW",
 cpp += r'''
 DecodedData lastData{};
 DecodedTelemetry lastTelemetry{};
+mcu_temperature::Received clientMcuTemperature;
 DiagnosticPayload lastClientDiagnostic{};
 gnss_diagnostics::Latest clientGnssDiagnostic;
 uint32_t rxGnssDiagnosticCount = 0;
@@ -220,6 +222,7 @@ void reset() {
   gnssDiagnosticSeq = 0; gnssDiagnosticPage = 0; rxGnssDiagnosticCount = 0;
   clientGnssDiagnostic = gnss_diagnostics::Latest{};
   havePkt = haveTelemetry = haveClientDiagnostic = haveSourceEstimate = rxWinHaveSeq = false;
+  clientMcuTemperature=mcu_temperature::Received{};
   lastData = DecodedData{}; lastTelemetry = DecodedTelemetry{};
   lastRxMs = lastTelemetryRxMs = lastClientDiagnosticMs = 0;
   rxDataCount = rxTelemetryCount = rxDiagnosticCount = rxDropCount = 0;
@@ -414,7 +417,23 @@ void test_t096_boot_discards_old_live_source() {
  assert(havePkt&&lastData.seq==0&&rxDataCount==2&&sequenceMissing==0);
  std::cout<<"PASS T096 new boot clears stale live source and accepts new DATA baseline without resetting receiver counters\n";
 }
-int main(){test_t096_boot_discards_old_live_source();test_ten_second_packet_rate();test_codec_dispatch_and_weak_quality();test_latest_and_observed_age();test_bound_rf_freshness_is_separate_from_data();test_scheduler_two_hz_latest_only_and_diagnostic_guard();
+void test_mcu_telemetry(){
+ reset();uint8_t wire[MAX_PACKET_LEN];PacketHeader h{gpsClientId,1,MSG_TELEMETRY};
+ TelemetryPayload t{4000,35,protocol::kMcuTemperatureMarker,10};
+ auto n=protocol::encodeTelemetry(wire,sizeof(wire),h,t);assert(n==11);
+ acceptRadioPacket(wire,n,1000);assert(haveTelemetry&&clientMcuTemperature.fresh(1000));
+ assert(clientMcuTemperature.maximum==35&&clientHumBaselinePct==-1);
+ t.tempC=33;n=protocol::encodeTelemetry(wire,sizeof(wire),h,t);acceptRadioPacket(wire,n,2000);
+ assert(clientMcuTemperature.maximum==35&&clientMcuTemperature.current==33);
+ assert(!clientMcuTemperature.fresh(62000));
+ t.tempC=INT8_MIN;n=protocol::encodeTelemetry(wire,sizeof(wire),h,t);acceptRadioPacket(wire,n,3000);
+ assert(!clientMcuTemperature.fresh(3000)&&clientMcuTemperature.maximum==35);
+ t.tempC=86;assert(!protocol::encodeTelemetry(wire,sizeof(wire),h,t));
+ t.tempC=24;t.humidityPct=50;n=protocol::encodeTelemetry(wire,sizeof(wire),h,t);acceptRadioPacket(wire,n,4000);
+ assert(!clientMcuTemperature.have&&clientHumBaselinePct==50);
+ std::cout<<"PASS MCU marker, maximum, stale, invalid sample and legacy environment isolation\n";
+}
+int main(){test_mcu_telemetry();test_t096_boot_discards_old_live_source();test_ten_second_packet_rate();test_codec_dispatch_and_weak_quality();test_latest_and_observed_age();test_bound_rf_freshness_is_separate_from_data();test_scheduler_two_hz_latest_only_and_diagnostic_guard();
  // SF9/BW125/CR4/5, preamble8, explicit header and CRC: ceil airtime ms.
  dataAirtimeMs=186;telemetryAirtimeMs=145;diagnosticAirtimeMs=165;gnssDiagnosticAirtimeMs=268;
  test_scheduler_two_hz_latest_only_and_diagnostic_guard();}

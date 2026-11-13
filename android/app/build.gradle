@@ -1,0 +1,27 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'tw.shorespotter.app'
+    compileSdk { version = release(36) { minorApiLevel = 1 } }
+    defaultConfig {
+        applicationId 'tw.shorespotter.app'
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName '0.1'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.activity:activity:1.8.2'
+    implementation 'androidx.camera:camera-camera2:1.6.2'
+    implementation 'androidx.camera:camera-lifecycle:1.6.2'
+    implementation 'androidx.camera:camera-view:1.6.2'
+    implementation 'androidx.camera:camera-video:1.6.2'
+    testImplementation 'junit:junit:4.13.2'
+}

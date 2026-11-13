@@ -20,6 +20,7 @@ void test_retained_ready_deadlines_wrap_and_never_auto_store() {
 
 void test_legacy_store_returns_retained_ready() {
   t096_control::Controller control(77); control.setClientId(0x20);
+  control.applyBle({ble_control::Op::Claim,0,0x20,10,77,0,100},false);
   control.apply(commandHeader(1),command(77,client_control::Action::Start,10),0);
   control.notedState(100);
   TEST_ASSERT_EQUAL_UINT32(4999,control.pollWaitMs(101));
@@ -31,6 +32,7 @@ void test_legacy_store_returns_retained_ready() {
 
 void test_boot_station_and_old_command_are_rejected() {
   t096_control::Controller control(77); control.setClientId(0x20);
+  control.applyBle({ble_control::Op::Claim,0,0x20,10,77,0,100},false);
   TEST_ASSERT_EQUAL(t096_control::CommandResult::Ignored,
                     control.apply(commandHeader(1), command(78, client_control::Action::Start, 10), 1));
   TEST_ASSERT_EQUAL(t096_control::CommandResult::Ignored,
@@ -47,6 +49,7 @@ void test_boot_station_and_old_command_are_rejected() {
 
 void test_duplicate_confirms_without_postponing_poll() {
   t096_control::Controller control(77); control.setClientId(0x20);
+  control.applyBle({ble_control::Op::Claim,0,0x20,10,77,65534,100},false);
   TEST_ASSERT_EQUAL(t096_control::CommandResult::Applied,
                     control.apply(commandHeader(65535), command(77, client_control::Action::Stop, 10), 100));
   TEST_ASSERT_EQUAL(t096_control::CommandResult::Duplicate,

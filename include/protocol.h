@@ -44,7 +44,7 @@ struct PositionPayload {
 struct TelemetryPayload {
   uint16_t batteryMv;  // 0 unknown
   int8_t tempC;  // INT8_MIN unknown
-  uint8_t humidityPct;  // 0..100; 255 unknown
+  uint8_t humidityPct;  // 0..100 environment; 254 MCU temp/no humidity; 255 unknown
   uint8_t satellites;  // exact diagnostic count; 255 unknown
 };
 // Separate low-rate diagnostics; no raw NMEA and no extra DATA bytes.
@@ -62,6 +62,7 @@ struct DiagnosticPayload {
 namespace protocol {
 using Header = PacketHeader;
 constexpr uint8_t kUnknown = 255;
+constexpr uint8_t kMcuTemperatureMarker = 254; // reserved humidity code; old decoders reject safely
 constexpr uint16_t kUnknownCourse = 4095;
 inline bool validClientId(uint16_t id) { return id != 0 && id != ID_BROADCAST; }
 inline size_t packetLength(uint8_t type) {
@@ -190,7 +191,8 @@ inline bool decodeData(const uint8_t *buf, size_t n, Header &header,
   return true;
 }
 inline bool validTelemetry(const TelemetryPayload &p) {
-  return p.humidityPct <= 100 || p.humidityPct == kUnknown;
+  return p.humidityPct <= 100 || p.humidityPct == kUnknown ||
+      (p.humidityPct == kMcuTemperatureMarker && (p.tempC == INT8_MIN || (p.tempC >= -40 && p.tempC <= 85)));
 }
 inline size_t encodeTelemetry(uint8_t *buf, size_t capacity, const Header &h,
                               const TelemetryPayload &p) {

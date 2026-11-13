@@ -11,7 +11,7 @@ for(const id of ids)elements[id]={value:'',textContent:'',disabled:false,checked
   classList:{toggle(){},add(){},remove(){}},setAttribute(){},getAttribute(){},getContext:()=>canvas,getBoundingClientRect(){return {left:0,top:0,width:500,height:500};},addEventListener(){},setPointerCapture(){}};
 const context={console,Promise,Date,Math,Number,URL,encodeURIComponent,performance:{now:()=>0},AbortController,
   setTimeout:()=>1,clearTimeout(){},setInterval:()=>1,clearInterval(){},
-  document:{getElementById:id=>elements[id],activeElement:null,documentElement:{style:{setProperty(){}}}},
+  document:{getElementById:id=>elements[id],activeElement:null,addEventListener(){},documentElement:{style:{setProperty(){}}}},
   window:{location:{href:'http://192.168.1.55/'},addEventListener(){},open(){return null;},visualViewport:null},
   fetch:()=>Promise.resolve({ok:true,status:200,json:()=>Promise.resolve({})})};
 vm.createContext(context);vm.runInContext(script,context);
@@ -27,17 +27,17 @@ assert(context.validStationReturnUrl('http://station.local/'));
 assert(!context.validStationReturnUrl('https://public.example/'));
 context.renderClientControl({supported:true,state:'ready',age_ms:230,command:'pending',command_id:12,test_received:2,test_missing:1,test_rssi:-101,test_snr:4.5,test_max_gap_ms:900});
 assert.match(elements.clientControlCommand.textContent,/等待 Client 確認 #12/);
-assert.equal(elements.btnClientStart.disabled,false);
+assert.equal(elements.btnClientStart.disabled,true,'pending command prevents duplicate submissions');
 context.renderClientControl({supported:true,state:'tracking',age_ms:300,command:'confirmed',command_id:12});
 assert.match(elements.clientControlCommand.textContent,/Client 已確認 #12/);
 context.renderClientControl({supported:true,state:'ready',age_ms:300,command:'idle',charging:true});
 assert.match(elements.clientControlState.textContent,/關閉/);
 assert(!elements.btnClientStore,'two daily modes have no SystemOFF control');
-assert.match(elements.clientControlHint.textContent,/每 30 秒交換指令/);
+assert.equal(elements.clientControlHint.textContent,'');
 assert.doesNotMatch(elements.clientControlHint.textContent,/12 小時/);
 context.renderClientControl({supported:true,state:'storage',age_ms:300,command:'confirmed',charging:false});
-assert.match(elements.clientControlHint.textContent,/舊版收納回覆/);
+assert.match(elements.clientControlHint.textContent,/舊版收納狀態/);
 context.renderClientControl({supported:false});
 assert.equal(elements.btnClientTest.disabled,true);
-assert.match(elements.clientControlHint.textContent,/狀態未確認/);
+assert.equal(elements.clientControlState.textContent,'Client 尚未回報');
 console.log('PASS station extensions UI: trusted popup only, malformed/untrusted rejected, Client pending/confirmed, retained Ready and offline state');

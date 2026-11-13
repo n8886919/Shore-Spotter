@@ -17,11 +17,12 @@ cpp=r'''
 #include "gnss_snapshot.h"
 #include "client_cadence.h"
 #include "client_control.h"
+#include "t096_control.h"
 #include "tracking_policy.h"
 #include "t096_gnss_config.h"
 struct Collector {gnss_snapshot::Snapshot value{};bool have=true;bool sample(uint32_t,gnss_snapshot::Snapshot &s){s=value;return have;}}gnss;
 client_cadence::Scheduler cadence;
-struct Control {client_control::State value=client_control::State::Tracking;auto state(){return value;}}control;
+t096_control::Controller control(77);
 enum class AirState {Idle,Sending,Receiving};AirState air=AirState::Idle;
 uint8_t out[MAX_PACKET_LEN];size_t outLength=0;bool outOpensReceiveWindow=false,outIsState=false,dataWaiting=false;
 uint16_t thisClientId=5,dataSequence=0;uint32_t dataDeferred=0,nextTxStartMs=0,usbLogDropped=0;
@@ -29,6 +30,8 @@ struct Console {bool connected=true;int available=128;std::string output;operato
 size_t write(const uint8_t*p,size_t n){assert(n<=size_t(available));output.append((char*)p,n);return n;}}Serial;
 '''+body+r'''
 int main(){
+ control.setClientId(thisClientId);assert(control.requestLocalMode(true,false));
+ assert(!control.hasStation());
  auto &s=gnss.value;s.fix=true;s.haveRmc=s.haveGga=true;s.lat=24.1;s.lon=121.5;s.epochMsOfDay=1000;
  s.arrivalAgeMs=20;s.hdop=1.2;s.satellites=9;s.velocityValid=true;s.speedMps=2;s.courseDeg=359.98;
  assert(queueRealPosition(100));PacketHeader h{};PositionPayload p{};
@@ -41,7 +44,7 @@ int main(){
  outLength=0;assert(!queueRealPosition(2900));
  s.epochMsOfDay=2000;s.arrivalAgeMs=0;s.haveGga=false;
  assert(!queueRealPosition(3000));assert(!queueRealPosition(3149));assert(queueRealPosition(3150));
- outLength=0;control.value=client_control::State::Ready;s.epochMsOfDay=2500;assert(!queueRealPosition(4000));
+ outLength=0;control.requestReady();s.epochMsOfDay=2500;assert(!queueRealPosition(4000));
  Serial.available=2;usbLog("%s","abcd");assert(usbLogDropped==1&&Serial.output.empty());
  Serial.available=128;usbLog("%s","works");assert(Serial.output=="works");
  Serial.connected=false;usbLog("ignored");assert(Serial.output=="works");
