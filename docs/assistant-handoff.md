@@ -15,6 +15,7 @@
 | 整體主機驗證 | **51／51 suites，native 140／140**；LilyGO Station／T096 build 通過；T096 ZIP CRC／application-only 通過 | 不是 RF、CameraX、機械或戶外驗收 |
 
 程式 commits：`4e1c00c`（manifest／文件）、`60d5d7b`（韌體／記錄）、`b395973`（Android）。
+修正負例、驗證與產物保存見 [本次階段紀錄](records-index.md#health-fixes-2026-11-14)。
 韌體 release 仍為 1.0，修正記在 CHANGELOG「未發行」；不能只看 1.0 判定是否已有本次修正。
 
 ## 下次使用的產物

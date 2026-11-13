@@ -4,8 +4,8 @@
 本頁只保留可查回的索引；已結束的實驗／部署／階段交接文件不留在工作目錄。
 原路徑、完整 commit 與 SHA-256／附件清單保存在 [records.json](records.json)。
 
-本次保存 checkpoint：`bcce441291c4c9ee6f2b9fe2b7817b1976702bf6`，標籤 `records/2026-11-14`。
-Android 原始碼在這個 commit；CAD 目錄之後由使用者更正為 `~/freecad/Shore-Spotter-Case/`，
+最初保存 checkpoint：`bcce441291c4c9ee6f2b9fe2b7817b1976702bf6`，標籤 `records/2026-11-14`。
+當時的 Android 原始碼在這個 commit；後續修正以各紀錄釘選的 commit 為準。CAD 目錄之後由使用者更正為 `~/freecad/Shore-Spotter-Case/`，
 正式外殼已在獨立 repository 提交 `f3c69b92dbabbcf2fabaf60c2b81fcd3ed723c81`，見 [CAD 索引](../cad/README.md)。
 原實驗記錄保留更正前的 Pocket 診斷脈絡；請以當前 CAD 索引為準。本地建置輸出、憑證與原始位置 log 未納入。
 
@@ -38,6 +38,7 @@ git log --all -- docs/field-experiment-2026-11-14.md
 
 | ID／原檔名 | 日期 | 內容 |
 | --- | --- | --- |
+| <a id="health-fixes-2026-11-14"></a>`health-fixes-2026-11-14` | 2026-11-14 | 健檢六項修正、App 0.2／兩端韌體待部署產物與驗證 |
 | <a id="field-experiment-2026-11-14"></a>`field-experiment-2026-11-14` | 2026-11-14 | 11/13 外測與 GPS-only 修正實驗紀錄 |
 | <a id="web-recovery-2026-11-13"></a>`web-recovery-2026-11-13` | 2026-11-13 | Station Web 逾時與前景恢復修復（2026-11-13，已部署 584C） |
 | <a id="android-app-2026-11-13"></a>`android-app-2026-11-13` | 2026-11-13 | Android 相機／控制／定位整合（2026-11-13） |
