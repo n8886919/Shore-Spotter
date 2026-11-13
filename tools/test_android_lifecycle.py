@@ -57,6 +57,8 @@ def controls_source():
     methods = '\n'.join(block(source, marker) for marker in markers)
     lease = (JAVA / 'ControlLease.java').read_text().replace(
         'package tw.shorespotter.app;', '').replace('public final class', 'final class')
+    remember = block((JAVA / 'MainActivity.java').read_text(),
+                     'private void rememberStation(String endpoint)').replace('private void', 'void', 1)
     return r'''
 import java.util.*;
 import java.util.concurrent.*;
@@ -89,11 +91,26 @@ class Ui {
     void post(Runnable task) { jobs.add(task); }
     void drain() { while(!jobs.isEmpty())jobs.remove().run(); }
 }
+class Prefs {
+    Map<String,String> values=new HashMap<>();int writes;
+    String getString(String key,String fallback) { return values.getOrDefault(key,fallback); }
+    Prefs edit() { return this; }
+    Prefs putString(String key,String value) { values.put(key,value);return this; }
+    void apply() { writes++; }
+}
+class History {
+    boolean destroyed,resumed=true,verified=true;
+    String station="http://station.invalid";
+    Prefs prefs=new Prefs();
+''' + remember + r'''
+}
 class ControlsTest {
     interface Exchange { JSONObject request(String url,String body) throws Exception; }
     QueueExecutor executor=new QueueExecutor();
     Ui ui=new Ui();
     Exchange exchange;
+    History history=new History();
+    java.util.function.Consumer<String> onConnected=history::rememberStation;
     boolean active=true,reading,motionBusy,clientBusy;
     int generation=1,failedGeneration=-1;
     long lastSuccess=9999,lastPollAttempt,pendingOperation=-1,pendingStationBoot,clientDeadline;
@@ -177,6 +194,39 @@ class ControlsTest {
             if(changed==0)check(f.posts.get(0).endsWith("epoch=22&seq=5&stamp=10000"),"motion metadata changed");
         }
     }
+    static void recentSuccessfulStations() {
+        Fixture f=new Fixture();ControlsTest x=f.subject;History h=x.history;
+        String a="http://192.168.1.10",b="http://192.168.1.20",c="http://192.168.1.30";
+        for(String endpoint:new String[]{a,a,b,a,c}) {
+            x.endpoint=endpoint;h.station=endpoint;SystemClock.now+=1300;
+            x.tick();x.executor.runOne();
+            // Successful HTTP alone is insufficient until the current UI generation accepts it.
+            int before=h.prefs.writes;x.ui.drain();
+            check(h.prefs.writes<=before+1,"poll wrote history more than once");
+        }
+        check(h.prefs.getString("recent_station_1","").equals(c),"newest IP missing");
+        check(h.prefs.getString("recent_station_2","").equals(a),"dedupe/order/limit incorrect");
+        check(h.prefs.writes==4,"repeated successful poll rewrote history");
+        // A recreated Activity reads the same persisted pair.
+        History reopened=new History();reopened.prefs=h.prefs;
+        check(reopened.prefs.getString("recent_station_2","").equals(a),"history did not persist");
+        for(int failedRequest=1;failedRequest<=3;failedRequest++) {
+            Fixture bad=new Fixture();ControlsTest y=bad.subject;
+            y.history.prefs=h.prefs;y.history.station=b;y.endpoint=b;
+            int failAt=failedRequest;int[] calls={0};Exchange normal=y.exchange;
+            y.exchange=(url,body)->{if(++calls[0]==failAt)throw new IOException("offline");return normal.request(url,body);};
+            y.tick();y.executor.runOne();y.ui.drain();
+            check(h.prefs.writes==4,"failed/partial poll recorded an IP");
+        }
+        for(int stale=0;stale<3;stale++) {
+            Fixture old=new Fixture();ControlsTest y=old.subject;
+            y.history.prefs=h.prefs;y.history.station=b;y.endpoint=b;
+            y.tick();y.executor.runOne();
+            if(stale==0)y.generation++;else if(stale==1)y.active=false;else y.history.resumed=false;
+            y.ui.drain();check(h.prefs.writes==4,"stale/background success recorded an IP");
+        }
+        System.out.println("PASS Android recent IPs: successful full poll only, newest two, dedupe, persistence, failed/partial/stale/background responses");
+    }
     public static void main(String[] args) {
         for(boolean client:new boolean[]{false,true}) {
             for(boolean uiFirst:new boolean[]{false,true})failedPollCancels(client,uiFirst);
@@ -185,6 +235,7 @@ class ControlsTest {
         }
         oldPollCannotInvalidateNewGeneration();
         healthyAndLeaseGuards();
+        recentSuccessfulStations();
         System.out.println("PASS Android queued controls: poll failure/UI ordering, expiry, reconnect, boot/epoch/deadline");
     }
 }

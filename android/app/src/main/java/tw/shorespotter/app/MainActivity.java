@@ -203,7 +203,7 @@ public class MainActivity extends ComponentActivity {
         FrameLayout.LayoutParams alertsLayout=new FrameLayout.LayoutParams(-2,dp(48),Gravity.TOP|Gravity.LEFT);
         alertsLayout.leftMargin=dp(24);alertsLayout.topMargin=dp(64);
         cameraRoot.addView(alertOverlay,alertsLayout);
-        stationControls=new StationControls(this,remotePanel,alertOverlay,network,this::request,this::phonePositionSummary,this::addressDialog);
+        stationControls=new StationControls(this,remotePanel,alertOverlay,network,this::request,this::phonePositionSummary,this::addressDialog,this::rememberStation);
         WindowManager.LayoutParams windowLayout=getWindow().getAttributes();
         windowLayout.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         getWindow().setAttributes(windowLayout);
@@ -421,6 +421,14 @@ public class MainActivity extends ComponentActivity {
                 .setPositiveButton("完成", null).show();
     }
 
+    private void rememberStation(String endpoint) {
+        if (destroyed || !resumed || !verified || !station.equals(endpoint)) return;
+        String newest = prefs.getString("recent_station_1", "");
+        if (endpoint.equals(newest)) return;
+        prefs.edit().putString("recent_station_1", endpoint)
+                .putString("recent_station_2", newest).apply();
+    }
+
     private void addressDialog() {
         EditText input = new EditText(this); input.setSingleLine(true);
         input.setHint("192.168.1.100"); input.setText(station.replaceFirst("^http://", ""));
@@ -429,8 +437,13 @@ public class MainActivity extends ComponentActivity {
         input.setRawInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);
         input.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE | android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);
         input.setSelection(input.length());
+        LinearLayout content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(16), 0, dp(16), 0);
+        content.addView(input);
+        LinearLayout recent = new LinearLayout(this);
+        content.addView(recent);
         AlertDialog dialog = new AppDialogBuilder(this).setTitle("Station IP")
-                .setView(input).setNegativeButton("取消", null).setPositiveButton("連線", null).create();
+                .setView(content).setNegativeButton("取消", null).setPositiveButton("連線", null).create();
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
                 String next = StationAddress.normalize(input.getText().toString());
@@ -444,6 +457,22 @@ public class MainActivity extends ComponentActivity {
             if(action!=android.view.inputmethod.EditorInfo.IME_ACTION_DONE)return false;
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();return true;
         });
+        for (String key : new String[]{"recent_station_1", "recent_station_2"}) {
+            String saved = prefs.getString(key, "");
+            if (saved.isEmpty()) continue;
+            String address = saved.replaceFirst("^http://", "");
+            Button choice = new Button(this); choice.setText(address); choice.setAllCaps(false);
+            choice.setContentDescription("連線至最近 Station " + address);
+            FieldStyle.apply(choice, FieldStyle.Tone.NEUTRAL);
+            LinearLayout.LayoutParams cell = new LinearLayout.LayoutParams(0, dp(48), 1);
+            cell.topMargin = dp(12);
+            if (recent.getChildCount() > 0) cell.leftMargin = dp(8);
+            recent.addView(choice, cell);
+            choice.setOnClickListener(v -> {
+                input.setText(address);
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+            });
+        }
         dialog.show();
     }
     private void connectStation() {

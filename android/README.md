@@ -1,10 +1,11 @@
 # Shore Spotter Android
 
-Pixel 10 的橫向滿版相機、原生追蹤控制與手機定位 App。App 版本與韌體版本分開管理。目前待安裝版本為 **0.2（versionCode 2）**。
+Pixel 10 的橫向滿版相機、原生追蹤控制與手機定位 App。App 版本與韌體版本分開管理。目前 source 為 **0.3（versionCode 3）**，本次新增最近 IP；安裝／真機狀態見交接入口。
 
 ## 海邊使用
 
 1. 開啟 **Shore Spotter**。首次允許相機與使用期間的**精確位置**；**Station 斷線** 可設定 Station IP，例如 `192.168.1.100`，不加協定。使用可輸入多個小數點的數字鍵盤，按完成即連線；保存後自動重連。
+   IP 輸入框下方最多顯示最近成功連線的兩個不同地址，最新在左；點按立即選取並連線。只有通過 Station 識別及完整狀態 poll 後才記錄，輸入／保存／失敗不列入；歷史保留於本機，升級後會從實際成功連線開始累積。
 2. 連上後只有一個 **Station 控制** 按鈕，點開同一面板內的控制與資訊；點按面板外的相機預覽即可收合，不影響相機綁定或錄影。未連線不能進入面板，失聯會收起浮層、停止操作並自動重連。
 3. **控制**可啟動／停止 Surfer 位置回報，選手動或 GPS 追蹤；手動方向滑桿放開才送出。同一頁可看兩端電量與定位，下方可校正、調整速度或更改 IP。
 4. 錄影鍵開始，方形鍵停止保存；旁邊可暫停／繼續，保持同一個影片檔。
@@ -77,3 +78,9 @@ APK SHA-256 `7e2fbf19faf1edd3c91c2297cfd241917ba91b2c05d8ae91c753de56496bfb0c`�
 覆蓋背景／前景 Finalize、仍在保存、相機不可用，以及 poll 失敗後 UI 回呼前後撤銷、freshness 期限、舊世代失敗、重連新手勢、boot／epoch／2 秒期限。這是主機回歸，不能替代 CameraX、實際 Wi-Fi、GPS／戶外與機械驗收；新 APK 尚未安裝。
 
 0.2 主機檢查：上述 integration 回歸、5 個 JUnit、assembleDebug 通過，lint 0 errors／26 warnings；4 個 64 位元 JNI 的 16 KB ELF／APK 對齊及 zipalign 通過。APK SHA-256 `9f5cb1f551452739ce3e21d02869f9cdfff64885a47f1ddae6e822919b2d8681`；產物與明日驗收步驟見 [交接入口](../docs/assistant-handoff.md)。
+
+### 0.3 最近 IP 主機驗證
+
+`tools/test_android_lifecycle.py` 另驗證實際 poll／歷史寫入方法：最近兩筆排序與去重、相同地址不重寫、歷史儲存，以及任一 GET 失敗、過期世代、背景回覆不記錄。保留數字鍵盤、完成即連線與取消／外部點按不提交的既有流程。
+assembleDebug、5 個 JUnit、上述 integration 回歸、16 KB ELF／APK 對齊與 zipalign 通過；lint 0 errors／26 warnings。
+APK SHA-256 `51df3ec533560626ba406a15b9ed2d66cc58780a72996cbc4a98334381d5b8ba`；本項僅為主機驗證，安裝與手機 UI 驗收另記於交接入口。

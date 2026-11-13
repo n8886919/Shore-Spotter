@@ -11,6 +11,8 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 Android 0.3 最近 Station IP**：IP 輸入框下列出最近成功連線的最多兩個不同地址，最新在左，點按直接沿用原連線流程；只在 Station 識別及完整狀態 poll 成功、目前世代仍有效時寫入本機歷史，失敗／過期／背景回覆不記錄。versionCode=3；主機回歸（排序／去重／失敗／過期回覆）、5 個 JUnit、assembleDebug、lint（0 errors／26 warnings）、16 KB／zipalign 通過；本項主機驗證不代表已安裝／真機驗收。
+
 - **2026-11-14 健檢修正整合與次日交接**：六項修正分別提交，完整主機回歸 **51／51**（native 140／140）與
   LilyGO Station／T096 build 通過；T096 DFU ZIP CRC／application-only 核對通過。
   APK／兩端 bin／elf／ZIP、hash 與來源 commit 已存本機獨立產物目錄；更新交接與出門前分段驗收。

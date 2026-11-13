@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Supplier;
+import java.util.function.Consumer;
 
 /** Field controls, deliberately separate from the Station's engineering/debug website. */
 public final class StationControls {
@@ -20,6 +21,7 @@ public final class StationControls {
     private final Exchange exchange;
     private final Supplier<String> phoneInfo;
     private final Runnable editAddress;
+    private final Consumer<String> onConnected;
     private final LinearLayout panel, controlPage;
     private final TextView alert, readiness, angle, information;
     private final Button clientButton, manualButton, gpsButton, calibrateButton, speedButton;
@@ -34,9 +36,11 @@ public final class StationControls {
     private long pendingStationBoot = -1, pendingOperation = -1, clientDeadline;
 
     public StationControls(Activity activity, LinearLayout panel, TextView alert, ExecutorService executor,
-                           Exchange exchange, Supplier<String> phoneInfo, Runnable editAddress) {
+                           Exchange exchange, Supplier<String> phoneInfo, Runnable editAddress,
+                           Consumer<String> onConnected) {
         this.activity=activity;this.panel=panel;this.alert=alert;this.executor=executor;
         this.exchange=exchange;this.phoneInfo=phoneInfo;this.editAddress=editAddress;
+        this.onConnected=onConnected;
         panel.setPadding(dp(16),dp(8),dp(16),dp(16));
         controlPage=column();
         ScrollView scroll=new ScrollView(activity);scroll.setFillViewport(true);scroll.addView(controlPage);panel.addView(scroll,new LinearLayout.LayoutParams(-1,-1));
@@ -93,6 +97,7 @@ public final class StationControls {
                 ui.post(()->{
                     if(!active||gen!=generation)return;
                     track=t;control=c;status=s;lastSuccess=SystemClock.elapsedRealtime();reading=false;
+                    onConnected.accept(base);
                     if(clientBusy&&pendingOperation>=0){
                         if(c.optLong("station_boot_id",-1)!=pendingStationBoot||c.optLong("operation_id",-1)!=pendingOperation){clientBusy=false;showError("追蹤器操作未確認，請重新操作");}
                         else if(!"pending".equals(c.optString("command"))){
