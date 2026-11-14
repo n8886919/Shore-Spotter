@@ -11,6 +11,8 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 下午 Station 部署／對照**：使用者確認Servo斷電，584C停用Axiom並保留Token，重啟前後heap約29→52～55 KB、位置快照恢復。Station最終build `Nov 14 2026 16:52:02`／source `c0dbd44` application-only hash通過；SD實際CRC匯出117筆全部含UTC／岸端位置／UART計數。Surfer啟停、App0.3錄影／背景恢復與API組合測試、51／51主機及Station build通過；仍有採樣略過與一次USB匯出失敗紀錄，不宣稱整場／機械／戶外通過。已保存CRC正確的歷史coredump，但缺匹配ELF，未定案panic根因；現役配對ELF已保存，詳見交接入口。
+
 - **2026-11-14 SD 校時解除 Axiom 相依**：實機停用 Axiom 後713筆快照 UTC 全為 null；將既有 SNTP 啟動移至 Station，Wi-Fi 首次連線時啟動一次，Axiom 停用／OTA 不再停止共用時鐘。沒有網路或尚未校時仍保留 boot／sample_ms 與 null，不虛構 UTC；不新增自行實作的重試／worker。
 
 - **2026-11-14 Station 使用情境留證**：沿用 SD／Axiom 既有快照，追加控制 epoch／序號與現役 Youmi UART 的送出、暫緩、錯誤、命令 pulse；明示無實體回授。固定 Sample 1240→1264 bytes，無新增 queue／worker／重試，不改追蹤／Servo 行為。實際 producer／encoder 回歸先紅後綠，雲端 schema 欄位238／256；完整驗證與部署狀態見交接入口。補充既有 SDK Flash coredump 的保存／離線解析流程，尚未以故意 panic 驗收。

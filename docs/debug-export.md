@@ -21,6 +21,8 @@ python tools/read_sd_log.py --port /dev/ttyACM0 start
 2026-11-14 主機查核：Station 584C 當時的 SDK 已配置 Flash／ELF／CRC32 coredump，
 對應 `firmware.elf` 已連結啟動檢查與 panic writer；**尚未驗證真實 panic 成功保存及解碼**。
 使用既有 SDK 與主機工具，不新增韌體 buffer／worker，也不故意觸發 panic。
+同日下午已讀回完整64 KiB分區，含39556-byte有效歷史dump、CRC32通過；ELF prefix符合舊rollback app，
+但缺匹配ELF，因此沒有解碼backtrace。現役bin／ELF已保存；這不等於驗收本次版本的panic保存，詳見[本次紀錄](records-index.md#memory-and-field-evidence-2026-11-14)。
 
 先保存當時部署的 `firmware.bin`、配對 `firmware.elf` 與 SHA-256，記錄 build／boot／操作時間；
 不能用之後重建的 ELF 代替。先匯出 SD，再送 `SD STOP`，等待回覆 `state=stopped`、

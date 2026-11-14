@@ -5,17 +5,18 @@
 
 ## 1. 出門前
 
-**優先處理記錄缺口**：新版同一 boot 的 SD samples 停在20，heap_free約21 KB低於32 KB快照門檻，Axiom low_memory／requests=0。
-先查持續佔用與原有 Axiom／BLE／HTTP 記憶體分布；不要僅降門檻或把已匯出20筆當成全程記錄通過。
-若決定減少功能，先說明取捨並保留 SD／原始 RF；修正後需在 App 連線及預計外測模式下驗證快照持續增加。
-
+**記錄停滯已改善，先核對現役再外測**：11/14下午停用Axiom、重啟前後heap約29→52～55 KB，SD快照恢復。
+現役Station build `Nov 14 2026 16:52:02`；新增控制epoch／序號與UART計數，既有SNTP已獨立於Axiom，
+沒有新增記錄worker／queue／重試。版本／hash／SD讀回以交接入口及[本次紀錄](records-index.md#memory-and-field-evidence-2026-11-14)為準。
+保留Axiom disabled、原SD／原始RF與採樣門檻；出門前在App連線／Surfer啟動狀態確認samples持續增加、
+errors增量與UTC，不把bytes增加或少量快照當整場通過。仍有採樣略過，長時間／戶外續驗。
 
 - Station 最後是手動、60°/s，T096 是 Ready、BLE 已認領。燒錄時使用者已斷開舵機電源；重新接電前確認機構位置，不能把本輪 UART 中位輸出當作已實體回中。
 - 重新辨識當下裝置／boot／網路，不沿用舊 ADB port 或 IP。App IP 框下方顯示最多兩個最近成功地址；家中地址已驗證，換熱點後依 Station 螢幕填入新 IP，成功後自動成為第二筆。
 - App 0.3 已真機驗證背景結束保存後回前景再錄、IP 快選；仍需在戶外確認日照操作、長錄影與實際衛星 fix。
 - 室外有衛星 fix 時確認新 GPS 樣本持續更新、Station 回覆相同快照；無 fix 時等待，不採 network／fused。
 - 再開始使用時才由使用者開啟位置回報、選 GPS 追蹤。不要在讀取交接或單純安裝時自動啟動 Client／切模式。
-- SD 目前 recording、errors=0，已讀回新 `station_position`；仍存在快照略過與 USB 寫入錯誤計數，先觀察增量，不把它們直接當 RF 漏包，也不宣稱記錄已完全可靠。
+- SD 應保持 recording、errors=0，快照包含 `station_position` 與 `control.controller`；未校時UTC仍可能null，先核對現況與增量，不把採樣略過直接當RF漏包，也不宣稱整場可靠。
 
 驗收記錄安裝版本、時間與結果。CameraX、GPS／Wi-Fi、API、RF、實際機械動作分開記。
 不要自行更動手機全域 GPS、網路或其他 App。
@@ -28,7 +29,7 @@
 - 若跳角：記時間與當時操作，保留同段原始 RF、實際岸端來源／座標／年齡、Surfer DATA、目標與命令。未部署新 Station 時要明說缺少岸端快照。
 - 若失聯：區分 App／HTTP、Station 是否重開，以及 Client RF；回家後另一個 boot 的計數不能代替當時證據。
 - 若手動不動：先分清 API 抵達、UART sent／deferred／errors 與實體接收；沒有回授不宣稱 Servo 已到位。
-- 若重開／panic：記錄發生時間、操作與新 boot，先保留／匯出 SD／DIAG，不先重刷清資料。需配對當時 ELF 與 crash backtrace 才能定位；本輪未加入持久化 coredump，無筆電現場可能仍取不到 backtrace，必要時回主機控制條件重現並捕捉 USB 輸出。
+- 若重開／panic：記錄發生時間、操作與新 boot，先保留／匯出 SD／DIAG，不先重刷清資料。需配對當時 ELF 與 crash backtrace 才能定位；SDK既有Flash coredump已配置／連結，且曾讀回有效歷史dump；本次部署bin／ELF已保存，回主機依[取回流程](debug-export.md)保留原分區再解碼。64 KiB容量、斷電或未進panic handler仍不保證保存，不故意製造panic。
 
 使用者不需在海邊操作診斷工具；先記時間／操作並保留裝置資料，回來由 agent 匯出分析。
 
@@ -36,5 +37,5 @@
 
 接續外測，不把「沒有再現」寫成已找到 panic 根因。
 每完成一段更新交接的版本／hash／boot／實測結果；有紀錄就依固定 commit＋hash 索引保存並驗證可取回。
-尚待決定：Axiom 是否需要、舊 profile／入口用途。SD 與 Axiom 共用快照／encoder，移除上傳時保留本地記錄。
+現役Axiom先停用，之後再決定是否刪除uploader原始碼；舊profile／入口用途尚待評估。SD與Axiom共用快照／encoder，不能刪掉本地記錄或把必要BLE／HTTP一併移除。
 CAD 幾何／STL 一致性、RF 長時間與機構驗收仍是獨立待辦；本輪沒有擴張這些範圍。
