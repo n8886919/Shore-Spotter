@@ -38,6 +38,7 @@ git log --all -- docs/field-experiment-2026-11-14.md
 
 | ID／原檔名 | 日期 | 內容 |
 | --- | --- | --- |
+| <a id="memory-and-field-evidence-2026-11-14"></a>`memory-and-field-evidence-2026-11-14` | 2026-11-14 | Axiom停用對照、SD UTC／UART讀回、既有coredump、App／Surfer組合與驗收界線 |
 | <a id="deployment-app-0-3-2026-11-14"></a>`deployment-app-0-3-2026-11-14` | 2026-11-14 | 584C／F035 燒錄、App 0.3 安裝／IP 快選及位置快照記憶體缺口 |
 | <a id="health-fixes-2026-11-14"></a>`health-fixes-2026-11-14` | 2026-11-14 | 健檢六項修正、App 0.2／兩端韌體待部署產物與驗證 |
 | <a id="field-experiment-2026-11-14"></a>`field-experiment-2026-11-14` | 2026-11-14 | 11/13 外測與 GPS-only 修正實驗紀錄 |

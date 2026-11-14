@@ -3,6 +3,20 @@
   "checkpoint_tag": "records/2026-11-14",
   "records": [
     {
+      "id": "memory-and-field-evidence-2026-11-14",
+      "date": "2026-11-14",
+      "title": "Station 記憶體對照、SD UTC／UART 留證與 App／Surfer 組合驗證",
+      "path": "docs/memory-and-field-evidence-2026-11-14.md",
+      "sha256": "fa1fb95882e3cdae1a22ade2521e714b22e83892b4bfa84b53829c11304e6b59",
+      "assets": [
+        {
+          "path": "docs/records-assets/2026-11-14/memory-workload.png",
+          "sha256": "5f6e5cf757d2a994c1325dce25f3fab634b681a77ab68e4ced27bf2b76b58413"
+        }
+      ],
+      "commit": "b9f57237110f1340ccfa9d315b199271329dfe5a"
+    },
+    {
       "id": "deployment-app-0-3-2026-11-14",
       "date": "2026-11-14",
       "title": "兩端韌體部署與 App 0.3 最近 IP／真機驗證",
