@@ -89,6 +89,9 @@ struct Sample {
   float stationRmsM = 0;
   float gpsHz = -1, gpsRmcHz = -1, gpsGgaHz = -1;
   uint32_t uartLate = 0, uartDiscarded = 0, uartRejected = 0, motionRejected = 0;
+  uint32_t controlEpoch = 0, commandSeq = 0;
+  uint32_t servoTxCommands = 0, servoTxDeferred = 0, servoTxErrors = 0;
+  uint16_t servoPulseUs = 0; // commanded pulse; the controller has no feedback
   uint32_t controlGapMax = 0, controlGapOver250 = 0;
   loop_metrics::Duration durations[8]; // loop, http, lora, motion, gps-independent I2C, OTA
   http_timing::Snapshot httpSlowest;

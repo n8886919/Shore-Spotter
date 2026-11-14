@@ -249,6 +249,7 @@ int main(){
  assert(!loop_metrics::due(0xfffffff0,20)&&loop_metrics::due(21,20));
  // Exact serializer: max-sized event page, invalid GPS as null, bounded overflow.
  Sample s;s.eventCount=8;s.ms=42;s.bootId=123;s.nodeId=456;s.gps.hdop=NAN;
+ s.controlEpoch=12;s.commandSeq=34;s.servoTxCommands=56;s.servoTxDeferred=78;s.servoTxErrors=9;s.servoPulseUs=1500;
  strcpy(s.mode,"uart");strcpy(s.uartState,"a\"b\\c\n");
  for(auto &e:s.events){e.rawLength=17;e.id=UINT32_MAX;memset(e.raw,0xff,17);}
  char payload[kBatchBytes];const size_t n=encodeSample(payload,sizeof(payload),s,1760000000123,7,91);
@@ -371,6 +372,9 @@ with tempfile.TemporaryDirectory(prefix='shore-axiom-test-') as tmp:
     assert event['_time'] == '2025-10-09T08:53:20.123Z'
     assert event['station_gps']['lat'] is None and event['station_gps']['hdop'] is None
     assert event['control']['uart_state'] == 'a"b\\c\n'
+    assert event['control']['epoch'] == 12 and event['control']['command_seq'] == 34
+    assert event['control']['controller'] == dict(tx_commands=56, tx_deferred=78, tx_errors=9,
+                                                pulse_us=1500, feedback_available=False)
     assert len(event['events']) == 8 and event['events'][0]['raw_hex'] == 'ff'*17
     fields_by_schema = {2: set(), 3: set()}
     def walk(value, fields, prefix=''):
@@ -403,6 +407,8 @@ from test_t096_gnss_uart import extract_function
 position_functions = '\n'.join(extract_function(source, sig) for sig in [
     'static bool gpsFixFresh()', 'static double stationLatitude()', 'static double stationLongitude()'])
 position_capture = source[source.index('  gnssCollector.sample(now, s.gps);'):source.index('  s.gnssCounters =')]
+controller_start = source.index('  s.controlEpoch =')
+controller_capture = source[controller_start:source.index('\n', source.index('s.servoPulseUs =', controller_start))]
 position_cpp = r"""
 #define ROLE_STATION
 #include <cassert>
@@ -417,9 +423,12 @@ constexpr uint32_t GPS_FIX_MAX_AGE_MS=2000;
 gnss_snapshot::Collector gnssCollector;
 station_position::Average stationAverage;
 namespace station_extensions {phone_position::Fix phone;}
+struct {uint32_t epoch(){return 12;} uint32_t sequence(){return 34;}} commandGate;
+struct {uint32_t sent(){return 56;} uint32_t deferred(){return 78;}
+ uint32_t errors(){return 9;} uint16_t pulse(){return 1500;}} servoOutput;
 """ + position_functions + r"""
 void capture(uint32_t now,axiom_log::Sample &s){
-""" + position_capture + r"""
+""" + position_capture + controller_capture + r"""
 }
 int main(){
  std::string payload="GPGGA,120000.000,2406.0000,N,12130.0000,E,1,08,1.0,0,M,0,M,,";
@@ -434,6 +443,8 @@ int main(){
    stationAverage.observe(1000,true,43200000,24.2,121.6);}
   if(scenario==2)clockMs=10000;
   capture(millis(),s);
+  assert(s.controlEpoch==12 && s.commandSeq==34 && s.servoTxCommands==56 &&
+         s.servoTxDeferred==78 && s.servoTxErrors==9 && s.servoPulseUs==1500);
   assert(gpsFixFresh()==(scenario!=2));
   assert(s.gpsFresh==(scenario==1));
   for(bool cloud:{false,true}){

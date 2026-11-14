@@ -7,6 +7,11 @@
 2026-09-23，0.6-dev，LoRa v5／SF10、Client 發送節奏不變。部署結果見 CHANGELOG.md。
 
 Station 插卡開機自動錄製，不需 Wi-Fi、Axiom、Station GPS 定位或 GPS 控制模式。
+2026-11-14 未發行修正：既有每秒快照的 `control` 追加 `epoch`／`command_seq`，
+以及 `controller.tx_commands/tx_deferred/tx_errors/pulse_us/feedback_available`，
+用來對照命令世代、目標角度與現役 Youmi UART 輸出；`feedback_available=false`，沒有實際角度回授。
+沿用原有快照／queue／worker，每筆固定 Sample 增加24 bytes，不新增採樣或重試機制。
+部署與取回驗證以交接入口為準。
 Client 一般版預設自動待命，僅 GPS 達 Good／OK 時錄製；見下節。
 `tbeam-client-trip` 例外：無定位也持續記錄原始 UART hex、Client epoch 與 TX，session 標示
 `profile=client-trip-1hz`、`gps_gate=false`；詳見 [field-diagnostic.md](field-diagnostic.md)。

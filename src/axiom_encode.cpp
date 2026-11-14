@@ -212,6 +212,10 @@ size_t encodeSample(char *out, size_t capacity, const Sample &s, int64_t unixMs,
   j.string("mode", s.mode); j.string("source", s.source); j.string("uart_state", s.uartState);
   j.real("commanded_angle", s.angle); j.real("target", s.target);
   j.real("speed_limit", s.speed); j.real("commanded_velocity", s.velocity);
+  j.number("epoch", s.controlEpoch); j.number("command_seq", s.commandSeq);
+  j.object("controller"); j.number("tx_commands", s.servoTxCommands);
+  j.number("tx_deferred", s.servoTxDeferred); j.number("tx_errors", s.servoTxErrors);
+  j.number("pulse_us", s.servoPulseUs); j.boolean("feedback_available", false); j.end();
   j.boolean("pwm_ok", s.pwmOk); j.boolean("fault", s.motionFault);
   j.boolean("calibrated", s.calibrated); j.boolean("gps_usable", s.gpsUsable);
   j.boolean("prediction", s.prediction); j.boolean("prediction_active", s.predictionActive); j.real("mount_offset", s.mountOffset);

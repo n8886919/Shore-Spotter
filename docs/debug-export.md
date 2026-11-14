@@ -16,6 +16,56 @@ python tools/read_sd_log.py --port /dev/ttyACM0 start
 需 pyserial（本機 `~/.platformio/penv/bin/python` 已具備）。list/read 會先停止、同步並關檔，
 讀回核對長度與 CRC32；最後執行 start 恢復記錄。失敗檔保留 `.partial`，不覆寫舊匯出。
 
+## Station panic：保留 Flash coredump
+
+2026-11-14 主機查核：Station 584C 當時的 SDK 已配置 Flash／ELF／CRC32 coredump，
+對應 `firmware.elf` 已連結啟動檢查與 panic writer；**尚未驗證真實 panic 成功保存及解碼**。
+使用既有 SDK 與主機工具，不新增韌體 buffer／worker，也不故意觸發 panic。
+
+先保存當時部署的 `firmware.bin`、配對 `firmware.elf` 與 SHA-256，記錄 build／boot／操作時間；
+不能用之後重建的 ELF 代替。先匯出 SD，再送 `SD STOP`，等待回覆 `state=stopped`、
+`enabled=false`、`bytes=synced_bytes`、`unconfirmed_bytes=0`，並核對錯誤；未同步完成不進 bootloader。
+重新辨識 USB 目標、晶片及實際分區表後才讀 Flash，不沿用 `/dev/ttyACM*` 順序。
+
+讀取會重啟並中斷 Station，恢復韌體可能輸出 Servo 中位命令；操作前須確認當下已允許重啟，
+且 Servo 斷電或機構處於已確認可安全重啟的狀態。本輪已有 Servo 斷電／重啟授權，不延伸到未來操作。
+以下偏移 `0x7f0000`／容量 `0x10000`（64 KiB）**僅限已核對的 584C 分區**，其他板須換成其實際值。
+
+```sh
+PY=/home/nolanasd123/.platformio/penv/bin/python
+PORT=/dev/serial/by-id/已重新核對的Station
+CHIP=esp32s3
+OFFSET=0x7f0000
+SIZE=0x10000
+OUT=/絕對路徑/本次新建的證據目錄
+ELF=/絕對路徑/當時部署的firmware.elf
+BIN=/絕對路徑/當時部署的firmware.bin
+GDB=/home/nolanasd123/.platformio/packages/tool-xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb
+mkdir "$OUT"
+cp "$BIN" "$OUT/firmware.bin"
+cp "$ELF" "$OUT/firmware.elf"
+sha256sum "$OUT/firmware.bin" "$OUT/firmware.elf" > "$OUT/firmware.sha256"
+"$PY" tools/read_sd_log.py --port "$PORT" stop
+# 確認上述同步狀態、目標／分區及重啟邊界後，才執行下一行。
+"$PY" -m esptool --chip "$CHIP" --port "$PORT" --after watchdog-reset \
+  read-flash "$OFFSET" "$SIZE" "$OUT/coredump-partition.bin"
+sha256sum "$OUT/coredump-partition.bin" > "$OUT/coredump.sha256"
+"$PY" -m esp_coredump --chip "$CHIP" info_corefile \
+  --core "$OUT/coredump-partition.bin" --core-format raw --gdb "$GDB" \
+  "$OUT/firmware.elf" > "$OUT/coredump-info.txt" 2>&1
+```
+
+先核對原始檔大小等於分區容量；保留完整 raw bin、hash、讀取及解碼輸出，不裁切或覆寫原檔。
+全 `0xff`，或首四 byte 小端長度為 `0xffffffff`（SDK 空白標記），表示沒有可解析的當前 dump；
+不能據此宣稱從未 panic。其他非法長度／CRC 失敗亦保留原始檔，不當作成功解碼。
+離線命令的 `--core` 不可省略，否則工具會再開 serial；本機也未設其線上讀取所需 `IDF_PATH`。
+本機已有 esp-coredump 1.16.0、esptool 5.3.0 與 GDB；ROM symbol 有需要時，另指定符合目標的 `--rom-elf`。
+讀取完成應確認 Station 已回到正常韌體、新 boot 與 SD recording 狀態；`watchdog-reset` 的重啟不代表新 panic。
+
+目前 SDK 允許下一次 panic 覆寫；boot check 只檢查 CRC，不自動清除。
+64 KiB 容量不足、寫入途中斷電或未進 panic handler 的 reset／卡死，都可能沒有有效 dump。
+coredump 不是整場追蹤／heap 歷史，跳角、失聯或 Servo 不動仍須配合 SD／RF／API 與實體證據判讀。
+
 ## 仍可直接讀取的 HTTP
 
 - `GET /api/status`：狀態、服務時間及最慢 HTTP 請求。

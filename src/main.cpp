@@ -2810,6 +2810,9 @@ static void serviceAxiomLog() {
   if (gpsRate.ready()) { s.gpsHz = gpsRate.hz(); s.gpsRmcHz = gpsRate.rmcHz(); s.gpsGgaHz = gpsRate.ggaHz(); }
   s.uartLate = 0; s.uartDiscarded = 0;
   s.uartRejected = 0; s.motionRejected = rejectedMotionCommands;
+  s.controlEpoch = commandGate.epoch(); s.commandSeq = commandGate.sequence();
+  s.servoTxCommands = servoOutput.sent(); s.servoTxDeferred = servoOutput.deferred();
+  s.servoTxErrors = servoOutput.errors(); s.servoPulseUs = servoOutput.pulse();
   s.controlGapMax = controlGap.maxMs; s.controlGapOver250 = controlGap.over250ms;
   const loop_metrics::Duration durations[] = {loopDuration, httpDuration, loraDuration, motionDuration,
     envDuration, pmuDuration, oledDuration, otaDuration};
