@@ -2756,6 +2756,14 @@ static void serviceStationFlash() {
 #endif
 }
 
+// SD timestamps need the same clock even when cloud upload is disabled.
+static void serviceStationClock() {
+  static bool started = false;
+  if (started || WiFi.status() != WL_CONNECTED) return;
+  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+  started = true;
+}
+
 static void serviceAxiomLog() {
   const uint32_t now = millis();
   const bool busy = stationRadioIrq || loopDuration.lastUs > 20000;
@@ -3898,6 +3906,7 @@ void setup() {
   delay(2000);
 #endif
 
+  serviceStationClock();
   axiom_log::begin(controlBootId);
   initWebServer();
   initArduinoOta();
@@ -4127,6 +4136,7 @@ void loop() {
   serviceControl();
   serviceStationDisplay();
   serviceControl();
+  serviceStationClock();
   serviceAxiomLog();
   serviceStationFlash();
   static uint32_t nextSdStatusMs = 0;

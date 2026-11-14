@@ -6,7 +6,6 @@
 #include <esp_crt_bundle.h>
 #include <esp_heap_caps.h>
 #include <esp_http_client.h>
-#include <esp_sntp.h>
 #include <cJSON.h>
 #include <sys/time.h>
 #include "axiom_log.h"
@@ -83,7 +82,7 @@ esp_err_t receiveHttp(esp_http_client_event_t *event) {
       struct tm utc{};
       end = strptime(event->header_value, "%a, %d %b %Y %H:%M:%S GMT", &utc);
       if (end && !*end) {
-        // configTime(0, 0, ...) above fixes the process timezone to UTC.
+        // Station's shared clock fixes the process timezone to UTC.
         const int64_t wait = static_cast<int64_t>(mktime(&utc)) - time(nullptr);
         if (wait > 0) r.retryAfter = wait > 86400 ? 86400 : wait;
       }
@@ -98,7 +97,7 @@ void discardQueued() {
 void worker(void *) {
   char *batch = nullptr;
   LogHistory history;
-  bool ntpStarted = false, rejected = false;
+  bool rejected = false;
   uint32_t failureStreak = 0, nextUpload = millis() + kFlushMs;
   for (;;) {
     Config config;
@@ -120,13 +119,11 @@ void worker(void *) {
     }
     if (!collecting.load() || otaPaused.load() || rejected) {
       history.valid = false;
-      if (ntpStarted) { esp_sntp_stop(); ntpStarted = false; }
       discardQueued(); free(batch); batch = nullptr;
       portENTER_CRITICAL(&mux); shared.batchInPsram = false; portEXIT_CRITICAL(&mux);
       vTaskDelay(pdMS_TO_TICKS(100)); continue;
     }
     if (WiFi.status() != WL_CONNECTED) { state(State::Wifi); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
-    if (!ntpStarted) { configTime(0, 0, "pool.ntp.org", "time.cloudflare.com"); ntpStarted = true; }
     if (time(nullptr) < 1735689600) { state(State::Clock); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     if (!loop_metrics::due(millis(), nextUpload)) {
       portENTER_CRITICAL(&mux);

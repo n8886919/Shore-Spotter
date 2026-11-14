@@ -46,7 +46,7 @@ uart / waiting | No Client data | Station GPS no_fix | Commanded 90.0 deg
   初次觀察、重啟、重新設定或換綁定時增量為 `null`，重新建立基準；uint32 計數與時鐘可回繞。
 - 尚未收到 Client／遠端診斷的測量與計數輸出 `null`，`client_gnss.state` 為 `unknown`。
   收過的舊報告仍保留數值與接收年齡，不把它當成本秒量測。
-- 摘要、差分與事件編碼都在背景 worker；主迴圈仍只複製固定 1240-byte 主機快照（2026-11-14 實測，新增選用岸端位置前為 1200 bytes；板型對齊以 `sample_bytes` 為準）。
+- 摘要、差分與事件編碼都在背景 worker；主迴圈仍只複製固定 1264-byte 主機快照（2026-11-14 追加控制 epoch／序號及現役 Servo UART 計數，前版1240 bytes；板型對齊以 `sample_bytes` 為準）。
   狀態事件取決於取樣觀察，短於取樣間隔的變化可能看不到；上傳失敗時事件也可能遺失，不補傳。
 
 在 Axiom Stream 的顯示設定選 `_time`、`level`、`message`、`kind`，關閉 raw event details，
@@ -69,13 +69,13 @@ uart / waiting | No Client data | Station GPS no_fix | Commanded 90.0 deg
 | server_gps／server_gnss | 雲端 schema 2 相容欄位：板載 GNSS 原始定位與 HDOP、自身新鮮度、epoch 間隔、RMC／GGA／checksum／積壓／重同步 |
 | station_position | 實際選用岸端位置：source、valid、lat／lon、age_ms、updated_utc_ms、accuracy_m |
 | client／client_gnss／client_diag | 最近收到的位置與品質、來源／接收年齡、低頻 GNSS 與 TX 診斷 |
-| control | 模式、來源、UART 狀態、軟體角度／目標／限速／速度、GPS 預測、指南針參考、fault |
+| control | 模式、來源、命令 epoch／序號、軟體角度／目標／限速／速度、現役 Servo UART 送出／暫緩／錯誤／pulse、GPS 預測、指南針參考、fault；無實體回授 |
 | timing | 主迴圈、HTTP、LoRa、motion、I2C、OTA 耗時與最慢 HTTP 請求分段 |
 | radio | 收件、錯誤、拒收、序號缺口／重同步、radio recovery 計數；ack_enabled=false，舊 ACK 計數為 null |
 | events | 每筆快照最多 8 個增量封包事件，保留 id、時間、raw hex、RSSI／SNR／錯誤碼 |
 | upload | 丟棄快照數、採樣最長耗時、封包事件游標遺失數 |
 
-使用固定欄位，主機 fixture 計得 **230 個含父層的欄位路徑**（包含狀態事件），低於 256。
+使用固定欄位，主機 fixture 計得 **238 個含父層的欄位路徑**（包含狀態事件），低於 256。
 Station 改名後，Axiom 專用編碼保留原本 `server_gps`、`server_gnss`、`station` 路徑與
 `changes.field = server_gnss` 相容值，避免同一 dataset 保留舊欄位又新增完整新路徑，
 導致欄位上限超標；沒有更換 dataset、Token 或既有 NVS 設定。新記錄的 kind 與顯示文字使用
@@ -90,7 +90,7 @@ Station，跨版本查詢快照須同時包含歷史 `server_snapshot` 及新的
 不將 Token、Wi-Fi 帳密、IP／MAC 或整份序列文字 log 放進雲端 JSON；結構化診斷內有
 GPS 座標與封包。瀏覽器的文字 log／備註／GPX 錄製仍是原有獨立功能。
 
-`_time` 為 RFC3339 UTC 毫秒：啟用後用 SNTP 校時，背景工作以當下 UTC 扣除快照年齡。
+`_time` 為 RFC3339 UTC 毫秒：Station 在 Wi-Fi 首次連線後啟動既有 SNTP，獨立於 Axiom 開關；背景工作以當下 UTC 扣除快照年齡。
 它是 Station 採樣時間的估計，**不是 GNSS 量測時間**。未完成校時不傳送。
 使用 `(node_id, boot_id, sample_id, kind)` 識別快照與狀態事件，`(node_id, boot_id, events.id)` 識別封包事件；
 node ID 為既有 16-bit 識別碼，並非全球唯一。跨 boot 分段，`sample_ms` 可回繞。
@@ -107,9 +107,9 @@ DATA 只送最新有效定位，失效只通知一次，不重傳舊定位。
 
 - loop 每秒只複製固定大小 POD 快照與最多 8 個事件，使用 **零等待**佇列操作。
   JSON 編碼、TLS、DNS、HTTP 與設定的 NVS 寫入都在另一核心的低優先權 FreeRTOS task。
-- 全新且停用時不建立背景 task／queue、不校時、不發出 Axiom 請求。第一次設定／啟用後，
-  queue（8 × `sizeof(Sample)`，主機測得每筆 1240 bytes，加 FreeRTOS metadata）與 12 KiB task
-  stack 保留到重開機；停用會排空 queue、停止 SNTP、釋放 32 KiB batch buffer。
+- 全新且停用時不建立 Axiom task／queue、不發出 Axiom 請求；Station 共用校時仍可供 SD 使用。第一次設定／啟用後，
+  queue（8 × `sizeof(Sample)`，主機測得每筆 1264 bytes，加 FreeRTOS metadata）與 12 KiB task
+  stack 保留到重開機；停用會排空 queue、釋放 32 KiB batch buffer，不停止 Station 共用時鐘。
   TLS／網路工作另有動態記憶體成本。板上 `sample_bytes` 會回報實際快照大小。
 - 約每 5 秒一批，最多 5 筆快照及其狀態事件（最多 10 筆文件）、32 KiB NDJSON。不是每包 LoRa 都建立一次 HTTPS。
   目前主機 fixture 完整快照約 5.2 KB，含同時七項狀態變化的一組約 5.9 KB；

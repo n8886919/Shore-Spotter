@@ -327,7 +327,7 @@ int main(){
  assert(configure(enabled()));httpCode=200;runUntil([]{return shared.sent>0;},clockMs+15000);
  // Missing time / low heap / OTA / loop overload do not start any HTTP upload.
  reset();assert(configure(enabled()));clockReady=false;
- runUntil([]{return clockMs>6000;});assert(performCalls==0&&ntpCalls==1);
+ runUntil([]{return clockMs>6000;});assert(performCalls==0&&ntpCalls==0); // shared Station clock owns SNTP
  // At the observed LilyGO idle heap, PSRAM permits repeated uploads while
  // preserving conservative internal headroom. Internal fallback must wait.
  reset();assert(configure(enabled()));heapFree=117468;psramAvailable=true;
@@ -473,3 +473,31 @@ with tempfile.TemporaryDirectory(prefix='shore-position-log-test-') as td:
         board=doc['server_gps' if i%2 else 'station_gps']
         assert board['fresh']==(scenario==1) and board['lat']==24.1
     print('PASS actual Station phone/GNSS/invalid selection, independent board freshness and both log schemas')
+
+# The existing Station clock must work with cloud upload disabled, without
+# restarting SNTP on each HTTP poll or Wi-Fi reconnect.
+clock_function = extract_function(source, 'static void serviceStationClock()')
+clock_cpp = r'''
+#include <cassert>
+#include <cstring>
+constexpr int WL_CONNECTED=3;
+bool connected=false;unsigned calls=0;
+struct {int status(){return connected?WL_CONNECTED:0;}} WiFi;
+void configTime(int timezone,int daylight,const char *first,const char *second){
+ assert(timezone==0 && daylight==0 && !strcmp(first,"pool.ntp.org") && !strcmp(second,"time.cloudflare.com"));++calls;
+}
+''' + clock_function + r'''
+int main(){
+ serviceStationClock();assert(calls==0);
+ connected=true;serviceStationClock();serviceStationClock();assert(calls==1);
+ connected=false;serviceStationClock();connected=true;serviceStationClock();assert(calls==1);
+}
+'''
+with tempfile.TemporaryDirectory(prefix='shore-clock-test-') as td:
+    td=Path(td);(td/'clock.cpp').write_text(clock_cpp)
+    subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror',str(td/'clock.cpp'),'-o',str(td/'clock')],check=True)
+    subprocess.run([str(td/'clock')],check=True)
+assert 'configTime(' not in (ROOT/'src/axiom_log.cpp').read_text()
+assert 'esp_sntp_stop(' not in (ROOT/'src/axiom_log.cpp').read_text()
+assert source.count('  serviceStationClock();') == 2
+print('PASS actual Station shared UTC initialization, offline/first connect/reconnect and independent uploader ownership')

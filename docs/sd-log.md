@@ -12,6 +12,8 @@ Station 插卡開機自動錄製，不需 Wi-Fi、Axiom、Station GPS 定位或 
 用來對照命令世代、目標角度與現役 Youmi UART 輸出；`feedback_available=false`，沒有實際角度回授。
 沿用原有快照／queue／worker，每筆固定 Sample 增加24 bytes，不新增採樣或重試機制。
 部署與取回驗證以交接入口為準。
+Station 的既有 SNTP 校時獨立於 Axiom 開關；Wi-Fi 可用後啟動一次，不等待校時才開始記錄。
+未完成校時或無網路時 UTC 保持 null，依 boot／`sample_ms` 判讀，不將上次或主機時間冒充量測時間。
 Client 一般版預設自動待命，僅 GPS 達 Good／OK 時錄製；見下節。
 `tbeam-client-trip` 例外：無定位也持續記錄原始 UART hex、Client epoch 與 TX，session 標示
 `profile=client-trip-1hz`、`gps_gate=false`；詳見 [field-diagnostic.md](field-diagnostic.md)。

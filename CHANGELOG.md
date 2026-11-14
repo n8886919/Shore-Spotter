@@ -11,6 +11,8 @@ debug 是建置標記，不是第三段版本號。舊版歷史與當時實測�
 
 ## 未發行
 
+- **2026-11-14 SD 校時解除 Axiom 相依**：實機停用 Axiom 後713筆快照 UTC 全為 null；將既有 SNTP 啟動移至 Station，Wi-Fi 首次連線時啟動一次，Axiom 停用／OTA 不再停止共用時鐘。沒有網路或尚未校時仍保留 boot／sample_ms 與 null，不虛構 UTC；不新增自行實作的重試／worker。
+
 - **2026-11-14 Station 使用情境留證**：沿用 SD／Axiom 既有快照，追加控制 epoch／序號與現役 Youmi UART 的送出、暫緩、錯誤、命令 pulse；明示無實體回授。固定 Sample 1240→1264 bytes，無新增 queue／worker／重試，不改追蹤／Servo 行為。實際 producer／encoder 回歸先紅後綠，雲端 schema 欄位238／256；完整驗證與部署狀態見交接入口。補充既有 SDK Flash coredump 的保存／離線解析流程，尚未以故意 panic 驗收。
 
 - **2026-11-14 實機部署**：使用者確認舵機斷電；584C application-only 燒錄及 hash 成功，build `Nov 14 2026 01:21:02`；F035 application-only DFU 成功，build `Nov 14 2026 01:21:52`，新 boot／Ready／BLE 認領確認。保留設定與 SD；新記錄 CRC 匯出含 `station_position`。Pixel 10 先安裝 0.2 驗證錄影恢復，再更新 **0.3**，拉回 APK hash 相符，最近 IP 按鈕真機點選連線成功。戶外 GPS-only、跳角／panic 與實際機械驗收仍待完成；歷史「未部署」敘述為當時階段狀態，現況見交接入口。
