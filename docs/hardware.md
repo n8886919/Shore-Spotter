@@ -1,5 +1,9 @@
 # 硬體說明（Hardware）
 
+## 硬體參考圖
+
+- [YwRobot 鋰電池分電板設計圖](assets/ywrobot-lithium-power-distribution-board/README.md)：2026-11-18 使用者提供原圖，紅框孔距最後確認為 **68、10**；附原圖與 SHA-256。
+
 ## 2026-10-28 現行控制與介面
 
 目前使用中的組合為 **LilyGO T-Beam Supreme Station＋Heltec T096 Client**。
