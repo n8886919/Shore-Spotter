@@ -1,6 +1,6 @@
 # FreeCAD 模型開發
 
-PCB 機殼的設計原始檔是 [pcb_case.py](pcb-case/pcb_case.py)。從專案根目錄執行以下命令。此主機使用已安裝的 FreeCAD 26.3rc2，Python 需能載入 FreeCAD、Part 及 MeshPart。
+PCB 機殼與 GPS 天線外殼的設計原始檔分別為 [pcb_case.py](pcb-case/pcb_case.py) 與 [gps_antenna_case.py](gps-antenna-case/gps_antenna_case.py)。從專案根目錄執行以下命令。此主機使用已安裝的 FreeCAD 26.3rc2，Python 需能載入 FreeCAD、Part 及 MeshPart。
 
 ```sh
 export PYTHONPATH="$HOME/.local/opt/FreeCAD-26.3rc2/usr/lib"
@@ -20,6 +20,24 @@ export PYTHONPATH="$HOME/.local/opt/FreeCAD-26.3rc2/usr/lib"
 | `usb_mount()`、`USB_HOLE_PITCH` | USB 板安裝壁、四角補強、螺絲孔、下方兩個螺母槽、電源開口 |
 
 改孔距時先確認哪一排孔要跟著移動。例如 USB 的兩列安裝中心由中心線向兩側各取半個孔距，孔、補強與螺母槽共用該中心。改完重新產生模型，量孔中心與邊距，檢查補強肉厚、裝配空間及 STL 切片。腳本會檢查有效單一實體及封閉網格。
+
+## GPS 天線外殼
+
+從專案根目錄執行以下命令。輸出在 `freecad/gps-antenna-case/build/`，可用 FreeCAD 開啟 `gps_antenna_case.FCStd` 或以 `gps_antenna_case.stl` 切片。
+
+```sh
+export PYTHONPATH="$HOME/.local/opt/FreeCAD-26.3rc2/usr/lib"
+~/.local/bin/freecad python freecad/gps-antenna-case/gps_antenna_case.py
+```
+
+底面中心是原點，+Z 朝開口。外形 57 × 62 × 10 mm，天線座面深 3 mm。中央 Ø4.5 mm 通孔與 Ø10 mm、深 4 mm 的沉孔同軸。四個凹槽共用 `floor_pocket()` 的輪廓，繞中心每 90° 排列。調整外形、孔徑或端部缺口可直接修改腳本開頭的尺寸。
+
+原生特徵樹與舊 STL 已釘選於 `archive/gps-antenna-case-fcstd`。首次重建與原 FCStd 同座標雙向相減，增加與移除皆為 0.000000000 mm³。重讀 STL 為單一封閉網格。
+
+```sh
+git show archive/gps-antenna-case-fcstd:freecad/gps-antenna-case/gps-antenna-case.FCStd > /tmp/gps-antenna-original.FCStd
+~/.local/bin/freecad python freecad/compare_solids.py /tmp/gps-antenna-original.FCStd freecad/gps-antenna-case/build/gps_antenna_case.FCStd
+```
 
 ## 其他零件也可沿用
 

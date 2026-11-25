@@ -50,7 +50,7 @@ git log --all -- docs/field-experiment-2026-11-14.md
 | `shore-tracker-artifacts/onnx-20260902` | `~/.local/share/shore-tracker/models/onnx-20260902/`，另一專案模型；僅確認本機移動及 hash，未驗證異機備份 |
 
 舊文件內「已保存」及舊路徑描述當時狀態；本次 raw 清理後不能再保證重算。
-11 月現役部署檔案和未追蹤的 `freecad/gps-antenna-case/` 不在本次清理範圍；未追蹤 CAD 尚未受本倉庫遠端保護。
+11 月現役部署檔案和未追蹤的 `freecad/gps-antenna-case/` 不在本次清理範圍；其後 GPS 天線外殼已納入本倉庫，原件標籤為 `archive/gps-antenna-case-fcstd`。
 摘要見 [舊測試結論](#legacy-test-lessons-2026-11-25)。不需把日常知識只寫在本機 README 或聊天記錄。
 
 新電腦從本倉庫遠端 clone 後，執行：
