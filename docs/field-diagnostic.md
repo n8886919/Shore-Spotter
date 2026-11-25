@@ -195,6 +195,12 @@ python3 tools/read_diagnostic_log.py --port /dev/ttyACM1 erase --confirm-erase
 不可插著 USB 留在家中持續開機，否則會消耗外測容量。關機最後一筆是否完整須靠讀回確認，不能保證突然斷電零損失。
 一般版不啟用 Flash recorder；診斷環境沒有另建 OTA profile。建置成功不代表已燒錄／Flash 實機寫入或外測已驗證。
 
+## 歷史證據保存狀態（2026-11-25）
+
+以下 9/24 結果是歷史驗證，不是本日重跑。測試 raw 與執行輸出已依使用者指示退出保留範圍，
+舊目錄僅保留分析原稿、腳本、韌體及部署前備份，不能保證原始資料仍可重算。
+結論及清理範圍見 [紀錄索引](records-index.md#legacy-test-lessons-2026-11-25)。
+
 ## 本輪驗證（2026-09-24）
 
 - native：129／129；SD worker／Client SD 與 retention、packet／motion／debug／Axiom backend 及既有 UI 回歸通過。
@@ -206,7 +212,7 @@ python3 tools/read_diagnostic_log.py --port /dev/ttyACM1 erase --confirm-erase
 - 真 codec 容量模型 12 情境，包含 recorder-health；30 分鐘皆低於 1.5 MiB，60 分鐘皆超出，非實機耐久測試。
 - Client、Station、Station OTA、兩端 diagnostic 共 5 個韌體環境 build 通過；僅第三方 SDK／RadioLib 既有警告。
   上述為建置／主機驗證；後續 Client USB 部署與室內實測另列於下方，尚未重新外測。
-  診斷 binary／ELF／分區與 SHA256 manifest 留存於私人 `shore-spotter-debug/2026-09-24/diagnostic-build/`。
+  診斷 binary／ELF／分區與 SHA256 manifest 留存於私人 `~/.local/state/shore-spotter/archive/debug-20260923-20261007/2026-09-24/diagnostic-build/`。
 
 ## Client 部署與室內採集（2026-09-24）
 
@@ -226,7 +232,7 @@ python3 tools/read_diagnostic_log.py --port /dev/ttyACM1 erase --confirm-erase
 - 一次明確標記的工具受控重啟後，匯出 81 frames、41,472 bytes，先前 35 frames 逐 byte 保留。
   新 boot 重新 P0，Flash 正常追加；drops／errors／corrupt 為 0，Flash write 最大 2681 μs。
 - 原始備份、兩次 binary／NDJSON／完整性 manifest、部署與重啟操作紀錄保留在私人
-  `shore-spotter-debug/2026-09-24/client-deployment/`。桌上驗收資料匯出後才清除，以準備外測。
+  `~/.local/state/shore-spotter/archive/debug-20260923-20261007/2026-09-24/client-deployment/`。桌上驗收資料匯出後才清除，以準備外測。
 
 以上證明室內原始資料採集、1 Hz、USB 匯出與受控重啟保存；不代表定位精度、完整 P1–P5／RF／SD 干擾、
 電池實際正常關機尾端保存或外測穩定性已驗證。日後燒錄仍須重新確認 MAC、備份既有資料並核對實機記錄狀態。
@@ -255,7 +261,7 @@ P3 新增兩份 SD log 合計 290,040 bytes，大小／CRC／742 行 JSON 全部
 
 優先在家排查電池固定／供電與 EN(RST)／按鍵受壓，再追 PMU／I2C，保留 L76K 與目前 1 Hz 作比較基準。
 I2C 讀錯誤可能被庫轉成 PKEY IRQ 的程式弱點另待修正與驗證；未將它定為本次重啟原因。
-私人證據與分析保存在 `shore-spotter-debug/2026-09-24/field-test/`，定位座標及完整原始紀錄不納入專案 Git。
+私人證據與分析保存在 `~/.local/state/shore-spotter/archive/debug-20260923-20261007/2026-09-24/field-test/`，定位座標及完整原始紀錄不納入專案 Git。
 
 後續主機故障注入共 11 案例通過：實際 XPowersLib 的 INTSTS2 read -1 會同時誤判 short／long，
 Client dispatch 先喚醒 OLED（至少 400 ms 固定 delay），才進入記錄 shutdown intent 的 helper。
@@ -263,7 +269,7 @@ IRQ clear 失敗也能重播短按；此為程式路徑驗證，尚無實機 sig
 使用者補充約 09:26 開始收拾設備、可能動到，與重啟時段吻合，接觸／按鍵／EN 受壓仍優先。
 已保留原韌體啟動 USB 靜置／SD 讀取／查詢負載的有界監測，主機留存增量 Flash 與 console；
 Flash 滿後不清除，僅剩 host status／console，不能以 USB 穩定排除電池或移動接觸故障。
-原始主機案例與實機監測進度在私人 `shore-spotter-debug/2026-09-24/bench-test/`，不視為已修正或已部署。
+原始主機案例與實機監測進度在私人 `~/.local/state/shore-spotter/archive/debug-20260923-20261007/2026-09-24/bench-test/`，不視為已修正或已部署。
 
 USB 留接測試另發現完成回覆時序問題：`SD LIST END` 送出後，worker 尚未 unmount／關卡電及釋放 usbActive；
 主機立即送下一命令時，parser 可能靜默丟棄。實際 worker/parser 的主機排程測試已重現 READ／DIAG 丟棄；

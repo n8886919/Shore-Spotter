@@ -1,5 +1,7 @@
 # Session 交接入口（2026-11-14）
 
+資料整理與換機恢復見 [紀錄索引](records-index.md#本機資料與異機恢復)：舊 raw 已退出保留範圍，結論從 Git 取回；不要依賴舊私人路徑。
+
 先讀 `AGENTS.md` → [下次更新與外測](next-session-plan.md)。過往證據由 [紀錄索引](records-index.md) 查回。
 目前已完成 **LilyGO Station 584C、T096 F035 燒錄，以及 Pixel 10 App 0.3 安裝**。使用者確認舵機斷電後才重啟 Station。
 App 0.3 增加最近兩個成功 Station IP 快選；目前一個真實地址已在手機驗證可點選連線。

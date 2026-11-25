@@ -33,10 +33,43 @@ git log --all -- docs/field-experiment-2026-11-14.md
 刪除 commit 的 `HEAD:原路徑` 會找不到檔案，請使用表內索引所釘選的保存 commit。
 需整套歷史文件互相導覽時，可在臨時目錄建立該 commit 的 detached worktree；不要切換或 reset 現有開發目錄。
 
+## 本機資料與異機恢復
+
+結論、心得、原因、驗證層級及未解問題要跟 Git 走；commit 後還須 push，並確認遠端 branch／必要 tag 可取回。
+測試 raw 不預設長期保留。先保留可讀摘要、必要重現方法及驗證界線，再清理；不可把摘要或 hash 說成原始資料備份。
+私人設定、憑證、完整 Flash 與定位 raw 不進公開 Git。只在本機的封存及未追蹤檔案都不算異機備份。
+
+2026-11-25 整理家目錄三個產物資料夾：
+
+| 原目錄／內容 | 整理後位置或處置 |
+| --- | --- |
+| `shore-spotter-debug` 的舊測試採樣、執行輸出及衍生圖資 | 451 檔、224,677,752 bytes 移入系統垃圾桶，不納入長期保留 |
+| 舊分析原稿、診斷腳本、來源快照、韌體／ELF、私人部署備份 | `~/.local/state/shore-spotter/archive/debug-20260923-20261007/`，有用途說明及檔案清單；不是現役版本 |
+| `shore-spotter-artifacts/coordinate-range` | `~/.local/state/shore-spotter/archive/coordinate-range-20260913/`，舊座標編碼範圍示意圖，不是現行規格 |
+| 兩個 PCB `.FCBak` | `~/.local/state/shore-spotter/archive/pcb-case-backups-20261125/`，保留原 bytes；現用可恢復來源見 [FreeCAD](../freecad/README.md) |
+| `shore-tracker-artifacts/onnx-20260902` | `~/.local/share/shore-tracker/models/onnx-20260902/`，另一專案模型；僅確認本機移動及 hash，未驗證異機備份 |
+
+舊文件內「已保存」及舊路徑描述當時狀態；本次 raw 清理後不能再保證重算。
+11 月現役部署檔案和未追蹤的 `freecad/gps-antenna-case/` 不在本次清理範圍；未追蹤 CAD 尚未受本倉庫遠端保護。
+摘要見 [舊測試結論](#legacy-test-lessons-2026-11-25)。不需把日常知識只寫在本機 README 或聊天記錄。
+
+新電腦從本倉庫遠端 clone 後，執行：
+
+```sh
+git fetch origin --tags
+python3 tools/read_record.py --verify
+python3 tools/read_record.py legacy-test-lessons-2026-11-25
+python3 tools/read_record.py field-experiment-2026-11-14 --export /tmp/shore-record-check
+git show archive/pcb-case-fcstd:Shore-Spotter-Case.FCStd > /tmp/Shore-Spotter-Case.FCStd
+```
+
+確認摘要、附圖與原 CAD 都能取回；build／實機與戶外驗收仍按各自流程執行。
+
 ## 紀錄清單
 
 | ID／原檔名 | 日期 | 內容 |
 | --- | --- | --- |
+| <a id="legacy-test-lessons-2026-11-25"></a>`legacy-test-lessons-2026-11-25` | 2026-11-25 | 9–10 月 GPS／RF／USB／PMU 結論，raw 清理、私人封存與異機恢復界線 |
 | <a id="memory-and-field-evidence-2026-11-14"></a>`memory-and-field-evidence-2026-11-14` | 2026-11-14 | Axiom停用對照、SD UTC／UART讀回、既有coredump、App／Surfer組合與驗收界線 |
 | <a id="deployment-app-0-3-2026-11-14"></a>`deployment-app-0-3-2026-11-14` | 2026-11-14 | 584C／F035 燒錄、App 0.3 安裝／IP 快選及位置快照記憶體缺口 |
 | <a id="health-fixes-2026-11-14"></a>`health-fixes-2026-11-14` | 2026-11-14 | 健檢六項修正、App 0.2／兩端韌體待部署產物與驗證 |
