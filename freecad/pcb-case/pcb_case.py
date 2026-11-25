@@ -152,8 +152,7 @@ def usb_mount(solid):
     lip = lip.cut(box(inner-4, inner, y0, y1, foot, 0))
     solid = solid.fuse(lip).removeSplitter()
     solid = round_edges(solid, 3, [(inner-4, (front+y0)/2, 0),
-                                  (inner-4, (rear+y1)/2, 0),
-                                  (web, y0, HEIGHT/2), (web, y1, HEIGHT/2)])
+                                  (inner-4, (rear+y1)/2, 0)])
     solid = solid.cut(box(web+3, inner-3, front, y0, 20, HEIGHT))
     solid = solid.cut(window_x(p, web, r, p-r, 5, 35))
 
