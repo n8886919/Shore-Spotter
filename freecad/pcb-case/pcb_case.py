@@ -22,6 +22,7 @@ USB_Y_MIN, USB_Y_MAX = -18.6, 52.4
 USB_CENTER_Y = (FRONT_Y + POST_PITCH + POST_RADIUS) / 2
 USB_HOLE_PITCH = 64
 USB_EXTENSION = 11
+USB_UPPER_PAD_HEIGHT = 1.5
 DESIGN_REVISION = "df951798"
 
 
@@ -141,7 +142,7 @@ def nut_trap(x, y, z, radius, depth):
     return Part.Face(Part.makePolygon(corners + corners[:1])).extrude(-X * depth)
 
 
-def usb_mount(solid):
+def usb_mount(solid, upper_pad_relief):
     p, r = POST_PITCH, POST_RADIUS
     outer, inner, web = USB_OUTER_X, USB_INNER_X, USB_WEB_X
     y0, y1 = USB_Y_MIN, USB_Y_MAX
@@ -158,10 +159,15 @@ def usb_mount(solid):
 
     for side in (-1, 1):
         y = USB_CENTER_Y + side * USB_HOLE_PITCH/2
-        pad_y0, pad_y1 = (y0, y+3) if side < 0 else (y-3, y1)
-        for z, bottom, top in ((foot+4, foot, foot+7), (HEIGHT-3, HEIGHT-6, HEIGHT)):
-            solid = solid.fuse(box(inner-2, inner, pad_y0, pad_y1, bottom, top))
-            solid = solid.cut(bore((inner-2, y, z), X, SCREW_DIAMETER, outer-inner+2))
+        # Lower pads retain their original projection and edge clearance.
+        # The inward edge of each upper pad meets its bore tangentially.
+        for z, bottom, top, height, margin in (
+            (foot+4, foot, foot+7, 2, 3),
+            (HEIGHT-3, HEIGHT-6, HEIGHT, USB_UPPER_PAD_HEIGHT, SCREW_DIAMETER/2 - upper_pad_relief),
+        ):
+            pad_y0, pad_y1 = (y0, y+margin) if side < 0 else (y-margin, y1)
+            solid = solid.fuse(box(inner-height, inner, pad_y0, pad_y1, bottom, top))
+            solid = solid.cut(bore((inner-height, y, z), X, SCREW_DIAMETER, outer-inner+height))
         solid = solid.cut(nut_trap(outer, y, foot+4, 3, 1.5))
     solid = solid.removeSplitter()
     return round_edges(solid, 3, [(outer, front, 10), (outer, rear, 10)])
@@ -184,8 +190,8 @@ def engrave_revision(solid):
     return solid.cut(text.extrude(X * 0.5)).removeSplitter()
 
 
-def build():
-    shape = engrave_revision(usb_mount(lilygo_and_servo(frame())))
+def build(upper_pad_relief=0.0):
+    shape = engrave_revision(usb_mount(lilygo_and_servo(frame()), upper_pad_relief))
     if len(shape.Solids) != 1 or not shape.isValid():
         raise ValueError("PCB case must be one valid solid")
     return shape.Solids[0]
@@ -193,7 +199,10 @@ def build():
 
 def export(directory):
     shape = build()
-    mesh = MeshPart.meshFromShape(Shape=shape, LinearDeflection=0.05,
+    # Exact tangency in the CAD solid creates a four-face contact in a mesh.
+    # Open the two tangencies by 0.01 mm only in the printable mesh.
+    print_shape = build(upper_pad_relief=0.01)
+    mesh = MeshPart.meshFromShape(Shape=print_shape, LinearDeflection=0.05,
                                   AngularDeflection=0.15, Relative=False)
     if not mesh.isSolid():
         raise ValueError("STL mesh is not closed")
