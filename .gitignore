@@ -17,3 +17,6 @@ __pycache__/
 
 # USB identities and pairing on this machine
 config/devices.local.json
+
+# Regenerated FreeCAD documents and print meshes
+/freecad/*/build/

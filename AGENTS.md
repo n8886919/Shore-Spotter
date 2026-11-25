@@ -5,7 +5,7 @@
   不因舊文件已移出工作目錄就判定證據遺失；例如 `python3 tools/read_record.py field-experiment-2026-11-14`。
 - `README.md` / `docs/features.md` / `docs/function-entrypoints.md` — 現行流程與功能入口。
 - `android/README.md` / `.agents/skills/shore-spotter-android/SKILL.md` — 原生相機／控制／GPS-only App；主機建置不等於已安裝。
-- `cad/README.md` / `cad/reference.json` — 正式外殼在 `~/freecad/Shore-Spotter-Case/` 的獨立 Git commit／主檔 hash，不重複拷貝模型。
+- `freecad/README.md` — 建模、重建、實體比對及版本刻字流程；PCB 機殼來源為 `freecad/pcb-case/pcb_case.py`。
 - `docs/interface.md` / `docs/client-binding-api.md` / `docs/openapi-client-control.json` / `docs/openapi-client-binding.json` — 現行 LoRa／BLE／HTTP 契約。
 - `docs/hardware.md` / `docs/device-config.md` — 硬體、設定、身分與部署邊界；私人 Wi-Fi／裝置設定不提交。
 - `docs/web-ui-design.md` / `include/web_ui.h` — 網頁修改前必讀；圖示只改 `tools/make_icon.py`，`include/web_icon.h` 為產生檔。

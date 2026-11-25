@@ -3,7 +3,7 @@
 目前原始碼為 **1.0（診斷專用建置 1.0-debug），LoRa wire v5、BLE wire v1**；版本唯一來源為
 [firmware_version.h](include/firmware_version.h)，變更見 [CHANGELOG](CHANGELOG.md)。
 其他工程師先讀 [交接入口](docs/assistant-handoff.md) 與 [功能入口](docs/function-entrypoints.md)。
-2026-11-14 checkpoint 已保存 BLE／維護介面／Web 恢復、Android GPS-only。外殼另於獨立 CAD repository 提交，見 [CAD 索引](cad/README.md)。
+2026-11-14 checkpoint 已保存 BLE／維護介面／Web 恢復、Android GPS-only。PCB 機殼由本專案的 Python 建模，見 [FreeCAD 開發與重建](freecad/README.md)。
 目前待辦見 [下一 session 規劃](docs/next-session-plan.md)，階段紀錄依 [索引](docs/records-index.md) 從 Git 查回。
 健檢六項修正已完成主機驗證，Station 584C／T096 F035 已燒錄，Pixel 10 已安裝 **App 0.3**（含最近兩個成功 IP 快選）。
 已核對新 build／boot／認領與 SD 新欄位；**戶外 GPS-only、跳角與 panic 根因仍未驗收**。

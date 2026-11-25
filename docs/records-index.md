@@ -5,9 +5,8 @@
 原路徑、完整 commit 與 SHA-256／附件清單保存在 [records.json](records.json)。
 
 最初保存 checkpoint：`bcce441291c4c9ee6f2b9fe2b7817b1976702bf6`，標籤 `records/2026-11-14`。
-當時的 Android 原始碼在這個 commit；後續修正以各紀錄釘選的 commit 為準。CAD 目錄之後由使用者更正為 `~/freecad/Shore-Spotter-Case/`，
-正式外殼已在獨立 repository 提交 `f3c69b92dbabbcf2fabaf60c2b81fcd3ed723c81`，見 [CAD 索引](../cad/README.md)。
-原實驗記錄保留更正前的 Pocket 診斷脈絡；請以當前 CAD 索引為準。本地建置輸出、憑證與原始位置 log 未納入。
+當時的 Android 原始碼在這個 commit；後續修正以各紀錄釘選的 commit 為準。原始外殼提交 `f3c69b92dbabbcf2fabaf60c2b81fcd3ed723c81` 已在本倉庫以 `archive/pcb-case-fcstd` 保留。取回與重建方式見 [FreeCAD 開發文件](../freecad/README.md)。
+本地建置輸出、憑證與原始位置 log 未納入。
 
 ## 查閱與取回
 

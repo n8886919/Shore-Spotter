@@ -89,7 +89,7 @@ GPS-only衛星fix、接電Servo／供電干擾、長時間RF與panic仍未戶外
 - 當時手動命令 119°／266°／109° 已抵達軟體；UART、控制板與 Servo 無回授，不能全部歸因 Wi-Fi。
 - Station 先前 `Nov 13 2026 01:13:33` Web 恢復版仍曾有連線異常；現役已更新，但不因此認定歷史根因排除。
 - Axiom 先前回家後 boot 有 enabled／low_memory／requests=0；下午已停用並驗證記錄改善，仍不能套用為歷史外測或panic的唯一根因。
-- CAD 仍由 `cad/reference.json` 指向獨立 repo。FCStd／STL committed hash 已核對，但 STL 與目前幾何一致性未驗證。
+- PCB 機殼由 [FreeCAD 流程](../freecad/README.md) 接手。未刻字重建版與原 FCStd 雙向相減皆為零；實機裝配待驗。
 
 ## 系統邊界
 
