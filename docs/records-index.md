@@ -65,6 +65,11 @@ git show archive/pcb-case-fcstd:Shore-Spotter-Case.FCStd > /tmp/Shore-Spotter-Ca
 
 確認摘要、附圖與原 CAD 都能取回；build／實機與戶外驗收仍按各自流程執行。
 
+本次驗證：從 GitHub 新 clone `8e777e3`，28 份紀錄／36 個 Git blobs 的 SHA-256 全數通過，
+實際匯出本次摘要及含 3 張 PNG 的外測紀錄；從遠端 `archive/pcb-case-fcstd` 取回原 CAD，hash 與既有保存值相符。
+三個家目錄產物資料夾已移除；保留檔案及垃圾桶內 451 個清理檔皆與移動前 SHA-256 相符。
+垃圾桶尚未清空，這次整理不等於已釋放磁碟空間。沒有 build、燒錄或操作硬體。
+
 ## 紀錄清單
 
 | ID／原檔名 | 日期 | 內容 |
