@@ -22,6 +22,7 @@ USB_Y_MIN, USB_Y_MAX = -18.6, 52.4
 USB_CENTER_Y = (FRONT_Y + POST_PITCH + POST_RADIUS) / 2
 USB_HOLE_PITCH = 64
 USB_EXTENSION = 11
+DESIGN_REVISION = "9d489250"
 
 
 def box(x0, x1, y0, y1, z0, z1):
@@ -167,8 +168,25 @@ def usb_mount(solid):
     return round_edges(solid, 3, [(outer, front, 10), (outer, rear, 10)])
 
 
+def engrave_revision(solid):
+    # Viewed from the open side, -Y points right and +Z points up.
+    from matplotlib import get_data_path
+    font = Path(get_data_path()) / "fonts/ttf/DejaVuSansMono-Bold.ttf"
+    glyphs = Part.makeWireString(DESIGN_REVISION, str(font.parent) + "/",
+                                font.name, 5.0)
+    faces = [Part.makeFace(wires, "Part::FaceMakerBullseye") for wires in glyphs]
+    if len(faces) != len(DESIGN_REVISION):
+        raise ValueError("Font did not produce the complete revision")
+    text = Part.makeCompound(faces)
+    bounds = text.BoundBox
+    text.translate(V(-bounds.Center.x, -bounds.Center.y, 0))
+    text.Placement = App.Placement(V(), App.Rotation(-Y, Z, -X, "ZXY")) * text.Placement
+    text.translate(V(USB_INNER_X, USB_CENTER_Y, -USB_EXTENSION/2))
+    return solid.cut(text.extrude(X * 0.5)).removeSplitter()
+
+
 def build():
-    shape = usb_mount(lilygo_and_servo(frame()))
+    shape = engrave_revision(usb_mount(lilygo_and_servo(frame())))
     if len(shape.Solids) != 1 or not shape.isValid():
         raise ValueError("PCB case must be one valid solid")
     return shape.Solids[0]

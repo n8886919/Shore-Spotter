@@ -37,4 +37,15 @@ git show archive/pcb-case-fcstd:Shore-Spotter-Case.FCStd > /tmp/pcb-case-origina
 ~/.local/bin/freecad python freecad/compare_solids.py /tmp/pcb-case-original.FCStd freecad/pcb-case/build/pcb_case.FCStd
 ```
 
+現行刻字為未刻字設計提交 `9d489250`。要重跑上述等形驗收，可先從該提交產生未刻字檔：
+
+```sh
+baseline=$(mktemp -d)
+git show 9d489250:freecad/pcb-case/pcb_case.py > "$baseline/pcb_case.py"
+~/.local/bin/freecad python "$baseline/pcb_case.py"
+~/.local/bin/freecad python freecad/compare_solids.py /tmp/pcb-case-original.FCStd "$baseline/build/pcb_case.FCStd"
+```
+
+`engrave_revision()` 在 USB 凸出部的內壁置中刻字，方向為從內側看向 +X 時可讀，字形來自 FreeCAD Python 隨附的 Matplotlib DejaVu Sans Mono Bold。內壁厚 3 mm，刻深 0.5 mm，字底保留 2.5 mm。列印版相對 `9d489250` 增加 0 mm³，移除 34.935900 mm³；差異限於內側字形。重讀 STL 共 17,866 個三角面，單一封閉網格。試改 USB 孔距增加 1 mm 後，四孔中心與孔旁材料檢查通過。
+
 首次驗收時兩個 FCStd 均有一個有效實體，雙向相減的體積皆為 0.000000000 mm³。列印公差與實機裝配需以實物量測。
